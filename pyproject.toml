@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moneymore"
+version = "0.1.0"
+description = "Auditable personal A-share quantitative trading system"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2,<3",
+  "numpy>=1.26,<3",
+  "pydantic>=2.7,<3",
+  "PyYAML>=6,<7",
+  "pyarrow>=16,<22",
+  "python-dotenv>=1,<2",
+  "tushare>=1.4,<2",
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
+
+[project.scripts]
+moneymore = "moneymore.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moneymore"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
