@@ -26,6 +26,10 @@ from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
 from .execution.paper import PaperBroker
 from .factors import build_default_registry
+from .multi_sector_daily import (
+    MULTI_SECTOR_ACCOUNT,
+    run_multi_sector_daily,
+)
 from .research.adaptive import research_weighted_strategies
 from .research.detail import (
     allocation_comparison,
@@ -319,6 +323,18 @@ class TaskService:
                     text=True,
                     timeout=300,
                 )
+                multi_result = run_multi_sector_daily(
+                    store=store,
+                    broker=broker,
+                    config=config,
+                    trade_date=trade_date,
+                    signal_dir=STATE / "multi-sector-signals",
+                    report_dir=STATE / "multi-sector-shadow",
+                )
+                if multi_result.status != "COMPLETED":
+                    raise RuntimeError(
+                        f"multi-sector pipeline status: {multi_result.status}"
+                    )
             status = "COMPLETED" if result.status in {
                 "COMPLETED",
                 "SKIPPED_MARKET_CLOSED",
@@ -486,6 +502,7 @@ def bank_dashboard() -> dict[str, object]:
         "scheduler": task_service.config(),
         "recent_runs": task_service.runs(10),
         "equity_curve": _records(sampled[["date", "equity", "drawdown"]]),
+        "symbol_names": _instrument_names(store),
     }
 
 
@@ -588,6 +605,7 @@ def sector_portfolio() -> dict[str, object]:
         "allocation": _records(recommendation.sort_values("budget_weight", ascending=False)),
         "report": _records(report),
         "universes": universes,
+        "symbol_names": _instrument_names(store),
     }
 
 
@@ -628,6 +646,51 @@ def bank_execution() -> dict[str, object]:
     }
 
 
+@app.get("/api/multi-sector-execution")
+def multi_sector_execution() -> dict[str, object]:
+    broker = PaperBroker(PAPER_DATABASE)
+    broker.initialize_account(1_000_000, MULTI_SECTOR_ACCOUNT)
+    with sqlite3.connect(PAPER_DATABASE) as connection:
+        connection.row_factory = sqlite3.Row
+        fills = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM fills WHERE account_id = ? ORDER BY id DESC LIMIT 100",
+                (MULTI_SECTOR_ACCOUNT,),
+            )
+        ]
+        positions = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM positions WHERE account_id = ? AND quantity != 0
+                ORDER BY symbol
+                """,
+                (MULTI_SECTOR_ACCOUNT,),
+            )
+        ]
+    orders = [
+        row
+        for row in reversed(broker.orders())
+        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
+    ][:100]
+    latest = _latest_multi_sector_shadow()
+    return {
+        "account_id": MULTI_SECTOR_ACCOUNT,
+        "status": latest.get("status", "AWAITING_FIRST_RUN"),
+        "trade_date": latest.get("trade_date"),
+        "target_weights": latest.get("target_weights", {}),
+        "symbol_sectors": latest.get("symbol_sectors", {}),
+        "orders": orders,
+        "fills": fills,
+        "positions": positions,
+        "portfolio": latest.get("portfolio"),
+        "attribution": latest.get("attribution", []),
+        "reconciliation": asdict(broker.reconcile(MULTI_SECTOR_ACCOUNT)),
+        "symbol_names": _instrument_names(ParquetStore(DATA)),
+    }
+
+
 def _latest_bank_shadow() -> dict[str, object]:
     directory = STATE / "bank-shadow"
     reports = sorted(directory.glob("*.json")) if directory.exists() else []
@@ -639,6 +702,25 @@ def _latest_bank_shadow() -> dict[str, object]:
             "ranking": [],
             "orders": [],
             "executions": [],
+            "portfolio": {
+                "cash": 1_000_000,
+                "market_value": 0,
+                "equity": 1_000_000,
+                "positions": [],
+            },
+        }
+    return json.loads(reports[-1].read_text(encoding="utf-8"))
+
+
+def _latest_multi_sector_shadow() -> dict[str, object]:
+    directory = STATE / "multi-sector-shadow"
+    reports = sorted(directory.glob("*.json")) if directory.exists() else []
+    if not reports:
+        return {
+            "status": "AWAITING_FIRST_RUN",
+            "target_weights": {},
+            "symbol_sectors": {},
+            "attribution": [],
             "portfolio": {
                 "cash": 1_000_000,
                 "market_value": 0,
@@ -882,6 +964,17 @@ def _research_payload(symbol: str, name: str, research_status: str) -> dict[str,
         "trades": _records(ledger),
         "equity_curve": _records(sampled[["date", "equity", "drawdown"]]),
     }
+
+
+def _instrument_names(store: ParquetStore) -> dict[str, str]:
+    instruments = store.read("instruments", columns=["ts_code", "name"])
+    return dict(
+        zip(
+            instruments["ts_code"].astype(str),
+            instruments["name"].astype(str),
+            strict=True,
+        )
+    )
 
 
 def _records(frame: Any) -> list[dict[str, object]]:
