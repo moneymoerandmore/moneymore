@@ -127,6 +127,39 @@ class PaperBroker:
             "avg_cost": float(position[2]),
         }
 
+    def account_snapshot(
+        self, mark_prices: dict[str, float], account_id: str = "default"
+    ) -> dict[str, object]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            account = connection.execute(
+                "SELECT cash FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            if account is None:
+                raise ValueError(f"paper account does not exist: {account_id}")
+            positions = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT symbol, quantity, available_quantity, avg_cost
+                    FROM positions WHERE account_id = ? AND quantity != 0
+                    ORDER BY symbol
+                    """,
+                    (account_id,),
+                )
+            ]
+        market_value = sum(
+            int(position["quantity"]) * float(mark_prices.get(position["symbol"], 0))
+            for position in positions
+        )
+        cash = float(account["cash"])
+        return {
+            "cash": cash,
+            "market_value": market_value,
+            "equity": cash + market_value,
+            "positions": positions,
+        }
+
     def execute_pending(
         self,
         bar: ExecutionBar,

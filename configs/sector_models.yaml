@@ -1,0 +1,118 @@
+disclosure_date: "2026-06-30"
+evidence_status: CURRENT_CONSTITUENT_BIASED
+universes:
+  growth:
+    name: 创业板ETF易方达前十大
+    etf_code: 159915.SZ
+    style: growth_quality_momentum
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.15
+    factors:
+      momentum_252_21: 0.25
+      return_120: 0.15
+      quarterly_revenue_growth: 0.25
+      roe: 0.15
+      volatility_60: 0.10
+      earnings_yield: 0.10
+    holdings:
+      300308.SZ: 0.1454
+      300750.SZ: 0.1356
+      300502.SZ: 0.1001
+      300059.SZ: 0.0345
+      300274.SZ: 0.0310
+      300476.SZ: 0.0278
+      300408.SZ: 0.0276
+      300394.SZ: 0.0249
+      301308.SZ: 0.0219
+      300604.SZ: 0.0213
+
+  metals:
+    name: 工业有色ETF万家前十大
+    etf_code: 560860.SH
+    style: cycle_value_momentum
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.14
+    factors:
+      momentum_252_21: 0.30
+      return_120: 0.15
+      earnings_yield: 0.15
+      book_to_price: 0.10
+      roe: 0.10
+      volatility_60: 0.10
+      drawdown_120: 0.10
+    holdings:
+      603993.SH: 0.1096
+      600111.SH: 0.0867
+      600549.SH: 0.0677
+      000657.SZ: 0.0624
+      601600.SH: 0.0463
+      000630.SZ: 0.0366
+      600673.SH: 0.0362
+      000426.SZ: 0.0335
+      000807.SZ: 0.0330
+      601168.SH: 0.0323
+
+  dividend:
+    name: 红利ETF易方达前十大
+    etf_code: 515180.SH
+    style: dividend_value_defensive
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.12
+    factors:
+      dividend_yield_ttm: 0.35
+      earnings_yield: 0.15
+      book_to_price: 0.15
+      volatility_60: 0.15
+      drawdown_120: 0.10
+      roe: 0.10
+    holdings:
+      601919.SH: 0.0282
+      000672.SZ: 0.0227
+      603565.SH: 0.0198
+      601699.SH: 0.0193
+      600188.SH: 0.0193
+      600256.SH: 0.0189
+      600546.SH: 0.0173
+      600985.SH: 0.0159
+      601101.SH: 0.0150
+      601666.SH: 0.0145
+
+  chip:
+    name: 芯片ETF国泰前十大
+    etf_code: 512760.SH
+    style: technology_growth_momentum
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.15
+    factors:
+      momentum_252_21: 0.25
+      return_120: 0.15
+      quarterly_revenue_growth: 0.20
+      roe: 0.15
+      price_to_ma_60: 0.10
+      volatility_60: 0.10
+      earnings_yield: 0.05
+    holdings:
+      688256.SH: 0.0939
+      688981.SH: 0.0907
+      688041.SH: 0.0769
+      002371.SZ: 0.0734
+      603986.SH: 0.0528
+      688008.SH: 0.0498
+      688012.SH: 0.0464
+      603501.SH: 0.0393
+      688072.SH: 0.0206
+      002049.SZ: 0.0199
+
+allocation:
+  method: inverse_volatility
+  lookback: 60
+  max_sleeve_weight: 0.35
+  minimum_sleeve_weight: 0.10

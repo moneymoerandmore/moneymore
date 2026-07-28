@@ -90,7 +90,12 @@ class ParquetStore:
         parts = additions
         if curated_path.exists():
             parts = [pd.read_parquet(curated_path), *additions]
-        combined = pd.concat(parts, ignore_index=True)
+        normalized = [
+            part.dropna(axis=1, how="all") for part in parts if not part.empty
+        ]
+        if not normalized:
+            return
+        combined = pd.concat(normalized, ignore_index=True)
         combined = combined.drop_duplicates(key_columns, keep="last").sort_values(
             key_columns
         )

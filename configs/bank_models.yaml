@@ -1,0 +1,50 @@
+models:
+  bank_multifactor_v1:
+    status: RESEARCH_ONLY
+    frozen_on: "2026-07-27"
+    universe: bank_cn
+    factor_weights:
+      value: 0.40
+      defensive: 0.25
+      momentum: 0.20
+      quality: 0.15
+    selection:
+      top_k: 8
+      exit_rank: 12
+      max_replacements: 2
+      position_weight: 0.10
+    promotion_blockers:
+      - train_sharpe
+      - pristine_forward_period
+
+  bank_multifactor_no_quality_candidate:
+    status: PROSPECTIVE_CANDIDATE
+    frozen_on: "2026-07-27"
+    universe: bank_cn
+    derived_from: bank_multifactor_v1
+    factor_weights:
+      value: 0.470588
+      defensive: 0.294118
+      momentum: 0.235294
+      quality: 0.0
+    selection:
+      top_k: 8
+      exit_rank: 12
+      max_replacements: 2
+      position_weight: 0.10
+    timing:
+      interface: qlib_risk_degree
+      active: vol_target_12
+      status: PROSPECTIVE_CANDIDATE
+      base_gross_exposure: 0.80
+      annual_volatility_target: 0.12
+      lookback: 60
+      minimum_risk_degree: 0.20
+      maximum_risk_degree: 0.80
+      rebalance_days: 20
+    notes:
+      - Removing quality improved both historical partitions.
+      - Historical results are consumed evidence, not a new out-of-sample test.
+      - KAMA timing is retained as a benchmark but rejected by historical evidence.
+      - Volatility targeting becomes a prospective timing candidate.
+      - Only observations after 2026-07-27 count as pristine forward evidence.

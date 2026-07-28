@@ -85,17 +85,19 @@ def load_point_in_time_features(store: ParquetStore, symbol: str) -> pd.DataFram
     ).rename(columns={"trade_date": "date"})
     basic["date"] = pd.to_datetime(basic["date"])
     basic = basic.sort_values("date")
-    for column in ("dv_ttm", "pb", "pe_ttm"):
+    market_columns = (
+        "dv_ttm", "pb", "pe_ttm", "turnover_rate", "volume_ratio",
+        "total_mv", "circ_mv",
+    )
+    for column in market_columns:
         if column not in basic:
             basic[column] = pd.NA
-    basic[["dv_ttm", "pb", "pe_ttm"]] = basic[
-        ["dv_ttm", "pb", "pe_ttm"]
-    ].shift(1)
+    basic[list(market_columns)] = basic[list(market_columns)].shift(1)
 
     result = bars.copy()
     result["date"] = pd.to_datetime(result["date"])
     result = result.merge(
-        basic[["date", "dv_ttm", "pb", "pe_ttm"]],
+        basic[["date", *market_columns]],
         on="date",
         how="left",
         validate="one_to_one",
@@ -110,8 +112,11 @@ def load_point_in_time_features(store: ParquetStore, symbol: str) -> pd.DataFram
     financial = financial.sort_values(["available_date", "end_date"]).drop_duplicates(
         "available_date", keep="last"
     )
+    financial_columns = (
+        "roe", "ocfps", "debt_to_assets", "netprofit_yoy", "q_sales_yoy",
+    )
     selected = ["available_date"] + [
-        column for column in ("roe", "ocfps", "debt_to_assets") if column in financial
+        column for column in financial_columns if column in financial
     ]
     result = pd.merge_asof(
         result.sort_values("date"),

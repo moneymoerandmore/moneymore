@@ -1,109 +1,250 @@
 # MoneyMore
 
-面向个人投资者的 A 股量化交易系统。当前版本先把最容易被忽略、但决定结果是否可信的部分做对：
+MoneyMore 是一个面向个人投资者的A股量化研究与模拟交易系统。当前主策略是银行多因子Top-K组合，并采用Qlib式动态 `risk_degree` 完成组合择时。
 
-- 信号在收盘后生成，下一交易日开盘成交，避免未来函数；
-- A 股买入按 100 股整数手、卖出收印花税；
-- 支持佣金最低收费、双边过户费、滑点；
-- 停牌、涨跌停无法成交；
-- 组合级仓位上限、单标的上限和回撤熔断；
-- 数据、策略、回测、执行适配器分层，实盘默认锁死。
+当前模式：`PAPER_ONLY`。系统不连接任何真实券商账户，也不会自动发送真实委托。
 
-## 快速开始
+## 当前能力
 
-需要 Python 3.11+：
+- Tushare历史行情、估值、财务和分红数据；
+- 原始数据不可变快照与Parquet研究表；
+- point-in-time财务特征；
+- 21因子注册表和横截面预处理；
+- 因子Rank IC、ICIR和分层收益分析；
+- 银行股历史股票池；
+- 银行多因子预测分数；
+- Qlib式Top-K缓冲换仓；
+- 固定风险度、KAMA和波动率目标择时；
+- Qlib `risk_degree` 语义的动态组合仓位；
+- T日信号、T+1开盘模拟撮合；
+- 订单、成交、持仓、现金和对账账本；
+- 每日18:30服务端自动流水线；
+- 组合研究与运行观测前台。
+
+详细路线见[规划文档](docs/PLAN.md)。
+
+## 策略结构
+
+```text
+Tushare点时数据
+      ↓
+MoneyMore因子注册表
+      ↓
+横截面预处理与多因子分数
+      ↓
+Qlib式Top-K策略
+Top 8 / Rank 12缓冲 / 最多替换2只
+      ↓
+Qlib risk_degree择时
+固定80% / KAMA / 12%波动率目标
+      ↓
+目标权重与风险约束
+      ↓
+PaperBroker次日开盘模拟成交
+      ↓
+订单、成交、持仓和现金对账
+```
+
+Qlib在本项目中是研究和策略接口的主体规范。MoneyMore当前使用轻量原生实现对齐Qlib的信号、Top-K和 `risk_degree` 语义，以保留A股交易规则和本地数据控制。后续接入原生Qlib模型训练器时，不需要修改模拟撮合和前台接口。
+
+## 当前银行策略
+
+模型：`bank_multifactor_no_quality_candidate`
+
+因子组：
+
+- 价值：47.0588%
+- 防御：29.4118%
+- 动量：23.5294%
+- 质量：0%
+
+组合规则：
+
+- 当前银行股票池39只；
+- 选择Top 8；
+- 持仓跌出Rank 12才触发正常退出；
+- 每期最多替换2只；
+- 每只股票基础权重为银行子账户10%；
+- 固定基准总风险度80%。
+
+当前择时：`vol_target_12`
+
+- 60日实现波动率；
+- 年化目标波动率12%；
+- `risk_degree`范围20%～80%；
+- 10个百分点为调整台阶；
+- 每20个交易日重新评估；
+- 状态为 `PROSPECTIVE_CANDIDATE`。
+
+最终单股目标权重计算：
+
+```text
+单股目标权重 = 10% × risk_degree ÷ 80%
+```
+
+例如 `risk_degree=70%`：
+
+- 银行子账户总持股目标约70%；
+- 8只股票每只约8.75%；
+- 银行子账户约30%保留现金；
+- 如果银行预算占总账户10%，则总账户银行持股约7%。
+
+## 环境要求
+
+- Windows；
+- Python 3.11或更高版本；
+- Node.js仅用于前台；
+- Tushare Token；
+- 建议16GB内存和SSD。
+
+## 安装
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest
-python -m moneymore.cli demo
 ```
 
-`demo` 使用确定性的合成行情，只用于验证系统链路，不代表策略收益。
-
-## Tushare 历史数据
-
-1. 在 Tushare 官网取得 Token。
-2. 复制 `.env.example` 为 `.env`，只在本机填写 `TUSHARE_TOKEN`。
-3. 首次先同步一个较短区间验证权限：
+复制环境变量文件：
 
 ```powershell
 Copy-Item .env.example .env
-# 用文本编辑器在 .env 中填写 Token
-.\.venv\Scripts\python.exe -m moneymore.cli sync-tushare --start 20250101 --end 20250131
 ```
 
-原始响应按数据源、表和日期不可变保存到 `data/raw`，并生成包含抓取时间、行数和 SHA-256
-的清单；去重后的研究表写入 `data/processed`。真实 Token、数据文件和日志均被 Git 忽略。
+在本地 `.env` 中填写：
 
-默认同步 A 股。ETF 使用独立接口和表，避免与股票行情混淆：
-
-```powershell
-.\.venv\Scripts\python.exe -m moneymore.cli sync-tushare --asset etfs --start 20250101 --end 20250131
+```text
+TUSHARE_TOKEN=你的Token
 ```
 
-按 Tushare 当前官方说明，股票基础信息、交易日历和股票复权因子通常需要至少 2000
-积分；ETF 日线需要至少 5000 积分，新的 ETF 基础信息接口需要 8000 积分。以账户实际
-权限为准。权限不足不做降级伪造，命令会直接失败。
+不得提交 `.env`、Token、行情数据、运行状态或本地账本。
 
-用本地真实数据验证回测链路：
+## 数据同步
 
-```powershell
-.\.venv\Scripts\python.exe -m moneymore.cli backtest-stock --symbol 000001.SZ --fast 3 --slow 5
-```
-
-执行价格使用当时未复权开盘价，均线信号使用独立复权因子构造的调整价格。短周期参数仅供
-链路验收，不能作为实盘策略。
-
-多年历史回填建议使用较大批次；命令支持断点续传，并会从原始快照修复尚未合并的研究表：
+同步股票数据：
 
 ```powershell
 .\.venv\Scripts\python.exe -m moneymore.cli sync-tushare `
   --asset stocks `
   --start 20150101 `
-  --end 20260724 `
+  --end 20260727 `
   --batch-days 200
 ```
 
-招商银行 M3 研究：
+数据目录：
 
-```powershell
-.\.venv\Scripts\python.exe -m moneymore.cli sync-research-reference `
-  --symbol 600036.SH --start 20150101 --end 20260724
-.\.venv\Scripts\python.exe -m moneymore.cli research-stock --symbol 600036.SH
+```text
+data/raw        Tushare不可变原始快照
+data/processed  去重后的研究表和研究产物
 ```
 
-PaperBroker 每日信号演练：
+ETF需要独立权限。当前ETF权限尚未开通，不应使用降级或网页抓取方式伪造ETF数据。
+
+## 运行银行择时研究
 
 ```powershell
-.\.venv\Scripts\python.exe -m moneymore.cli paper-signal `
-  --symbol 600036.SH --as-of 20260724 `
-  --cash 1000000 --equity 1000000 --position 0
+.\.venv\Scripts\python.exe scripts\research_bank_timing.py
 ```
 
-详见 `docs/PAPER_RUNBOOK.md`。当前实现没有任何真实券商连接。
+该命令使用完全相同的Top-K、交易费用和T+1成交规则，对比：
 
-## 可视化量化控制台
+- `fixed_80`
+- `kama_10_2_30`
+- `vol_target_12`
 
-控制台把数据状态、M3 信号、纸面账户、任务运行和三方对账集中到本机页面。
-服务端进程内置每日 18:30 调度，不依赖 Codex 自动任务：
+输出：
+
+```text
+data/processed/bank_timing_report.parquet
+data/processed/bank_timing_degrees.parquet
+data/processed/bank_timing_equity.parquet
+```
+
+历史结果已参与模型开发，只能作为验证证据。2026-07-27之后的模拟记录才属于新前瞻证据。
+
+## 启动组合控制台
 
 ```powershell
 .\scripts\start_dashboard.ps1
 ```
 
-打开 `http://127.0.0.1:3000`。停止服务：
+访问：
+
+- 前台：[http://127.0.0.1:3000](http://127.0.0.1:3000)
+- API健康检查：[http://127.0.0.1:8788/api/health](http://127.0.0.1:8788/api/health)
+- 银行组合数据：[http://127.0.0.1:8788/api/bank-dashboard](http://127.0.0.1:8788/api/bank-dashboard)
+- 择时研究数据：[http://127.0.0.1:8788/api/bank-timing](http://127.0.0.1:8788/api/bank-timing)
+- 模拟成交数据：[http://127.0.0.1:8788/api/bank-execution](http://127.0.0.1:8788/api/bank-execution)
+
+停止服务：
 
 ```powershell
 .\scripts\stop_dashboard.ps1
 ```
 
-服务只监听本机回环地址，Tushare Token、Parquet 行情和 SQLite 账本不会上传。
+服务只监听本机回环地址，不对公网开放。
+
+## 每日流水线
+
+服务端每天18:30（Asia/Shanghai）自动运行，不依赖Codex自动任务。
+
+流水线执行：
+
+1. 交易日检查；
+2. 行情和基本数据增量入库；
+3. 前一日委托开盘模拟撮合；
+4. 因子和银行多因子分数计算；
+5. Top-K缓冲换仓；
+6. 动态 `risk_degree` 计算；
+7. 下一交易日目标委托生成；
+8. 订单、成交、持仓和现金对账；
+9. 运行证据归档。
+
+流水线报告：
+
+```text
+state/bank-shadow/YYYYMMDD.json
+```
+
+信号和报告均按日期固化，避免同一交易日被静默覆盖。
+
+## 测试
+
+后端：
+
+```powershell
+.\.venv\Scripts\ruff.exe check src tests scripts\research_bank_timing.py
+.\.venv\Scripts\pytest.exe -q
+```
+
+前端：
+
+```powershell
+cd apps\dashboard
+pnpm run lint
+pnpm test
+```
+
+## 重要口径
+
+- Top-K是交易策略：决定何时调仓、买谁、卖谁和换多少；
+- `risk_degree`是组合择时：决定银行子账户投入多少风险资金；
+- 因子分数不等于买入建议；
+- 历史最优不等于前瞻有效；
+- KAMA在本银行组合中表现较差，不能因算法成熟而直接采用；
+- 波动率目标只是前瞻候选，不是已证明的最优策略；
+- 页面中的持仓、订单和收益均为模拟结果；
+- 项目不提供收益保证或个股投资建议。
 
 ## 项目边界
 
-当前里程碑是 M1：可靠的日频研究/回测内核。真实数据接入、点时财务数据、模拟撮合和券商
-适配器将按 `docs/PLAN.md` 逐阶段实现。任何真实自动委托前，先向开户券商完成程序化交易报告，
-确认所用接口、部署环境及账户权限符合券商要求。
+当前阶段不做：
+
+- 真实券商账户连接；
+- 程序化实盘下单；
+- 高频或日内交易；
+- 未授权网页行情抓取；
+- 用未来披露数据回填历史；
+- 用同一历史区间反复搜索并宣称得到纯样本外结论。
+
+后续工作以持续模拟、模型治理、组合归因和前瞻证据积累为主。

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -12,16 +14,18 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from .bank_daily import BANK_ACCOUNT, run_bank_daily_pipeline
 from .config import BacktestConfig
-from .daily import run_daily_pipeline
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
 from .execution.paper import PaperBroker
+from .factors import build_default_registry
 from .research.adaptive import research_weighted_strategies
 from .research.detail import (
     allocation_comparison,
@@ -29,6 +33,7 @@ from .research.detail import (
     candidate_result,
     trade_ledger,
 )
+from .research.governance import evaluate_bank_model_promotion
 from .research.single_stock import research_single_stock, robustness_single_stock
 from .signals import trend_decision
 
@@ -296,33 +301,29 @@ class TaskService:
             store = ParquetStore(DATA)
             broker = PaperBroker(PAPER_DATABASE)
             config = BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml")
-            results = []
-            for candidate in self.candidates(enabled_only=True):
-                results.append(
-                    run_daily_pipeline(
-                        provider=provider,
-                        store=store,
-                        broker=broker,
-                        config=config,
-                        symbol=str(candidate["symbol"]),
-                        trade_date=trade_date,
-                        account_id=ACCOUNT,
-                        signal_dir=STATE / "signals",
-                        report_dir=STATE / "daily-runs",
-                        strategy_id=str(candidate["strategy_id"]),
-                        active_weight=float(candidate["target_weight"]),
-                    )
+            result = run_bank_daily_pipeline(
+                provider=provider,
+                store=store,
+                broker=broker,
+                config=config,
+                trade_date=trade_date,
+                signal_dir=STATE / "bank-signals",
+                report_dir=STATE / "bank-shadow",
+            )
+            if result.status == "COMPLETED":
+                subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "research_sector_portfolio.py")],
+                    cwd=ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
                 )
-            statuses = {result.status for result in results}
-            status = "COMPLETED" if statuses <= {
+            status = "COMPLETED" if result.status in {
                 "COMPLETED",
                 "SKIPPED_MARKET_CLOSED",
-                "SKIPPED_SUSPENDED",
             } else "FAILED"
-            report_paths = json.dumps(
-                [result.report_path for result in results], ensure_ascii=False
-            )
-            self._finish(run_id, status, report_path=report_paths)
+            self._finish(run_id, status, report_path=result.report_path)
         except Exception as error:  # noqa: BLE001 - task failures must stay observable
             self._finish(run_id, "FAILED", error=f"{type(error).__name__}: {error}")
         finally:
@@ -386,6 +387,266 @@ def health() -> dict[str, object]:
         "scheduler": bool(task_service._thread and task_service._thread.is_alive()),
         "server_time": datetime.now(SHANGHAI).isoformat(),
     }
+
+
+@app.get("/api/factors")
+def factors() -> dict[str, object]:
+    registry = build_default_registry()
+    catalog = registry.catalog()
+    return {
+        "count": len(catalog),
+        "categories": sorted({str(item["category"]) for item in catalog}),
+        "items": catalog,
+    }
+
+
+@app.get("/api/factor-research")
+def factor_research(universe: str = "bank_cn") -> dict[str, object]:
+    if not re.fullmatch(r"[a-z0-9_]{1,40}", universe):
+        raise HTTPException(status_code=400, detail="invalid universe")
+    store = ParquetStore(DATA)
+    try:
+        membership = store.read(
+            "universe_membership", filters=[("universe", "==", universe)]
+        )
+        ic = store.read("factor_ic_report")
+        period_ic = store.read("factor_ic_period_report")
+        quantiles = store.read("factor_quantile_report")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    latest_date = membership["date"].max()
+    return {
+        "universe": universe,
+        "membership_rows": len(membership),
+        "latest_date": str(latest_date)[:10],
+        "latest_members": int((membership["date"] == latest_date).sum()),
+        "ic": _records(ic),
+        "period_ic": _records(period_ic),
+        "quantiles": _records(quantiles),
+    }
+
+
+@app.get("/api/bank-model")
+def bank_model() -> dict[str, object]:
+    store = ParquetStore(DATA)
+    try:
+        scores = store.read("bank_model_scores")
+        targets = store.read("bank_model_targets")
+        report = store.read("bank_model_report")
+        robustness = store.read("bank_model_robustness")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    latest_date = scores["date"].max()
+    latest_scores = scores.loc[scores["date"] == latest_date].sort_values(
+        "score", ascending=False
+    )
+    latest_targets = targets.loc[
+        (targets["date"] == targets["date"].max()) & targets["selected"]
+    ].sort_values("rank")
+    return {
+        "model_id": "bank_multifactor_v1",
+        "status": "RESEARCH_ONLY",
+        "warning": (
+            "The 2022+ period has been inspected during model development and is "
+            "validation evidence, not a pristine untouched test set."
+        ),
+        "latest_date": str(latest_date)[:10],
+        "report": _records(report),
+        "robustness": _records(robustness),
+        "promotion": evaluate_bank_model_promotion(
+            report, robustness, has_pristine_forward_period=False
+        ),
+        "latest_scores": _records(
+            latest_scores[
+                [
+                    "symbol", "score", "value_score", "defensive_score",
+                    "momentum_score", "quality_score",
+                ]
+            ].head(20)
+        ),
+        "latest_holdings": _records(
+            latest_targets[["symbol", "rank", "target"]]
+        ),
+    }
+
+
+@app.get("/api/bank-dashboard")
+def bank_dashboard() -> dict[str, object]:
+    model = bank_model()
+    store = ParquetStore(DATA)
+    equity = store.read("bank_model_equity").copy()
+    equity["date"] = equity["date"].astype(str).str[:10]
+    sampled = equity.iloc[::20]
+    shadow = _latest_bank_shadow()
+    return {
+        **model,
+        "mode": "PAPER_ONLY",
+        "shadow": shadow,
+        "timing": bank_timing(),
+        "scheduler": task_service.config(),
+        "recent_runs": task_service.runs(10),
+        "equity_curve": _records(sampled[["date", "equity", "drawdown"]]),
+    }
+
+
+@app.get("/api/bank-timing")
+def bank_timing() -> dict[str, object]:
+    store = ParquetStore(DATA)
+    try:
+        report = store.read("bank_timing_report")
+        degrees = store.read("bank_timing_degrees")
+        equity = store.read("bank_timing_equity")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    latest = (
+        degrees.sort_values("date")
+        .groupby("strategy", as_index=False)
+        .tail(1)
+        .sort_values("strategy")
+    )
+    active = "vol_target_12"
+    current = latest.loc[latest["strategy"] == active].iloc[0]
+    active_equity = equity.loc[equity["strategy"] == active].copy()
+    active_equity["date"] = active_equity["date"].astype(str).str[:10]
+    return {
+        "interface": "qlib_risk_degree",
+        "active_strategy": active,
+        "status": "PROSPECTIVE_CANDIDATE",
+        "risk_degree": float(current["risk_degree"]),
+        "base_gross_exposure": 0.8,
+        "bank_budget_fraction": float(current["risk_degree"]) / 0.8,
+        "latest_date": str(current["date"])[:10],
+        "report": _records(report),
+        "current": _records(latest),
+        "equity_curve": _records(
+            active_equity.iloc[::20][["date", "equity", "drawdown"]]
+        ),
+        "decision": (
+            "FULL_BANK_BUDGET"
+            if float(current["risk_degree"]) >= 0.8
+            else "REDUCED_BANK_BUDGET"
+        ),
+        "evidence_note": (
+            "The timing candidates were selected using already inspected history. "
+            "Only observations after 2026-07-27 are pristine forward evidence."
+        ),
+    }
+
+
+@app.get("/api/sector-portfolio")
+def sector_portfolio() -> dict[str, object]:
+    store = ParquetStore(DATA)
+    try:
+        recommendation = store.read("sector_portfolio_recommendation")
+        report = store.read("sector_model_report")
+        scores = store.read("sector_model_scores")
+        targets = store.read("sector_model_targets")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+    config = yaml.safe_load(
+        (ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
+    )
+    latest_date = scores["date"].max()
+    latest_scores = scores.loc[scores["date"] == latest_date].copy()
+    latest_targets = targets.loc[targets["date"] == targets["date"].max()].copy()
+    ranked = latest_scores.merge(
+        latest_targets[["sector", "symbol", "rank", "selected", "target"]],
+        on=["sector", "symbol"],
+        how="left",
+    ).sort_values(["sector", "rank", "score"], ascending=[True, True, False])
+
+    display_names = {
+        "growth": "创业板ETF易方达前十大",
+        "metals": "工业有色ETF万家前十大",
+        "dividend": "红利ETF易方达前十大",
+        "chip": "芯片ETF国泰前十大",
+    }
+    universes = []
+    for sector, definition in config["universes"].items():
+        universes.append(
+            {
+                "sector": sector,
+                "name": display_names[sector],
+                "fund_code": definition["etf_code"],
+                "style": definition["style"],
+                "factor_weights": definition["factors"],
+                "constituents": definition["holdings"],
+                "ranking": _records(ranked.loc[ranked["sector"] == sector]),
+            }
+        )
+    return {
+        "status": "PAPER_RESEARCH_ONLY",
+        "latest_date": str(latest_date)[:10],
+        "disclosure_date": str(config["disclosure_date"]),
+        "evidence_status": config["evidence_status"],
+        "warning": (
+            "Tushare 当前权限不含历史 ETF 持仓。行业池来自 2026-06-30 "
+            "披露快照，历史结果存在当前成分回看偏差，不属于无偏回测。"
+        ),
+        "allocation_method": config["allocation"]["method"],
+        "allocation": _records(recommendation.sort_values("budget_weight", ascending=False)),
+        "report": _records(report),
+        "universes": universes,
+    }
+
+
+@app.get("/api/bank-execution")
+def bank_execution() -> dict[str, object]:
+    broker = PaperBroker(PAPER_DATABASE)
+    broker.initialize_account(1_000_000, BANK_ACCOUNT)
+    with sqlite3.connect(PAPER_DATABASE) as connection:
+        connection.row_factory = sqlite3.Row
+        fills = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM fills WHERE account_id = ? ORDER BY id DESC LIMIT 100",
+                (BANK_ACCOUNT,),
+            )
+        ]
+        positions = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM positions WHERE account_id = ? AND quantity != 0
+                ORDER BY symbol
+                """,
+                (BANK_ACCOUNT,),
+            )
+        ]
+    orders = [
+        row for row in reversed(broker.orders())
+        if row.get("account_id") == BANK_ACCOUNT
+    ][:100]
+    latest = _latest_bank_shadow()
+    return {
+        "orders": orders,
+        "fills": fills,
+        "positions": positions,
+        "portfolio": latest.get("portfolio"),
+        "reconciliation": asdict(broker.reconcile(BANK_ACCOUNT)),
+    }
+
+
+def _latest_bank_shadow() -> dict[str, object]:
+    directory = STATE / "bank-shadow"
+    reports = sorted(directory.glob("*.json")) if directory.exists() else []
+    if not reports:
+        return {
+            "status": "AWAITING_FIRST_RUN",
+            "holdings": [],
+            "timing": {},
+            "ranking": [],
+            "orders": [],
+            "executions": [],
+            "portfolio": {
+                "cash": 1_000_000,
+                "market_value": 0,
+                "equity": 1_000_000,
+                "positions": [],
+            },
+        }
+    return json.loads(reports[-1].read_text(encoding="utf-8"))
 
 
 @app.get("/api/overview")

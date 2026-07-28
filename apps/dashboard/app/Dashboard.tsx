@@ -1,413 +1,299 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
-type Page = "overview" | "research" | "backtest" | "execution" | "tasks" | "reconcile";
-type Run = { id: number; trade_date: string; source: string; status: string; started_at: string; finished_at?: string; error?: string | null };
-type Overview = {
-  mode: string; symbol: string; symbol_name: string; latest_data_date: string; latest_price: number;
-  decision: { action: string; reason_code: string; target_weight: number; fast_ma: number; slow_ma: number };
-  portfolio: { cash: number; equity: number; position_quantity: number; available_quantity: number };
-  reconciliation: Reconciliation;
-  recent_runs: Run[];
-  scheduler: TaskConfig;
-};
-type Reconciliation = {
-  matched: boolean; expected_cash: number; actual_cash: number; expected_quantity: number;
-  actual_quantity: number; cash_difference: number; quantity_difference: number;
-  filled_order_count: number; fill_count: number; missing_fill_count: number; orphan_fill_count: number;
-};
-type Research = {
-  symbol: string; symbol_name: string;
-  strategy: { id: string; fast: number; slow: number; account_weight: number; research_sleeve_weight: number; execution: string; status: string };
-  fundamental_context: { summary: string; strengths: string[]; risks: string[]; source: string; source_url: string } | null;
-  primary: Record<string, string | number>[];
-  robustness: Record<string, string | number>[];
-  weighted_strategies: Record<string, string | number>[];
-  allocations: Record<string, number>[];
-  annual: Record<string, number>[];
-  trades: Record<string, string | number>[];
+type Page = "overview" | "factors" | "portfolio" | "execution" | "pipeline";
+type Row = Record<string, unknown>;
+type Run = { id: number; trade_date: string; source: string; status: string; started_at: string; error?: string | null };
+type DashboardData = {
+  mode: string;
+  model_id: string;
+  status: string;
+  latest_date: string;
+  warning: string;
+  report: Row[];
+  robustness: Row[];
+  promotion: { eligible: boolean; status: string; checks: Record<string, boolean>; reasons: string[] };
+  latest_scores: Row[];
+  latest_holdings: Row[];
   equity_curve: { date: string; equity: number; drawdown: number }[];
+  scheduler: { enabled: boolean; time: string; timezone: string; next_run?: string };
+  recent_runs: Run[];
+  timing: {
+    interface: string; active_strategy: string; status: string; risk_degree: number;
+    base_gross_exposure: number; bank_budget_fraction: number; latest_date: string;
+    decision: string; evidence_note: string; report: Row[]; current: Row[];
+  };
+  shadow: {
+    status: string; trade_date?: string; model_id?: string; holdings: string[];
+    ranking: Row[]; orders: Row[]; executions: Row[];
+    portfolio: { cash: number; market_value: number; equity: number; positions: Row[] };
+    reconciliation?: Record<string, unknown>;
+  };
 };
-type Execution = {
-  orders: Record<string, string | number>[];
-  fills: Record<string, string | number>[];
-  attempts: Record<string, string | number>[];
-  positions: Record<string, string | number>[];
-  reconciliation: Reconciliation;
+type FactorData = {
+  universe: string; latest_date: string; latest_members: number;
+  membership_rows: number; ic: Row[]; period_ic: Row[]; quantiles: Row[];
 };
-type TaskConfig = { enabled: boolean; hour: number; minute: number; schedule: string; timezone: string };
-type Candidate = {
-  symbol: string; name: string; enabled: boolean; target_weight: number; research_status: string;
-  latest_date: string; latest_price: number; action: string; reason_code: string;
-  signal_weight: number; position_quantity: number; market_value: number;
+type ExecutionData = {
+  orders: Row[]; fills: Row[]; positions: Row[];
+  portfolio: DashboardData["shadow"]["portfolio"] | null;
+  reconciliation: Record<string, unknown>;
 };
-type CandidatePool = { items: Candidate[]; active_count: number; target_gross_weight: number; max_gross_weight: number };
+type SectorData = {
+  status: string; latest_date: string; disclosure_date: string;
+  evidence_status: string; warning: string; allocation_method: string;
+  allocation: Row[]; report: Row[];
+  universes: { sector: string; name: string; fund_code: string; style: string; ranking: Row[] }[];
+};
 
-const API = "";
-const money = new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 2 });
-const pct = (value: number) => `${(value * 100).toFixed(2)}%`;
-const num = (value: number) => Number(value).toFixed(2);
-
-const pages: { id: Page; icon: string; label: string }[] = [
-  { id: "overview", icon: "◈", label: "总览" },
-  { id: "research", icon: "⌁", label: "策略研究" },
-  { id: "backtest", icon: "◒", label: "回测分析" },
-  { id: "execution", icon: "⇄", label: "订单成交" },
-  { id: "tasks", icon: "◎", label: "任务配置" },
-  { id: "reconcile", icon: "✓", label: "资金对账" },
+const pages: { id: Page; label: string; eyebrow: string }[] = [
+  { id: "overview", label: "组合总览", eyebrow: "MONITOR" },
+  { id: "factors", label: "因子研究", eyebrow: "RESEARCH" },
+  { id: "portfolio", label: "组合构建", eyebrow: "TOP-K" },
+  { id: "execution", label: "成交对账", eyebrow: "SHADOW" },
+  { id: "pipeline", label: "每日流水线", eyebrow: "OPS" },
 ];
 
-const titles: Record<Page, [string, string]> = {
-  overview: ["PERSONAL QUANT COMMAND", "量化运行总览"],
-  research: ["M3 RESEARCH LAB", "策略研究"],
-  backtest: ["EVIDENCE BEFORE CAPITAL", "回测分析"],
-  execution: ["PAPER EXECUTION LEDGER", "订单与成交"],
-  tasks: ["SERVICE AUTOMATION", "任务配置"],
-  reconcile: ["THREE-WAY RECONCILIATION", "资金与持仓对账"],
+const factorNames: Record<string, string> = {
+  pe_ttm: "市盈率", pb: "市净率", dividend_yield: "股息率", volatility_20d: "20日波动",
+  volatility_60d: "60日波动", max_drawdown_120d: "120日回撤", return_20d: "20日动量",
+  return_60d: "60日动量", return_120d: "120日动量", roe: "ROE", roa: "ROA",
+  net_profit_growth: "净利润增速", revenue_growth: "营收增速",
 };
+
+async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, { cache: "no-store", ...init });
+  if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+  return response.json() as Promise<T>;
+}
+const money = (v: unknown) => Number(v ?? 0).toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+const pct = (v: unknown) => `${(Number(v ?? 0) * 100).toFixed(2)}%`;
+const num = (v: unknown, digits = 2) => Number(v ?? 0).toFixed(digits);
+const text = (v: unknown) => v === null || v === undefined ? "—" : String(v);
 
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("overview");
-  const [overview, setOverview] = useState<Overview | null>(null);
-  const [candidatePool, setCandidatePool] = useState<CandidatePool | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState("600036.SH");
-  const [research, setResearch] = useState<Research | null>(null);
-  const [execution, setExecution] = useState<Execution | null>(null);
-  const [runs, setRuns] = useState<Run[]>([]);
-  const [taskConfig, setTaskConfig] = useState<TaskConfig | null>(null);
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [factors, setFactors] = useState<FactorData | null>(null);
+  const [execution, setExecution] = useState<ExecutionData | null>(null);
+  const [sectors, setSectors] = useState<SectorData | null>(null);
   const [error, setError] = useState("");
-  const [running, setRunning] = useState(false);
-  const [updatedAt, setUpdatedAt] = useState("");
-
-  const getJson = useCallback(async <T,>(path: string): Promise<T> => {
-    const response = await fetch(`${API}${path}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`${path}: ${response.status}`);
-    return response.json();
-  }, []);
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [base, pool] = await Promise.all([
-        getJson<Overview>(`/api/overview?symbol=${selectedSymbol}`),
-        getJson<CandidatePool>("/api/candidates"),
+      const [dashboard, factorData, executionData, sectorData] = await Promise.all([
+        getJson<DashboardData>("/api/bank-dashboard"),
+        getJson<FactorData>("/api/factor-research?universe=bank_cn"),
+        getJson<ExecutionData>("/api/bank-execution"),
+        getJson<SectorData>("/api/sector-portfolio"),
       ]);
-      setOverview(base);
-      setCandidatePool(pool);
-      setTaskConfig(base.scheduler);
-      if (page === "research" || page === "backtest") setResearch(await getJson<Research>(`/api/research?symbol=${selectedSymbol}`));
-      if (page === "execution" || page === "reconcile") setExecution(await getJson<Execution>("/api/execution"));
-      if (page === "tasks") setRuns(await getJson<Run[]>("/api/tasks"));
-      setError("");
-      setUpdatedAt(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
-    } catch {
-      setError("服务端暂时不可用，正在重试");
-    }
-  }, [getJson, page, selectedSymbol]);
+      setData(dashboard); setFactors(factorData); setExecution(executionData); setSectors(sectorData); setError("");
+    } catch (e) { setError(e instanceof Error ? e.message : "服务暂不可用"); }
+  }, []);
 
   useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, 5000);
-    return () => window.clearInterval(timer);
+    const initial = window.setTimeout(() => void refresh(), 0);
+    const interval = window.setInterval(refresh, 30_000);
+    return () => { clearTimeout(initial); clearInterval(interval); };
   }, [refresh]);
 
-  async function runNow() {
-    setRunning(true);
+  const runPipeline = async () => {
+    setBusy(true);
     try {
-      await fetch("/api/tasks/daily-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      window.setTimeout(refresh, 500);
-    } finally {
-      setRunning(false);
-    }
+      await getJson("/api/tasks/daily-run", { method: "POST" });
+      window.setTimeout(() => void refresh(), 1200);
+    } catch (e) { setError(e instanceof Error ? e.message : "触发失败"); }
+    finally { setBusy(false); }
+  };
+
+  if (!data || !factors || !execution || !sectors) {
+    return <main className="loading"><span className="pulse">M</span><p>{error || "正在连接 MoneyMore 组合服务…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   }
 
-  async function saveTaskConfig(next: TaskConfig) {
-    const response = await fetch("/api/task-config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: next.enabled, hour: next.hour, minute: next.minute }),
-    });
-    if (response.ok) setTaskConfig(await response.json());
-  }
-
-  async function addCandidate(symbol: string, name: string) {
-    const response = await fetch("/api/candidates", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol, name }),
-    });
-    if (!response.ok) {
-      const detail = await response.json();
-      throw new Error(detail.detail ?? "添加失败");
-    }
-    setSelectedSymbol(symbol.toUpperCase());
-  }
-
-  if (!overview) return <Loading error={error} />;
-  const [eyebrow, title] = titles[page];
-
+  const active = pages.find((item) => item.id === page)!;
   return (
-    <main className="app-shell">
-      <Sidebar page={page} onChange={setPage} />
-      <section className="workspace">
-        <header>
-          <div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1></div>
-          <div className="header-actions">
-            <span className="last-update">更新于 {updatedAt}</span>
-            <button className="ghost" onClick={refresh}>刷新</button>
-            <button className="primary" onClick={runNow} disabled={running}>{running ? "提交中…" : "立即运行"}</button>
-          </div>
-        </header>
-        {error && <div className="warning">{error}</div>}
-        <StatusStrip scheduler={taskConfig ?? overview.scheduler} />
-        {page === "overview" && candidatePool && <OverviewPage data={overview} pool={candidatePool} selectedSymbol={selectedSymbol} onSelect={setSelectedSymbol} onAdd={addCandidate} onNavigate={setPage} />}
-        {page === "research" && (research ? <ResearchPage data={research} /> : <SectionLoading />)}
-        {page === "backtest" && (research ? <BacktestPage data={research} /> : <SectionLoading />)}
-        {page === "execution" && (execution ? <ExecutionPage data={execution} /> : <SectionLoading />)}
-        {page === "tasks" && taskConfig && <TasksPage config={taskConfig} runs={runs} onSave={saveTaskConfig} onRun={runNow} running={running} />}
-        {page === "reconcile" && (execution ? <ReconciliationPage data={execution.reconciliation} positions={execution.positions} /> : <SectionLoading />)}
-      </section>
-    </main>
-  );
-}
-
-function Sidebar({ page, onChange }: { page: Page; onChange: (page: Page) => void }) {
-  return (
-    <aside className="sidebar">
-      <div className="identity"><div className="brand-mark">M</div><div><strong>MoneyMore</strong><span>QUANT OS</span></div></div>
-      <nav>
-        {pages.map((item) => (
-          <button key={item.id} className={`nav-item ${page === item.id ? "active" : ""}`} onClick={() => onChange(item.id)}>
-            <span>{item.icon}</span>{item.label}
-          </button>
-        ))}
-      </nav>
-      <div className="safety-card"><span className="pulse" /><div><strong>纸面交易模式</strong><small>真实委托保持锁定</small></div></div>
-      <div className="sidebar-foot"><span>服务状态</span><strong><i />在线</strong></div>
-    </aside>
-  );
-}
-
-function StatusStrip({ scheduler }: { scheduler: TaskConfig }) {
-  return (
-    <div className="status-strip">
-      <div><span className="live-dot" />服务端持续运行</div>
-      <span>下一次任务 · {scheduler.enabled ? scheduler.schedule : "已暂停"}</span>
-      <span>{scheduler.timezone}</span><b>只读实盘权限</b>
+    <div className="shell">
+      <aside className="sidebar">
+        <div className="brand"><span>M</span><div><strong>MoneyMore</strong><small>QUANT RESEARCH SYSTEM</small></div></div>
+        <div className="model-card"><small>ACTIVE RESEARCH</small><b>银行多因子组合</b><span>Top 8 · 月度调仓 · 影子盘</span></div>
+        <nav>{pages.map((item, index) => <button className={page === item.id ? "active" : ""} key={item.id} onClick={() => setPage(item.id)}><i>0{index + 1}</i><span>{item.label}<small>{item.eyebrow}</small></span></button>)}</nav>
+        <div className="sidebar-foot"><span className="live-dot" /> PAPER ONLY<br/><small>{data.scheduler.time} {data.scheduler.timezone}</small></div>
+      </aside>
+      <main className="content">
+        <header><div><small>{active.eyebrow} / BANK_CN</small><h1>{active.label}</h1></div><div className="actions"><button className="ghost" onClick={() => void refresh()}>刷新数据</button><button className="primary" disabled={busy} onClick={() => void runPipeline()}>{busy ? "启动中…" : "运行今日流水线"}</button></div></header>
+        {error && <div className="error">{error}</div>}
+        {page === "overview" && <Overview data={data} sectors={sectors} />}
+        {page === "factors" && <Factors data={factors} />}
+        {page === "portfolio" && <Portfolio data={data} sectors={sectors} />}
+        {page === "execution" && <Execution data={execution} />}
+        {page === "pipeline" && <Pipeline data={data} />}
+      </main>
     </div>
   );
 }
 
-function OverviewPage({ data, pool, selectedSymbol, onSelect, onAdd, onNavigate }: {
-  data: Overview; pool: CandidatePool; selectedSymbol: string;
-  onSelect: (symbol: string) => void; onAdd: (symbol: string, name: string) => Promise<void>;
-  onNavigate: (page: Page) => void;
-}) {
-  const active = data.decision.target_weight > 0;
-  const bars = [36, 43, 39, 56, 49, 62, 58, 71, 68, 76, 73, 82, 79, 88, 84, 92];
-  return (
-    <>
-      <CandidatePortfolio pool={pool} selectedSymbol={selectedSymbol} onSelect={onSelect} onAdd={onAdd} />
-      <section className="hero-grid">
-        <article className="market-card">
-          <div className="card-head"><div><span className="code">{data.symbol}</span><h2>{data.symbol_name}</h2></div><span className="date-chip">数据 {data.latest_data_date}</span></div>
-          <div className="quote-row"><strong>¥{data.latest_price.toFixed(2)}</strong><span className={active ? "positive" : "neutral"}>{active ? "趋势开启" : "趋势观察"}</span></div>
-          <div className="mini-chart" aria-label="策略趋势示意">{bars.map((height, index) => <i key={index} style={{ height: `${height}%` }} />)}<div className="chart-line fast" /><div className="chart-line slow" /></div>
-          <div className="legend"><span><i className="fast-key" />MA120 {data.decision.fast_ma.toFixed(2)}</span><span><i className="slow-key" />MA250 {data.decision.slow_ma.toFixed(2)}</span></div>
-        </article>
-        <article className="signal-card">
-          <div className="card-head"><span className="section-label">M3 STRATEGY SIGNAL</span><span className={`signal-pill ${active ? "on" : ""}`}>{active ? "持有" : "空仓"}</span></div>
-          <div className="signal-orbit"><div><small>目标仓位</small><strong>{(data.decision.target_weight * 100).toFixed(0)}%</strong><span>{data.decision.action}</span></div></div>
-          <div className="logic-row"><span>策略判断</span><strong>{data.decision.reason_code}</strong></div><div className="logic-row"><span>执行规则</span><strong>次交易日开盘</strong></div>
-        </article>
-      </section>
-      <section className="metric-grid">
-        <Metric label="账户权益" value={money.format(data.portfolio.equity)} note="纸面账户" />
-        <Metric label="可用现金" value={money.format(data.portfolio.cash)} note="实时账本" />
-        <Metric label="当前持仓" value={`${data.portfolio.position_quantity} 股`} note={`可卖 ${data.portfolio.available_quantity}`} />
-        <Metric label="三方对账" value={data.reconciliation.matched ? "账实相符" : "发现差异"} note={`现金差 ¥${data.reconciliation.cash_difference.toFixed(2)}`} good={data.reconciliation.matched} />
-      </section>
-      <section className="lower-grid">
-        <article className="runs-card"><div className="card-head"><div><span className="section-label">AUTOMATION</span><h3>最近任务</h3></div><button className="text-button" onClick={() => onNavigate("tasks")}>查看全部 →</button></div><RunList runs={data.recent_runs} /></article>
-        <article className="guard-card"><div><span className="section-label">RISK GUARD</span><h3>风险护栏</h3></div><Guard label="单标的仓位" value="≤ 10%" /><Guard label="账户回撤熔断" value="15%" /><Guard label="A股 T+1" value="已启用" /><Guard label="真实委托" value="已锁定" locked /></article>
-      </section>
-    </>
-  );
+function Overview({ data, sectors }: { data: DashboardData; sectors: SectorData }) {
+  const sample = data.report.find((r) => r.period === "sample_out") ?? data.report.at(-1) ?? {};
+  const portfolio = data.shadow.portfolio;
+  return <>
+    <section className="advice-banner">
+      <div><span className="tag orange">当前建仓建议</span><b>银行模拟仓持股 {pct(data.timing.risk_degree)}</b><p>若银行预算固定为总账户10%，当前目标银行持股为总账户 <strong>{pct(data.timing.risk_degree * 0.1)}</strong>，其余 <strong>{pct((1 - data.timing.risk_degree) * 0.1)}</strong> 保留现金。</p></div>
+      <div><small>QLIB RISK DEGREE</small><b>{pct(data.timing.risk_degree)}</b><span>{data.timing.active_strategy} · {data.timing.latest_date}</span></div>
+    </section>
+    <section className="hero">
+      <div><span className="tag orange">PROSPECTIVE CANDIDATE</span><h2>从单股择时，升级为<br/><em>横截面选股 + 组合执行</em></h2><p>价值、防御与动量共同排序；质量因子暂时降权为零。策略只运行影子盘，真实前瞻证据从 2026-07-27 起累计。</p></div>
+      <div className="hero-score"><small>MODEL SCORECARD</small><b>{num(sample.sharpe)}</b><span>样本外夏普</span><hr/><label>{pct(sample.cagr)} 年化 · {pct(sample.max_drawdown)} 最大回撤</label></div>
+    </section>
+    <section className="metrics">
+      <Metric label="影子账户权益" value={`¥ ${money(portfolio.equity)}`} note={`${portfolio.positions?.length ?? 0} 个实际持仓`} />
+      <Metric label="目标持仓" value={`${data.shadow.holdings?.length ?? 0} / 8`} note={`信号日 ${data.shadow.trade_date ?? "待首次运行"}`} />
+      <Metric label="研究股票池" value="39" note={`数据截至 ${data.latest_date}`} />
+      <Metric label="银行模拟仓持股" value={pct(data.timing.risk_degree)} note={`总账户10%预算时实际持股 ${pct(data.timing.risk_degree * 0.1)}`} tone="orange" />
+    </section>
+    <Card title="跨行业动态仓位" subtitle={`银行 + 四类 ETF 权重股 · ${sectors.allocation_method}`}>
+      <DataTable rows={sectors.allocation} columns={[["sector","行业袖套"],["budget_weight","风险预算"],["risk_degree","择时仓位"],["target_weight","账户目标"],["cash_weight","保留现金"],["selected","当前候选"]]} format={{ budget_weight: pct, risk_degree: pct, target_weight: pct, cash_weight: pct }} />
+      <p className="evidence-note">{sectors.warning}</p>
+    </Card>
+    <div className="grid two">
+      <Card title="组合净值与回撤" subtitle="历史研究曲线，仅用于模型证据"><EquityCurve rows={data.equity_curve} /></Card>
+      <Card title="当前目标篮子" subtitle="缓冲区与最多两只替换约束"><HoldingTiles rows={data.latest_holdings} /></Card>
+    </div>
+    <div className="grid two lower">
+      <Card title="建仓建议" subtitle="Qlib risk_degree 动态市场暴露"><TimingAdvice timing={data.timing} /></Card>
+      <Card title="最近流水线" subtitle="服务端常驻任务记录"><RunList rows={data.recent_runs.slice(0, 6)} /></Card>
+    </div>
+    <Card title="模型晋级门槛" subtitle="不因漂亮回测自动进入模拟主策略"><Gate promotion={data.promotion} /></Card>
+  </>;
 }
 
-function CandidatePortfolio({ pool, selectedSymbol, onSelect, onAdd }: {
-  pool: CandidatePool; selectedSymbol: string; onSelect: (symbol: string) => void;
-  onAdd: (symbol: string, name: string) => Promise<void>;
-}) {
-  const [adding, setAdding] = useState(false);
-  const [symbol, setSymbol] = useState("");
-  const [name, setName] = useState("");
-  const [message, setMessage] = useState("");
-  async function submit() {
-    try {
-      await onAdd(symbol, name);
-      setAdding(false); setSymbol(""); setName(""); setMessage("");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "添加失败");
-    }
-  }
-  return (
-    <article className="portfolio-card">
-      <div className="card-head">
-        <div><span className="section-label">CANDIDATE PORTFOLIO</span><h3>候选股组合</h3></div>
-        <div className="pool-summary"><span>{pool.active_count} 个候选</span><strong>目标上限 {pct(pool.target_gross_weight)}</strong><small>组合护栏 {pct(pool.max_gross_weight)}</small></div>
-      </div>
-      <div className="candidate-list">
-        {pool.items.map((item) => (
-          <button key={item.symbol} className={`candidate-item ${selectedSymbol === item.symbol ? "selected" : ""}`} onClick={() => onSelect(item.symbol)}>
-            <div className="candidate-top"><span>{item.symbol}</span><i className={item.research_status.toLowerCase()}>{item.research_status}</i></div>
-            <strong>{item.name}</strong>
-            <div className="candidate-quote"><b>¥{item.latest_price.toFixed(2)}</b><span>{item.action}</span></div>
-            <div className="candidate-foot"><span>目标 {pct(item.target_weight)}</span><span>持仓 {item.position_quantity}</span></div>
-          </button>
-        ))}
-        <button className="candidate-add" onClick={() => setAdding(!adding)}><b>＋</b><span>增加候选股</span></button>
-      </div>
-      {adding && <div className="add-candidate-form"><input aria-label="证券代码" placeholder="例如 600900.SH" value={symbol} onChange={(event) => setSymbol(event.target.value)} /><input aria-label="股票名称" placeholder="股票名称" value={name} onChange={(event) => setName(event.target.value)} /><button className="primary" onClick={submit}>加入候选池</button>{message && <span>{message}</span>}</div>}
-    </article>
-  );
+function Factors({ data }: { data: FactorData }) {
+  const periods = data.period_ic.filter((r) => Number(r.horizon) === 20);
+  const train = periods.filter((r) => r.period === "sample_in").sort((a, b) => Math.abs(Number(b.rank_ic_mean)) - Math.abs(Number(a.rank_ic_mean)));
+  const out = periods.filter((r) => r.period === "sample_out");
+  return <>
+    <section className="page-intro"><div><span className="tag">POINT-IN-TIME</span><h2>因子不是指标陈列，<br/>而是一套证据生产线。</h2></div><p>所有基本面字段按可用日期对齐，横截面去极值、标准化；IC 与分层收益分别在样本内外观察。</p></section>
+    <section className="metrics">
+      <Metric label="因子注册表" value="21" note="价格 / 估值 / 基本面 / 分红" />
+      <Metric label="当前成分股" value={text(data.latest_members)} note={`银行股 · ${data.latest_date}`} />
+      <Metric label="历史成员记录" value={money(data.membership_rows)} note="避免幸存者偏差" />
+      <Metric label="观察窗口" value="20D" note="Rank IC 主视角" />
+    </section>
+    <div className="grid two">
+      <Card title="样本内 Rank IC" subtitle="按绝对均值排序">
+        <div className="factor-list">{train.slice(0, 10).map((row) => <FactorBar key={text(row.factor)} row={row} />)}</div>
+      </Card>
+      <Card title="样本外对照" subtitle="同因子、同口径，不重新调参">
+        <DataTable rows={out.slice(0, 12)} columns={[["factor","因子"],["rank_ic_mean","Rank IC"],["rank_ic_ir","ICIR"],["count","样本"]]} format={{ factor: (v) => factorNames[text(v)] ?? text(v), rank_ic_mean: num, rank_ic_ir: num }} />
+      </Card>
+    </div>
+    <Card title="研究纪律" subtitle="当前结论的证据边界">
+      <div className="principles"><div><b>01</b><span><strong>不偷看未来</strong>财报按公告可用日进入截面。</span></div><div><b>02</b><span><strong>不把验证集叫测试集</strong>2022 年后已参与开发判断。</span></div><div><b>03</b><span><strong>前瞻才能晋级</strong>2026-07-27 后影子盘是新增证据。</span></div></div>
+    </Card>
+  </>;
 }
 
-function ResearchPage({ data }: { data: Research }) {
-  const oos = data.primary.find((row) => row.strategy === "trend_120_250" && row.period === "out_of_sample");
-  const watch = data.strategy.status === "WATCH";
-  return (
-    <>
-      <section className="research-hero">
-        <article className="strategy-identity">
-          <span className="section-label">FIXED CANDIDATE · {data.symbol}</span><h2>{data.symbol_name} · MA120 / MA250</h2>
-          <p>价格站上慢线且快线高于慢线时持有；信号收盘确认，下一交易日开盘成交。</p>
-          <div className="strategy-tags"><span>{data.symbol_name}</span><span>账户仓位 10%</span><span>样本外 2022—2026</span></div>
-        </article>
-        <article className={`verdict-card ${watch ? "watch" : ""}`}><small>研究结论</small><strong>{watch ? "观察候选" : "稳健候选"}</strong><p>{watch ? "趋势过滤降低波动，但样本外收益与夏普偏弱，暂不升级为正式候选。" : "降低单股深度回撤，但收益能力有限，适合作为低权重策略组件。"}</p></article>
-      </section>
-      <section className="metric-grid research-metrics">
-        <Metric label="样本外 CAGR" value={pct(Number(oos?.cagr ?? 0))} note="80% 研究袖套" />
-        <Metric label="最大回撤" value={pct(Number(oos?.max_drawdown ?? 0))} note="样本外" good />
-        <Metric label="夏普比率" value={num(Number(oos?.sharpe ?? 0))} note="无风险利率 0" />
-        <Metric label="成交次数" value={`${Number(oos?.fills_full ?? 0)} 笔`} note="完整历史" />
-      </section>
-      <article className="table-card">
-        <div className="card-head"><div><span className="section-label">PRE-REGISTERED TESTS</span><h3>预注册策略对比</h3></div><span className="date-chip">训练 / 样本外严格分离</span></div>
-        <DataTable columns={["strategy", "period", "cagr", "max_drawdown", "sharpe", "average_exposure"]} rows={data.primary} percent={["cagr", "max_drawdown", "average_exposure"]} />
-      </article>
-      <article className="table-card weighted-card">
-        <div className="card-head"><div><span className="section-label">WEIGHTED STRATEGIES · GEN 2</span><h3>基础持仓 + 战术权重</h3></div><span className="date-chip">研究中 · 尚未用于纸面交易</span></div>
-        <p className="table-intro">不再把股票简化为全仓或清仓。基础仓位负责长期暴露，趋势或波动率模块只决定增减仓；所有信号仍在下一交易日开盘执行。</p>
-        <DataTable columns={["strategy", "period", "cagr", "volatility", "max_drawdown", "sharpe", "fills_full", "average_target"]} rows={data.weighted_strategies} percent={["cagr", "volatility", "max_drawdown", "average_target"]} />
-      </article>
-      {data.fundamental_context && <article className="context-card">
-        <div><span className="section-label">BUSINESS CONTEXT</span><h3>业务背景与非量化风险</h3><p>{data.fundamental_context.summary}</p><a href={data.fundamental_context.source_url} target="_blank" rel="noreferrer">{data.fundamental_context.source} →</a></div>
-        <div><strong>观察优势</strong>{data.fundamental_context.strengths.map((item) => <span key={item}>＋ {item}</span>)}</div>
-        <div><strong>核心风险</strong>{data.fundamental_context.risks.map((item) => <span key={item}>— {item}</span>)}</div>
-      </article>}
-      <article className="table-card">
-        <div className="card-head"><div><span className="section-label">ROBUSTNESS</span><h3>参数与成本压力测试</h3></div></div>
-        <DataTable columns={["strategy", "scenario", "cagr", "max_drawdown", "sharpe"]} rows={data.robustness} percent={["cagr", "max_drawdown"]} />
-      </article>
-    </>
-  );
+function Portfolio({ data, sectors }: { data: DashboardData; sectors: SectorData }) {
+  const rows = data.shadow.ranking?.length ? data.shadow.ranking : data.latest_scores;
+  return <>
+    <section className="page-intro"><div><span className="tag">BANK MULTIFACTOR</span><h2>选最强的一篮子，<br/>不是赌一条均线。</h2></div><p>价值 47.1% · 防御 29.4% · 动量 23.5%。Top 8 入选，Rank 12 缓冲，每期最多替换 2 只，抑制换手。</p></section>
+    <div className="grid portfolio-layout">
+      <Card title="组合构建规则" subtitle="已冻结的前瞻候选模型">
+        <div className="weights"><Weight name="价值" value={47.1}/><Weight name="防御" value={29.4}/><Weight name="动量" value={23.5}/><Weight name="质量" value={0}/></div>
+        <div className="rule-strip"><span>TOP <b>8</b></span><span>BUFFER <b>12</b></span><span>MAX SWAP <b>2</b></span><span>WEIGHT <b>10%</b></span></div>
+      </Card>
+      <Card title="目标持仓" subtitle={`生成日期 ${data.shadow.trade_date ?? data.latest_date}`}><HoldingTiles rows={data.shadow.holdings?.length ? data.shadow.ranking.filter(r => Boolean(r.selected)) : data.latest_holdings} /></Card>
+    </div>
+    <Card title="择时策略比较" subtitle="相同Top-K、成本和T+1成交规则；KAMA保留为被拒绝基线">
+      <DataTable rows={data.timing.report} columns={[["strategy","risk_degree策略"],["period","区间"],["cagr","年化"],["max_drawdown","最大回撤"],["sharpe","夏普"],["average_risk_degree","平均风险度"],["fills","成交数"]]} format={{ cagr: pct, max_drawdown: pct, sharpe: num, average_risk_degree: pct, fills: money }} />
+    </Card>
+    <Card title="实时横截面排名" subtitle={`${rows.length} 只银行股的可审计打分结果`}>
+      <DataTable rows={rows} columns={[["rank","排名"],["symbol","证券"],["score","总分"],["value_score","价值"],["defensive_score","防御"],["momentum_score","动量"],["selected","目标"]]} format={{ score: num, value_score: num, defensive_score: num, momentum_score: num, selected: (v) => v ? "持有" : "—" }} />
+    </Card>
+    <Card title="行业候选池与差异化模型" subtitle={`ETF 持仓披露日 ${sectors.disclosure_date} · 当前仅运行影子研究`}>
+      {sectors.universes.map((universe) => <div key={universe.sector} className="sector-block">
+        <h3>{universe.name} <small>{universe.fund_code} · {universe.style}</small></h3>
+        <DataTable rows={universe.ranking.slice(0, 10)} columns={[["rank","排名"],["symbol","证券"],["score","行业分"],["selected","目标"]]} format={{ score: num, selected: (v) => v ? "持有" : "—" }} />
+      </div>)}
+      <p className="evidence-note">{sectors.warning}</p>
+    </Card>
+  </>;
 }
 
-function BacktestPage({ data }: { data: Research }) {
-  const values = data.equity_curve.map((point) => point.equity);
-  const min = Math.min(...values), max = Math.max(...values);
-  return (
-    <>
-      <article className="equity-card">
-        <div className="card-head"><div><span className="section-label">EQUITY CURVE</span><h3>策略净值路径</h3></div><span className="date-chip">2015—2026 · 80%研究袖套</span></div>
-        <div className="equity-chart">
-          {data.equity_curve.map((point) => <i key={point.date} title={`${point.date} ${money.format(point.equity)}`} style={{ height: `${18 + ((point.equity - min) / Math.max(max - min, 1)) * 76}%` }} />)}
-        </div>
-        <div className="chart-axis"><span>{data.equity_curve[0]?.date}</span><span>{data.equity_curve.at(-1)?.date}</span></div>
-      </article>
-      <section className="split-grid">
-        <article className="table-card compact"><div className="card-head"><div><span className="section-label">ALLOCATION</span><h3>账户权重敏感性</h3></div></div><DataTable columns={["weight", "cagr", "volatility", "max_drawdown", "sharpe"]} rows={data.allocations} percent={["weight", "cagr", "volatility", "max_drawdown"]} /></article>
-        <article className="table-card compact"><div className="card-head"><div><span className="section-label">ANNUAL</span><h3>年度收益</h3></div></div><DataTable columns={["year", "trend_120_250", "cmb_buy_hold_80", "csi300_price", "csi_bank_price"]} rows={data.annual} percent={["trend_120_250", "cmb_buy_hold_80", "csi300_price", "csi_bank_price"]} /></article>
-      </section>
-      <article className="table-card"><div className="card-head"><div><span className="section-label">CLOSED TRADES</span><h3>历史闭合交易</h3></div><span className="date-chip">{data.trades.length} 笔</span></div><DataTable columns={["entry_date", "exit_date", "holding_days", "entry_price", "exit_price", "net_return", "fees"]} rows={data.trades} percent={["net_return"]} /></article>
-    </>
-  );
+function Execution({ data }: { data: ExecutionData }) {
+  const recon = data.reconciliation;
+  return <>
+    <section className="metrics">
+      <Metric label="账户权益" value={`¥ ${money(data.portfolio?.equity)}`} note="bank_shadow 独立账户" />
+      <Metric label="可用现金" value={`¥ ${money(data.portfolio?.cash)}`} note="收盘盯市" />
+      <Metric label="累计成交" value={text(data.fills.length)} note="最近 100 条" />
+      <Metric label="对账" value={recon.matched ? "一致" : "需检查"} note={`现金差 ${money(recon.cash_difference)}`} tone={recon.matched ? undefined : "orange"} />
+    </section>
+    <div className="grid two">
+      <Card title="当前持仓" subtitle="影子经纪商账本"><DataTable rows={data.positions} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["average_price","成本"]]} format={{ quantity: money, available_quantity: money, average_price: num }} empty="尚未发生首笔成交" /></Card>
+      <Card title="对账检查" subtitle="订单、成交、现金与持仓闭环"><Gate promotion={{ eligible: Boolean(recon.matched), status: "", checks: { "现金账一致": Number(recon.cash_difference) === 0, "持仓账一致": Number(recon.quantity_difference) === 0, "无缺失成交": Number(recon.missing_fill_count) === 0, "无孤儿成交": Number(recon.orphan_fill_count) === 0 }, reasons: [] }} /></Card>
+    </div>
+    <Card title="委托流水" subtitle="信号在下一交易日开盘撮合"><DataTable rows={data.orders} columns={[["trade_date","日期"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason","原因"]]} format={{ quantity: money }} empty="等待今日流水线生成委托" /></Card>
+    <Card title="成交明细" subtitle="费用与滑点进入影子账本"><DataTable rows={data.fills} columns={[["trade_date","日期"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","价格"],["commission","佣金"],["stamp_duty","印花税"]]} format={{ quantity: money, price: num, commission: num, stamp_duty: num }} empty="待下一交易日开盘撮合" /></Card>
+  </>;
 }
 
-function ExecutionPage({ data }: { data: Execution }) {
-  return (
-    <>
-      <section className="metric-grid">
-        <Metric label="订单总数" value={`${data.orders.length}`} note="最近 100 条" />
-        <Metric label="成交总数" value={`${data.fills.length}`} note="纸面成交" />
-        <Metric label="执行尝试" value={`${data.attempts.length}`} note="含延迟与拒绝" />
-        <Metric label="账本状态" value={data.reconciliation.matched ? "正常" : "异常"} note="三方对账" good={data.reconciliation.matched} />
-      </section>
-      <article className="table-card"><div className="card-head"><div><span className="section-label">ORDER INTENTS</span><h3>订单意图</h3></div></div><DataTable columns={["signal_date", "symbol", "side", "quantity", "status", "reason_code"]} rows={data.orders} /></article>
-      <section className="split-grid">
-        <article className="table-card compact"><div className="card-head"><div><span className="section-label">FILLS</span><h3>成交回报</h3></div></div><DataTable columns={["trade_date", "side", "quantity", "price", "fee"]} rows={data.fills} /></article>
-        <article className="table-card compact"><div className="card-head"><div><span className="section-label">ATTEMPTS</span><h3>撮合尝试</h3></div></div><DataTable columns={["trade_date", "outcome", "reason_code"]} rows={data.attempts} /></article>
-      </section>
-    </>
-  );
+function Pipeline({ data }: { data: DashboardData }) {
+  const steps = [["01","交易日校验","确认交易日与最新可用数据"],["02","数据同步","行情、估值、财务与分红增量入库"],["03","因子截面","21 因子计算、去极值与标准化"],["04","组合构建","Top-K 排名、缓冲与换仓约束"],["05","影子撮合","前日委托按当日开盘成交"],["06","对账归档","现金、持仓、成交闭环并固化证据"]];
+  return <>
+    <section className="pipeline-hero"><div><span className="live-dot"/><small>SERVER SCHEDULER</small><h2>每日 {data.scheduler.time}</h2><p>{data.scheduler.timezone} · 服务端持续运行 · 非 Codex 自动任务</p></div><div className="next-run"><small>NEXT RUN</small><b>{data.scheduler.next_run ? new Date(data.scheduler.next_run).toLocaleString("zh-CN") : "由交易日历触发"}</b></div></section>
+    <div className="steps">{steps.map(([n,t,d]) => <div key={n}><b>{n}</b><span><strong>{t}</strong><small>{d}</small></span></div>)}</div>
+    <div className="grid two">
+      <Card title="最近运行" subtitle="手动与定时任务共用同一条流水线"><RunList rows={data.recent_runs} /></Card>
+      <Card title="实盘隔离线" subtitle="华泰 MiniQMT 审批完成前">
+        <div className="isolation"><b>PAPER_ONLY</b><p>行情与策略已产品化运行，但委托只写入 bank_shadow 影子账户。未来接入 QMT 时替换执行适配器，不改变研究、组合与风控层。</p><span>研究 → 组合 → 风控 → <em>Paper Broker</em></span></div>
+      </Card>
+    </div>
+  </>;
 }
 
-function TasksPage({ config, runs, onSave, onRun, running }: { config: TaskConfig; runs: Run[]; onSave: (next: TaskConfig) => void; onRun: () => void; running: boolean }) {
-  const [draft, setDraft] = useState(config);
-  useEffect(() => setDraft(config), [config]);
-  return (
-    <>
-      <section className="task-layout">
-        <article className="settings-card">
-          <div className="card-head"><div><span className="section-label">DAILY PIPELINE</span><h3>日终任务</h3></div><label className="switch"><input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /><span /></label></div>
-          <div className="setting-row"><div><strong>运行时间</strong><small>Asia/Shanghai，本机服务端调度</small></div><div className="time-fields"><input aria-label="小时" type="number" min="0" max="23" value={draft.hour} onChange={(event) => setDraft({ ...draft, hour: Number(event.target.value) })} /><b>:</b><input aria-label="分钟" type="number" min="0" max="59" value={draft.minute} onChange={(event) => setDraft({ ...draft, minute: Number(event.target.value) })} /></div></div>
-          <div className="pipeline-steps">{["交易日校验", "增量入库", "数据门禁", "撮合旧单", "生成信号", "三方对账"].map((step, index) => <div key={step}><i>{index + 1}</i><span>{step}</span></div>)}</div>
-          <div className="form-actions"><button className="ghost" onClick={onRun} disabled={running}>立即运行</button><button className="primary" onClick={() => onSave(draft)}>保存配置</button></div>
-        </article>
-        <article className="guard-card"><div><span className="section-label">IMMUTABLE CORE</span><h3>组合锁定项</h3></div><Guard label="候选池" value="逐股独立信号" /><Guard label="均线参数" value="120 / 250" /><Guard label="单股目标" value="10%" /><Guard label="执行模式" value="PAPER" locked /></article>
-      </section>
-      <article className="runs-card full"><div className="card-head"><div><span className="section-label">RUN HISTORY</span><h3>任务运行历史</h3></div><span className="date-chip">{runs.length} 条</span></div><RunList runs={runs} /></article>
-    </>
-  );
+function Card({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) {
+  return <section className="card"><div className="card-head"><div><h3>{title}</h3>{subtitle && <p>{subtitle}</p>}</div><span>•••</span></div>{children}</section>;
 }
-
-function ReconciliationPage({ data, positions }: { data: Reconciliation; positions: Record<string, string | number>[] }) {
-  return (
-    <>
-      <article className={`reconcile-hero ${data.matched ? "matched" : "broken"}`}><div className="reconcile-seal">{data.matched ? "✓" : "!"}</div><div><span className="section-label">RECONCILIATION RESULT</span><h2>{data.matched ? "账实完全相符" : "发现账本差异"}</h2><p>从成交流水独立重建现金与净持仓，并核对 FILLED 订单和成交回报。</p></div></article>
-      <section className="metric-grid">
-        <Metric label="账面现金" value={money.format(data.actual_cash)} note={`应有 ${money.format(data.expected_cash)}`} good={Math.abs(data.cash_difference) < 0.01} />
-        <Metric label="账面持仓" value={`${data.actual_quantity} 股`} note={`应有 ${data.expected_quantity} 股`} good={data.quantity_difference === 0} />
-        <Metric label="FILLED 订单" value={`${data.filled_order_count}`} note={`${data.fill_count} 条成交`} good={data.missing_fill_count === 0} />
-        <Metric label="孤儿成交" value={`${data.orphan_fill_count}`} note={`缺失成交 ${data.missing_fill_count}`} good={data.orphan_fill_count === 0} />
-      </section>
-      <article className="table-card"><div className="card-head"><div><span className="section-label">POSITIONS</span><h3>持仓账本</h3></div></div><DataTable columns={["symbol", "quantity", "available_quantity", "avg_cost", "last_buy_date"]} rows={positions} /></article>
-    </>
-  );
+function Metric({ label, value, note, tone }: { label: string; value: string; note: string; tone?: string }) {
+  return <div className={`metric ${tone ?? ""}`}><small>{label}</small><b>{value}</b><span>{note}</span></div>;
 }
-
-function DataTable({ columns, rows, percent = [] }: { columns: string[]; rows: Record<string, string | number>[]; percent?: string[] }) {
-  return (
-    <div className="table-scroll"><table><thead><tr>{columns.map((column) => <th key={column}>{column.replaceAll("_", " ")}</th>)}</tr></thead><tbody>
-      {rows.length === 0 && <tr><td colSpan={columns.length} className="empty-cell">暂无记录</td></tr>}
-      {rows.map((row, index) => <tr key={index}>{columns.map((column) => {
-        const value = row[column];
-        const shown = typeof value === "number" ? (percent.includes(column) ? pct(value) : Number.isInteger(value) ? value : num(value)) : value ?? "—";
-        return <td key={column}>{String(shown)}</td>;
-      })}</tr>)}
-    </tbody></table></div>
-  );
+function HoldingTiles({ rows }: { rows: Row[] }) {
+  return <div className="holdings">{rows.slice(0,8).map((r,i) => <div key={`${text(r.symbol)}-${i}`}><b>{text(r.rank ?? i + 1).padStart(2,"0")}</b><span><strong>{text(r.symbol)}</strong><small>{r.target ? pct(r.target) : "目标持仓"}</small></span></div>)}</div>;
 }
-
-function RunList({ runs }: { runs: Run[] }) {
-  return <div className="run-list">{runs.length === 0 && <p className="empty">服务已就绪，等待首次任务。</p>}{runs.map((run) => <div className="run-row" key={run.id}><div className={`run-icon ${run.status.toLowerCase()}`}>{run.status === "FAILED" ? "!" : "✓"}</div><div className="run-main"><strong>日终量化流水线</strong><span>{run.trade_date} · {run.source === "MANUAL" ? "手工触发" : "定时执行"}{run.error ? ` · ${run.error}` : ""}</span></div><span className={`run-status ${run.status.toLowerCase()}`}>{statusLabel(run.status)}</span></div>)}</div>;
+function RunList({ rows }: { rows: Run[] }) {
+  return <div className="runs">{rows.length ? rows.map(r => <div key={r.id}><span className={`status ${r.status.toLowerCase()}`}/><b>{r.trade_date}</b><span>{r.source}</span><em>{r.status}</em></div>) : <p className="empty">暂无运行记录</p>}</div>;
 }
-
-function statusLabel(status: string) {
-  return ({ COMPLETED: "已完成", RUNNING: "运行中", QUEUED: "排队中", FAILED: "失败", SKIPPED_MARKET_CLOSED: "休市跳过", SKIPPED_BUSY: "任务繁忙" } as Record<string, string>)[status] ?? status;
+function Gate({ promotion }: { promotion: DashboardData["promotion"] }) {
+  return <div className="gate">{Object.entries(promotion.checks).map(([name,ok]) => <div key={name}><span>{ok ? "✓" : "×"}</span><b>{name.replaceAll("_"," ")}</b><em>{ok ? "通过" : "未通过"}</em></div>)}</div>;
 }
-function Metric({ label, value, note, good }: { label: string; value: string; note: string; good?: boolean }) { return <article className="metric-card"><span>{label}</span><strong className={good ? "good" : ""}>{value}</strong><small>{note}</small></article>; }
-function Guard({ label, value, locked }: { label: string; value: string; locked?: boolean }) { return <div className="guard-row"><span>{label}</span><strong className={locked ? "locked" : ""}>{value}</strong></div>; }
-function Loading({ error }: { error: string }) { return <main className="loading-shell"><div className="brand-mark">M</div><p>{error || "正在连接 MoneyMore 服务…"}</p></main>; }
-function SectionLoading() { return <div className="section-loading"><i /><span>正在计算并载入真实研究数据…</span></div>; }
+function FactorBar({ row }: { row: Row }) {
+  const value = Number(row.rank_ic_mean ?? 0);
+  return <div className="factor-bar"><span>{factorNames[text(row.factor)] ?? text(row.factor)}</span><i><b style={{ width: `${Math.min(100, Math.abs(value) * 500)}%` }} className={value < 0 ? "negative" : ""}/></i><em>{num(value,3)}</em></div>;
+}
+function Weight({ name, value }: { name: string; value: number }) {
+  return <div><span><b>{name}</b><em>{value}%</em></span><i><b style={{ width: `${value}%` }}/></i></div>;
+}
+function TimingAdvice({ timing }: { timing: DashboardData["timing"] }) {
+  const enabled = timing.risk_degree;
+  return <div className="timing-advice">
+    <div><span>建议银行模拟仓持股</span><b>{pct(enabled)}</b></div>
+    <p>若银行模拟仓预算固定为总资金10%，当前目标银行持股约为总资金 <strong>{pct(enabled * 0.1)}</strong>，其余留在模拟现金。</p>
+    <div className="timing-scale"><i style={{ width: `${Math.min(100, enabled * 100)}%` }}/></div>
+    <ul><li>策略：{timing.active_strategy}</li><li>Qlib风险度：{pct(timing.risk_degree)}</li><li>证据状态：前瞻候选</li><li>数据日：{timing.latest_date}</li></ul>
+  </div>;
+}
+function DataTable({ rows, columns, format = {}, empty = "暂无数据" }: { rows: Row[]; columns: [string,string][]; format?: Record<string,(v: unknown) => string>; empty?: string }) {
+  if (!rows.length) return <p className="empty">{empty}</p>;
+  return <div className="table-wrap"><table><thead><tr>{columns.map(([,label]) => <th key={label}>{label}</th>)}</tr></thead><tbody>{rows.map((row,i) => <tr key={i}>{columns.map(([key]) => <td key={key}>{format[key] ? format[key](row[key]) : text(row[key])}</td>)}</tr>)}</tbody></table></div>;
+}
+function EquityCurve({ rows }: { rows: DashboardData["equity_curve"] }) {
+  const points = useMemo(() => {
+    if (!rows.length) return "";
+    const values = rows.map(r => r.equity); const min = Math.min(...values), max = Math.max(...values);
+    return rows.map((r,i) => `${(i/(rows.length-1||1))*100},${92-((r.equity-min)/(max-min||1))*78}`).join(" ");
+  }, [rows]);
+  const last = rows.at(-1);
+  return <div className="chart"><div className="chart-value"><b>{last ? num(last.equity,3) : "—"}</b><span>累计净值</span></div><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="组合净值曲线"><polyline points={points} fill="none" vectorEffect="non-scaling-stroke"/></svg><div className="chart-axis"><span>{rows[0]?.date}</span><span>{last?.date}</span></div></div>;
+}
