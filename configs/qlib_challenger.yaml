@@ -1,0 +1,43 @@
+account_id: qlib_gru_shadow
+model_id: qlib_gru_alpha360_v1
+feature_set: moneymore_alpha360_6x60
+sequence_length: 60
+label_horizon: 5
+top_k_per_sector: 2
+exit_rank_per_sector: 4
+rebalance_interval: 5
+target_gross_exposure: 0.40
+research_gate:
+  minimum_samples: 10000
+  minimum_rank_ic: 0.01
+  minimum_rank_ic_ir: 0.08
+  minimum_cost_adjusted_excess_return: 0.0
+  minimum_seed_count: 5
+  minimum_positive_seed_ratio: 0.80
+promotion_gate:
+  minimum_rank_ic: 0.02
+  minimum_rank_ic_ir: 0.10
+  minimum_forward_days: 20
+  minimum_forward_rank_ic: 0.0
+train:
+  start: "2015-01-01"
+  end: "2023-12-31"
+valid:
+  start: "2024-01-01"
+  end: "2024-12-31"
+test:
+  start: "2025-01-01"
+  end: "2026-07-26"
+forward:
+  start: "2026-07-27"
+  end: "2099-12-31"
+model:
+  d_feat: 6
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.1
+  n_epochs: 100
+  early_stop: 10
+  batch_size: 1024
+  learning_rate: 0.001
+  seeds: [17, 23, 42, 71, 101]

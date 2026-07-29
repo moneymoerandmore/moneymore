@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 type Row = Record<string, unknown>;
-type Page = "overview" | "sectors" | "research" | "data" | "operations";
+type Page = "overview" | "sectors" | "research" | "challenger" | "data" | "operations";
 type Bank = {
   latest_date: string; latest_scores: Row[]; latest_holdings: Row[];
   scheduler: { enabled: boolean; time: string; timezone: string; next_run?: string };
@@ -50,11 +50,20 @@ type MonthlyAcceptance = {
   progress: number; expected_earliest_completion: string; checks: Row[];
   evidence: Row; report_path?: string | null;
 };
+type Challenger = {
+  account_id: string; research: Row & { metrics?: Row[] };
+  forward: Row & { daily?: Row[] };
+  comparison: Row & { metrics?: Row[]; histories?: Record<string, Row[]> };
+  latest: Row & { selected?: string[]; scores?: Row[]; portfolio?: Bank["shadow"]["portfolio"] };
+  orders: Row[]; fills: Row[]; reconciliation: Row;
+  baseline: { account_id: string; latest: Row };
+};
 
 const nav: { id: Page; label: string; note: string }[] = [
   { id: "overview", label: "组合总览", note: "PORTFOLIO" },
   { id: "sectors", label: "行业与个股", note: "SLEEVES" },
   { id: "research", label: "策略研究", note: "MODELS" },
+  { id: "challenger", label: "Qlib挑战者", note: "AI LAB" },
   { id: "data", label: "数据健康", note: "QUALITY" },
   { id: "operations", label: "运行与对账", note: "PAPER" },
 ];
@@ -97,14 +106,15 @@ export default function Dashboard() {
   const [operations, setOperations] = useState<OperationsCenter | null>(null);
   const [models, setModels] = useState<ModelRegistry | null>(null);
   const [acceptance, setAcceptance] = useState<MonthlyAcceptance | null>(null);
+  const [challenger, setChallenger] = useState<Challenger | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
     try {
-      const [b, s, e, q, o, m, a] = await Promise.all([
-        json<Bank>("/api/bank-dashboard"), json<Sectors>("/api/sector-portfolio"), json<Execution>("/api/multi-sector-execution"), json<DataQuality>("/api/data-quality"), json<OperationsCenter>("/api/operations-center"), json<ModelRegistry>("/api/model-registry"), json<MonthlyAcceptance>("/api/monthly-acceptance"),
+      const [b, s, e, q, o, m, a, c] = await Promise.all([
+        json<Bank>("/api/bank-dashboard"), json<Sectors>("/api/sector-portfolio"), json<Execution>("/api/multi-sector-execution"), json<DataQuality>("/api/data-quality"), json<OperationsCenter>("/api/operations-center"), json<ModelRegistry>("/api/model-registry"), json<MonthlyAcceptance>("/api/monthly-acceptance"), json<Challenger>("/api/qlib-challenger"),
       ]);
-      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setError("");
+      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
   useEffect(() => {
@@ -118,7 +128,7 @@ export default function Dashboard() {
     catch (reason) { setError(reason instanceof Error ? reason.message : "任务启动失败"); }
     finally { setBusy(false); }
   };
-  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
+  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   const current = nav.find((item) => item.id === page)!;
   return <div className="app-shell">
     <aside>
@@ -133,6 +143,7 @@ export default function Dashboard() {
       {page === "overview" && <Overview sectors={sectors} execution={execution}/>}
       {page === "sectors" && <SectorPage bank={bank} sectors={sectors}/>}
       {page === "research" && <Research sectors={sectors} models={models}/>}
+      {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/></>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <Operations bank={bank} execution={execution} operations={operations} acceptance={acceptance} names={sectors.symbol_names} onRefresh={refresh}/>}
     </main>
@@ -166,6 +177,24 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
     <Panel title="整体配置架构" subtitle="系统当前采用的分层决策结构"><div className="architecture">{[["01","数据层","行情、估值、财务、分红、ETF披露"],["02","行业模型","五套因子模型，行业内排序"],["03","组合模型","Top-K、缓冲退出、替换约束"],["04","择时模型","波动率目标决定风险度"],["05","总账户","逆波动预算与行业边界"],["06","执行层","T+1撮合、成本与对账"]].map(([n,t,d])=><div key={n}><b>{n}</b><span><strong>{t}</strong><small>{d}</small></span></div>)}</div></Panel>
     <Panel title="模型版本注册表" subtitle="模型版本绑定代码、配置、股票池和数据截止日；任一内容改变都会产生新版本"><Table rows={models.versions} columns={[["version_id","版本"],["lifecycle","生命周期"],["evidence_stage","证据阶段"],["data_cutoff","数据截止"],["universe_hash","股票池指纹"],["code_hash","代码指纹"]]}/></Panel>
     <div className="two-col"><Panel title="证据隔离" subtitle="历史诊断不能自动升级为前瞻证据"><Table rows={models.artifacts.slice(0,20)} columns={[["artifact_type","产物"],["evidence_stage","证据阶段"],["artifact_key","定位"]]}/></Panel><Panel title="信号与订单绑定" subtitle="每个信号和订单都可反查具体模型版本"><Table rows={models.bindings.slice(0,20)} columns={[["trade_date","交易日"],["binding_type","类型"],["symbol","证券"],["version_id","模型版本"]]}/></Panel></div><Evidence sectors={sectors}/></>;
+}
+
+function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
+  const metrics = challenger.research.metrics??[];
+  const challengerEquity = Number(challenger.latest.portfolio?.equity??1_000_000);
+  const baselinePortfolio = challenger.baseline.latest.portfolio as Row|undefined;
+  const baselineEquity = Number(baselinePortfolio?.equity??1_000_000);
+  return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
+    <section className="kpis"><Kpi label="挑战者状态" value={text(challenger.latest.status)} note={challenger.account_id} accent={text(challenger.latest.status)!=="COMPLETED"}/><Kpi label="GPU训练" value={Boolean(challenger.research.cuda_available)?"CUDA":"未启用"} note={text(challenger.research.cuda_device)}/><Kpi label="挑战者权益" value={money(challengerEquity)} note={`累计 ${pct(challengerEquity/1_000_000-1)}`}/><Kpi label="因子基线权益" value={money(baselineEquity)} note={`累计 ${pct(baselineEquity/1_000_000-1)}`}/></section>
+    <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
+    <div className="two-col"><Panel title="GRU最新排名" subtitle="每行业Top-2进入独立挑战者账户"><Table rows={(challenger.latest.scores??[]).slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["score","预测分数"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:num}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
+    <Panel title="挑战者订单与成交" subtitle="仍采用T+1开盘撮合、费用、滑点和对账规则"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel>
+    <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
+  </>;
+}
+
+function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
+  return <div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title="双策略同口径比较" subtitle="至少20个共同模拟交易日后才形成比较结论"><Table rows={challenger.comparison.metrics??[]} columns={[["account_id","账户"],["observation_days","观察日"],["total_return","累计收益"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel></div>;
 }
 
 function DataHealth({ quality }: { quality: DataQuality }) {

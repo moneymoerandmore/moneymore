@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -21,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .bank_daily import BANK_ACCOUNT, run_bank_daily_pipeline
 from .config import BacktestConfig
+from .data.fundamental_sync import sync_daily_basic_universe
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
@@ -31,6 +33,10 @@ from .monthly_acceptance import evaluate_monthly_cycle
 from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
+)
+from .qlib_challenger_daily import (
+    QLIB_CHALLENGER_ACCOUNT,
+    run_qlib_challenger_daily,
 )
 from .research.adaptive import research_weighted_strategies
 from .research.detail import (
@@ -51,6 +57,28 @@ SERVICE_DATABASE = STATE / "service.sqlite3"
 SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _composite_universe_symbols(store: ParquetStore) -> list[str]:
+    sector_config = yaml.safe_load(
+        (ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
+    )
+    symbols = {
+        str(symbol)
+        for universe in sector_config["universes"].values()
+        for symbol in universe["holdings"]
+    }
+    membership = store.read(
+        "universe_membership",
+        columns=["date", "ts_code"],
+        filters=[("universe", "==", "bank_cn")],
+    )
+    membership["date"] = membership["date"].astype(str)
+    latest_date = membership["date"].max()
+    symbols.update(
+        membership.loc[membership["date"] == latest_date, "ts_code"].astype(str)
+    )
+    return sorted(symbols)
 
 
 class TaskService:
@@ -259,8 +287,10 @@ class TaskService:
     def preview(self, trade_date: str) -> dict[str, object]:
         step_names = [
             "bank_pipeline",
+            "composite_daily_basic",
             "sector_research",
             "multi_sector_execution",
+            "qlib_challenger_execution",
         ]
         with sqlite3.connect(self.database) as connection:
             completed = {
@@ -566,6 +596,17 @@ class TaskService:
             self._run_step(
                 run_id,
                 trade_date,
+                "composite_daily_basic",
+                lambda: sync_daily_basic_universe(
+                    provider,
+                    store,
+                    _composite_universe_symbols(store),
+                    trade_date,
+                ),
+            )
+            self._run_step(
+                run_id,
+                trade_date,
                 "sector_research",
                 lambda: subprocess.run(
                     [
@@ -629,6 +670,33 @@ class TaskService:
                     "ORDER_DEFERRED",
                     "存在延迟或受阻订单",
                     f"本次流水线共有 {len(deferred)} 条执行未即时完成，请在撮合明细复核。",
+                    trade_date=trade_date,
+                    run_id=run_id,
+                )
+            try:
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "qlib_challenger_execution",
+                    lambda: run_qlib_challenger_daily(
+                        root=ROOT,
+                        store=store,
+                        broker=broker,
+                        config=config,
+                        trade_date=trade_date,
+                        signal_dir=STATE / "qlib-challenger-signals",
+                        report_dir=STATE / "qlib-challenger-shadow",
+                    ),
+                )
+            except Exception as challenger_error:  # noqa: BLE001
+                self._notify(
+                    "WARN",
+                    "QLIB_CHALLENGER_FAILED",
+                    "Qlib挑战账户运行失败",
+                    (
+                        f"{type(challenger_error).__name__}: "
+                        f"{challenger_error}; 原因子账户不受影响"
+                    ),
                     trade_date=trade_date,
                     run_id=run_id,
                 )
@@ -994,6 +1062,31 @@ def multi_sector_execution() -> dict[str, object]:
         if row.get("account_id") == MULTI_SECTOR_ACCOUNT
     ][:100]
     latest = _latest_multi_sector_shadow()
+    position_symbols = [str(row["symbol"]) for row in positions]
+    live_marks: dict[str, float] = {}
+    if position_symbols:
+        daily = store.read(
+            "daily",
+            columns=["ts_code", "trade_date", "close"],
+            filters=[("ts_code", "in", position_symbols)],
+        )
+        latest_daily = (
+            daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1)
+        )
+        live_marks = {
+            str(row["ts_code"]): float(row["close"])
+            for row in latest_daily.to_dict("records")
+        }
+    live_portfolio = broker.account_snapshot(live_marks, MULTI_SECTOR_ACCOUNT)
+    catch_up_dir = STATE / "catch-up"
+    catch_up_reports = (
+        sorted(catch_up_dir.glob("*.json")) if catch_up_dir.exists() else []
+    )
+    latest_catch_up = (
+        json.loads(catch_up_reports[-1].read_text(encoding="utf-8"))
+        if catch_up_reports
+        else None
+    )
     analytics: dict[str, list[dict[str, object]]] = {}
     for api_key, table in {
         "history": "multi_sector_account_daily",
@@ -1009,14 +1102,20 @@ def multi_sector_execution() -> dict[str, object]:
             analytics[api_key] = []
     return {
         "account_id": MULTI_SECTOR_ACCOUNT,
-        "status": latest.get("status", "AWAITING_FIRST_RUN"),
+        "status": (
+            "COMPLETED_CATCH_UP"
+            if latest_catch_up
+            and latest_catch_up.get("trade_date") == latest.get("trade_date")
+            else latest.get("status", "AWAITING_FIRST_RUN")
+        ),
         "trade_date": latest.get("trade_date"),
         "target_weights": latest.get("target_weights", {}),
         "symbol_sectors": latest.get("symbol_sectors", {}),
         "orders": orders,
         "fills": fills,
         "positions": positions,
-        "portfolio": latest.get("portfolio"),
+        "portfolio": live_portfolio,
+        "latest_catch_up": latest_catch_up,
         "attribution": latest.get("attribution", []),
         "return_attribution": latest.get("return_attribution", []),
         "risk_attribution": latest.get("risk_attribution", []),
@@ -1071,6 +1170,165 @@ def model_registry() -> dict[str, list[dict[str, Any]]]:
         STATE / "model-versions",
     )
     return registry.snapshot()
+
+
+@app.get("/api/qlib-challenger")
+def qlib_challenger() -> dict[str, object]:
+    broker = PaperBroker(PAPER_DATABASE)
+    broker.initialize_account(1_000_000, QLIB_CHALLENGER_ACCOUNT)
+    research_path = STATE / "qlib-challenger" / "latest-research.json"
+    forward_path = STATE / "qlib-challenger" / "forward-evaluation.json"
+    reports_dir = STATE / "qlib-challenger-shadow"
+    reports = sorted(reports_dir.glob("*.json")) if reports_dir.exists() else []
+    latest = (
+        max(
+            (
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in reports
+            ),
+            key=lambda report: str(report.get("created_at", "")),
+        )
+        if reports
+        else {
+            "status": "AWAITING_TRAINING",
+            "selected": [],
+            "scores": [],
+            "portfolio": {
+                "cash": 1_000_000,
+                "market_value": 0,
+                "equity": 1_000_000,
+                "positions": [],
+            },
+        }
+    )
+    research = (
+        json.loads(research_path.read_text(encoding="utf-8"))
+        if research_path.exists()
+        else {
+            "status": "AWAITING_TRAINING",
+            "metrics": [],
+            "cuda_available": False,
+        }
+    )
+    forward_evaluation = (
+        json.loads(forward_path.read_text(encoding="utf-8"))
+        if forward_path.exists()
+        else {"matured_days": 0, "rank_ic": None, "rank_ic_ir": None, "daily": []}
+    )
+    challenger_config = yaml.safe_load(
+        (ROOT / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
+    )
+    gate_config = challenger_config["research_gate"]
+    model_metrics = next(
+        (
+            row
+            for row in research.get("metrics", [])
+            if row.get("model_id") == challenger_config["model_id"]
+        ),
+        None,
+    )
+    research["gate"] = {
+        **gate_config,
+        "passed": bool(
+            model_metrics
+            and int(model_metrics["samples"]) >= int(gate_config["minimum_samples"])
+            and float(model_metrics["rank_ic"])
+            >= float(gate_config["minimum_rank_ic"])
+            and float(model_metrics["rank_ic_ir"])
+            >= float(gate_config["minimum_rank_ic_ir"])
+            and float(
+                model_metrics.get("cost_adjusted_top_k_excess_return", -1)
+            )
+            > float(gate_config["minimum_cost_adjusted_excess_return"])
+            and int(research.get("stability", {}).get("seed_count", 0))
+            >= int(gate_config["minimum_seed_count"])
+            and float(
+                research.get("stability", {}).get("positive_seed_ratio", 0)
+            )
+            >= float(gate_config["minimum_positive_seed_ratio"])
+        ),
+    }
+    promotion_gate = challenger_config["promotion_gate"]
+    research["promotion_gate"] = {
+        **promotion_gate,
+        "passed": bool(
+            model_metrics
+            and float(model_metrics["rank_ic"])
+            >= float(promotion_gate["minimum_rank_ic"])
+            and float(model_metrics["rank_ic_ir"])
+            >= float(promotion_gate["minimum_rank_ic_ir"])
+            and int(forward_evaluation.get("matured_days", 0))
+            >= int(promotion_gate["minimum_forward_days"])
+            and float(forward_evaluation.get("rank_ic") or -1)
+            > float(promotion_gate["minimum_forward_rank_ic"])
+        ),
+    }
+    orders = [
+        row
+        for row in reversed(broker.orders())
+        if row.get("account_id") == QLIB_CHALLENGER_ACCOUNT
+    ][:100]
+    comparison_histories: dict[str, list[dict[str, object]]] = {}
+    comparison_metrics: list[dict[str, object]] = []
+    for account_id, table in (
+        (MULTI_SECTOR_ACCOUNT, "multi_sector_account_daily"),
+        (QLIB_CHALLENGER_ACCOUNT, "qlib_challenger_account_daily"),
+    ):
+        try:
+            history = ParquetStore(DATA).read(table).sort_values("trade_date")
+        except FileNotFoundError:
+            history = pd.DataFrame()
+        comparison_histories[account_id] = _records(history)
+        comparison_metrics.append(_account_performance(account_id, history))
+    return {
+        "account_id": QLIB_CHALLENGER_ACCOUNT,
+        "research": research,
+        "forward": forward_evaluation,
+        "latest": latest,
+        "orders": orders,
+        "fills": broker.fills(QLIB_CHALLENGER_ACCOUNT),
+        "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
+        "comparison": {
+            "metrics": comparison_metrics,
+            "histories": comparison_histories,
+            "ready": all(
+                int(row["observation_days"]) >= 20 for row in comparison_metrics
+            ),
+            "minimum_observation_days": 20,
+        },
+        "baseline": {
+            "account_id": MULTI_SECTOR_ACCOUNT,
+            "latest": _latest_multi_sector_shadow(),
+        },
+    }
+
+
+def _account_performance(account_id: str, history: pd.DataFrame) -> dict[str, object]:
+    if history.empty or "equity" not in history:
+        return {
+            "account_id": account_id,
+            "observation_days": 0,
+            "total_return": None,
+            "annualized_volatility": None,
+            "sharpe": None,
+            "max_drawdown": None,
+        }
+    equity = pd.to_numeric(history["equity"], errors="coerce").dropna()
+    returns = equity.pct_change().dropna()
+    drawdown = equity / equity.cummax() - 1
+    volatility = float(returns.std(ddof=1) * (252**0.5)) if len(returns) > 1 else 0.0
+    return {
+        "account_id": account_id,
+        "observation_days": len(equity),
+        "total_return": float(equity.iloc[-1] / equity.iloc[0] - 1),
+        "annualized_volatility": volatility,
+        "sharpe": (
+            float(returns.mean() / returns.std(ddof=1) * (252**0.5))
+            if len(returns) > 1 and returns.std(ddof=1)
+            else None
+        ),
+        "max_drawdown": float(drawdown.min()),
+    }
 
 
 @app.get("/api/monthly-acceptance")

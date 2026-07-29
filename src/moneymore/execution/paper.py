@@ -89,10 +89,23 @@ class PaperBroker:
                 if existing == ("CANCELLED", account_id):
                     connection.execute(
                         """
-                        UPDATE orders SET status = 'PENDING', created_at = ?
+                        UPDATE orders
+                        SET status = 'PENDING', created_at = ?, strategy_id = ?,
+                            symbol = ?, side = ?, quantity = ?, signal_date = ?,
+                            reason_code = ?, account_id = ?
                         WHERE idempotency_key = ?
                         """,
-                        (now, intent.idempotency_key),
+                        (
+                            now,
+                            intent.strategy_id,
+                            intent.symbol,
+                            intent.side.value,
+                            intent.quantity,
+                            intent.signal_date,
+                            intent.reason_code,
+                            account_id,
+                            intent.idempotency_key,
+                        ),
                     )
                     return "REOPENED"
                 self._record_duplicate(connection, intent, now)
@@ -389,6 +402,43 @@ class PaperBroker:
                     ) VALUES (?, ?, 'CANCELLED', ?)
                     """,
                     (key, signal_date or "", reason_code),
+                )
+        return len(keys)
+
+    def restore_cancelled(
+        self,
+        account_id: str,
+        signal_date: str,
+        reason_code: str,
+    ) -> int:
+        """Restore a dated order batch after its blocking incident is resolved."""
+        with sqlite3.connect(self.database) as connection:
+            keys = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT idempotency_key FROM orders
+                    WHERE account_id = ? AND signal_date = ?
+                      AND status = 'CANCELLED'
+                    """,
+                    (account_id, signal_date),
+                )
+            ]
+            for key in keys:
+                connection.execute(
+                    """
+                    UPDATE orders SET status = 'PENDING'
+                    WHERE idempotency_key = ?
+                    """,
+                    (key,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO execution_attempts(
+                        idempotency_key, trade_date, outcome, reason_code
+                    ) VALUES (?, ?, 'RESTORED', ?)
+                    """,
+                    (key, signal_date, reason_code),
                 )
         return len(keys)
 

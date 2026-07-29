@@ -21,6 +21,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
+ai = [
+  "pyqlib>=0.9.7,<1",
+  "torch>=2.7",
+  "lightgbm>=4.6,<5",
+  "scikit-learn>=1.7,<2",
+]
 
 [project.scripts]
 moneymore = "moneymore.cli:main"

@@ -170,6 +170,34 @@ def test_cancelled_order_can_be_reopened_after_data_correction(tmp_path: Path):
     assert broker.orders()[0]["status"] == "PENDING"
 
 
+def test_reopened_order_uses_recalculated_quantity(tmp_path: Path):
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000)
+    original = _risk("corrected-buy", Side.BUY)
+    updated_intent = OrderIntent(
+        **{
+            **original.intent.__dict__,
+            "quantity": 200,
+        }
+    )
+
+    broker.submit(original)
+    broker.cancel_pending("default", "DATA_STALE", "20260105")
+    assert broker.submit(RiskResult(True, updated_intent, None)) == "REOPENED"
+
+    assert broker.orders()[0]["quantity"] == 200
+
+
+def test_cancelled_batch_can_be_restored_for_catch_up(tmp_path: Path):
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000)
+    broker.submit(_risk("catch-up-buy", Side.BUY))
+    broker.cancel_pending("default", "DATA_STALE", "20260105")
+
+    assert broker.restore_cancelled("default", "20260105", "INCIDENT_RESOLVED") == 1
+    assert broker.orders()[0]["status"] == "PENDING"
+
+
 def test_cash_and_stock_dividends_are_idempotent_and_reconcile(tmp_path: Path):
     broker = PaperBroker(tmp_path / "paper.sqlite3")
     broker.initialize_account(100_000)

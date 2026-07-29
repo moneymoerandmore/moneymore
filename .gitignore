@@ -12,3 +12,4 @@ test-tmp-*/
 .tmp/
 .test-artifacts/
 state/
+mlruns/

@@ -11,6 +11,33 @@ from .quality import (
 from .store import ParquetStore
 
 
+def sync_daily_basic_universe(
+    provider: MarketDataProvider,
+    store: ParquetStore,
+    symbols: list[str],
+    trade_date: str,
+) -> dict[str, int]:
+    """Fetch one market-wide valuation snapshot and persist the requested universe."""
+    requested = sorted(set(symbols))
+    frame = provider.daily_basic("", trade_date, trade_date)
+    validate_daily_basic(frame)
+    frame = frame.loc[frame["ts_code"].astype(str).isin(requested)].copy()
+    received = set(frame["ts_code"].astype(str))
+    missing = sorted(set(requested) - received)
+    if missing:
+        raise ValueError(
+            "daily_basic universe snapshot is incomplete: " + ",".join(missing)
+        )
+    store.save_snapshot(
+        "daily_basic",
+        frame,
+        provider.name,
+        ["ts_code", "trade_date"],
+        f"composite_universe_{trade_date}",
+    )
+    return {"requested": len(requested), "saved": len(frame), "missing": 0}
+
+
 def sync_stock_fundamentals(
     provider: MarketDataProvider,
     store: ParquetStore,

@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from moneymore.data.fundamental_sync import sync_daily_basic_universe
 from moneymore.data.quality import DataQualityError, validate_daily_bars
 from moneymore.data.store import ParquetStore
 from moneymore.data.sync import (
@@ -65,6 +66,22 @@ class FakeProvider:
     def etf_adjustment_factors(self, trade_date):
         return self.adjustment_factors(trade_date)
 
+    def daily_basic(self, ts_code, start_date, end_date):
+        assert ts_code == ""
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": symbol,
+                    "trade_date": start_date,
+                    "close": 10.0,
+                    "pb": 1.0,
+                    "dv_ttm": 2.0,
+                    "total_mv": 1000.0,
+                }
+                for symbol in ("AAA.SH", "BBB.SZ", "OTHER.SH")
+            ]
+        )
+
 
 def test_pipeline_saves_raw_manifest_and_curated_tables(tmp_path: Path):
     provider = FakeProvider()
@@ -87,6 +104,30 @@ def test_etf_pipeline_uses_separate_semantic_tables(tmp_path: Path):
     assert summary.open_days == 1
     assert len(store.read("etf_daily")) == 1
     assert (tmp_path / "processed/etf_adj_factor.parquet").exists()
+
+
+def test_daily_basic_universe_uses_one_market_snapshot(tmp_path: Path):
+    store = ParquetStore(tmp_path)
+
+    result = sync_daily_basic_universe(
+        FakeProvider(),
+        store,
+        ["AAA.SH", "BBB.SZ"],
+        "20250102",
+    )
+
+    assert result == {"requested": 2, "saved": 2, "missing": 0}
+    assert set(store.read("daily_basic")["ts_code"]) == {"AAA.SH", "BBB.SZ"}
+
+
+def test_daily_basic_universe_rejects_incomplete_snapshot(tmp_path: Path):
+    with pytest.raises(ValueError, match="MISSING.SH"):
+        sync_daily_basic_universe(
+            FakeProvider(),
+            ParquetStore(tmp_path),
+            ["AAA.SH", "MISSING.SH"],
+            "20250102",
+        )
 
 
 def test_immutable_snapshot_rejects_changed_vendor_history(tmp_path: Path):
