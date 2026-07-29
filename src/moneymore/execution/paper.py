@@ -79,6 +79,22 @@ class PaperBroker:
                     ),
                 )
             except sqlite3.IntegrityError:
+                existing = connection.execute(
+                    """
+                    SELECT status, account_id FROM orders
+                    WHERE idempotency_key = ?
+                    """,
+                    (intent.idempotency_key,),
+                ).fetchone()
+                if existing == ("CANCELLED", account_id):
+                    connection.execute(
+                        """
+                        UPDATE orders SET status = 'PENDING', created_at = ?
+                        WHERE idempotency_key = ?
+                        """,
+                        (now, intent.idempotency_key),
+                    )
+                    return "REOPENED"
                 self._record_duplicate(connection, intent, now)
                 return "DUPLICATE"
         return "PENDING"
@@ -257,6 +273,14 @@ class PaperBroker:
                     (account_id,),
                 ).fetchone()[0]
             )
+            corporate_actions = connection.execute(
+                """
+                SELECT action_type, cash_amount, share_quantity
+                FROM corporate_action_ledger WHERE account_id = ?
+                ORDER BY id
+                """,
+                (account_id,),
+            ).fetchall()
         expected_cash = float(account[0])
         expected_quantity = 0
         for side, quantity, price, fee in fills:
@@ -267,6 +291,11 @@ class PaperBroker:
             else:
                 expected_cash += notional - float(fee)
                 expected_quantity -= int(quantity)
+        for action_type, cash_amount, share_quantity in corporate_actions:
+            if action_type == "CASH_DIVIDEND":
+                expected_cash += float(cash_amount)
+            if action_type == "STOCK_DIVIDEND":
+                expected_quantity += int(share_quantity)
         cash_difference = float(account[1]) - expected_cash
         quantity_difference = int(actual_quantity) - expected_quantity
         return ReconciliationResult(
@@ -314,6 +343,362 @@ class PaperBroker:
         with sqlite3.connect(self.database) as connection:
             connection.row_factory = sqlite3.Row
             return [dict(row) for row in connection.execute("SELECT * FROM orders")]
+
+    def fills(
+        self, account_id: str, trade_date: str | None = None
+    ) -> list[dict[str, object]]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            query = "SELECT * FROM fills WHERE account_id = ?"
+            parameters: list[object] = [account_id]
+            if trade_date is not None:
+                query += " AND trade_date = ?"
+                parameters.append(trade_date)
+            query += " ORDER BY id"
+            return [dict(row) for row in connection.execute(query, parameters)]
+
+    def cancel_pending(
+        self,
+        account_id: str,
+        reason_code: str,
+        signal_date: str | None = None,
+        side: str | None = None,
+    ) -> int:
+        with sqlite3.connect(self.database) as connection:
+            query = (
+                "SELECT idempotency_key FROM orders "
+                "WHERE account_id = ? AND status = 'PENDING'"
+            )
+            parameters: list[object] = [account_id]
+            if signal_date is not None:
+                query += " AND signal_date = ?"
+                parameters.append(signal_date)
+            if side is not None:
+                query += " AND side = ?"
+                parameters.append(side)
+            keys = [row[0] for row in connection.execute(query, parameters)]
+            for key in keys:
+                connection.execute(
+                    "UPDATE orders SET status = 'CANCELLED' WHERE idempotency_key = ?",
+                    (key,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO execution_attempts(
+                        idempotency_key, trade_date, outcome, reason_code
+                    ) VALUES (?, ?, 'CANCELLED', ?)
+                    """,
+                    (key, signal_date or "", reason_code),
+                )
+        return len(keys)
+
+    def risk_state(self, account_id: str) -> dict[str, object]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM account_risk_states WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                now = datetime.now(UTC).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO account_risk_states(
+                        account_id, effective_state, proposed_state,
+                        reason_code, recovery_required, updated_at
+                    ) VALUES (?, 'NORMAL', 'NORMAL', 'INITIALIZED', 0, ?)
+                    """,
+                    (account_id, now),
+                )
+                return {
+                    "account_id": account_id,
+                    "effective_state": "NORMAL",
+                    "proposed_state": "NORMAL",
+                    "reason_code": "INITIALIZED",
+                    "recovery_required": False,
+                    "updated_at": now,
+                }
+            result = dict(row)
+            result["recovery_required"] = bool(result["recovery_required"])
+            return result
+
+    def update_risk_state(
+        self,
+        account_id: str,
+        proposed_state: str,
+        reason_code: str,
+        trade_date: str,
+    ) -> dict[str, object]:
+        levels = {"NORMAL": 0, "REDUCE_ONLY": 1, "SELL_ONLY": 2, "SUSPENDED": 3}
+        if proposed_state not in levels:
+            raise ValueError(f"invalid risk state: {proposed_state}")
+        current = self.risk_state(account_id)
+        effective = str(current["effective_state"])
+        recovery_required = levels[proposed_state] < levels[effective]
+        next_effective = (
+            proposed_state
+            if levels[proposed_state] >= levels[effective]
+            else effective
+        )
+        now = datetime.now(UTC).isoformat()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                UPDATE account_risk_states SET
+                    effective_state = ?, proposed_state = ?, reason_code = ?,
+                    recovery_required = ?, updated_at = ?
+                WHERE account_id = ?
+                """,
+                (
+                    next_effective,
+                    proposed_state,
+                    reason_code,
+                    int(recovery_required),
+                    now,
+                    account_id,
+                ),
+            )
+            if next_effective != effective or proposed_state != current["proposed_state"]:
+                connection.execute(
+                    """
+                    INSERT INTO risk_state_transitions(
+                        account_id, trade_date, from_state, to_state,
+                        proposed_state, reason_code, transition_type, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'AUTOMATIC', ?)
+                    """,
+                    (
+                        account_id,
+                        trade_date,
+                        effective,
+                        next_effective,
+                        proposed_state,
+                        reason_code,
+                        now,
+                    ),
+                )
+        return self.risk_state(account_id)
+
+    def approve_risk_recovery(
+        self, account_id: str, operator: str = "LOCAL_USER"
+    ) -> dict[str, object]:
+        current = self.risk_state(account_id)
+        if not current["recovery_required"]:
+            return current
+        now = datetime.now(UTC).isoformat()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                UPDATE account_risk_states SET
+                    effective_state = proposed_state,
+                    recovery_required = 0, updated_at = ?
+                WHERE account_id = ?
+                """,
+                (now, account_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO risk_state_transitions(
+                    account_id, trade_date, from_state, to_state,
+                    proposed_state, reason_code, transition_type,
+                    operator, created_at
+                ) VALUES (?, '', ?, ?, ?, ?, 'MANUAL_RECOVERY', ?, ?)
+                """,
+                (
+                    account_id,
+                    current["effective_state"],
+                    current["proposed_state"],
+                    current["proposed_state"],
+                    current["reason_code"],
+                    operator,
+                    now,
+                ),
+            )
+        return self.risk_state(account_id)
+
+    def risk_transitions(self, account_id: str) -> list[dict[str, object]]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM risk_state_transitions
+                    WHERE account_id = ? ORDER BY id DESC
+                    """,
+                    (account_id,),
+                )
+            ]
+
+    def register_corporate_entitlement(
+        self,
+        account_id: str,
+        symbol: str,
+        action_key: str,
+        record_date: str,
+        cash_per_share: float,
+        stock_ratio: float,
+        cash_pay_date: str | None,
+        stock_list_date: str | None,
+    ) -> str:
+        with sqlite3.connect(self.database) as connection:
+            position = connection.execute(
+                """
+                SELECT quantity FROM positions
+                WHERE account_id = ? AND symbol = ?
+                """,
+                (account_id, symbol),
+            ).fetchone()
+            quantity = int(position[0]) if position else 0
+            if quantity <= 0:
+                return "NO_POSITION"
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO corporate_entitlements(
+                        account_id, action_key, symbol, record_date,
+                        entitled_quantity, cash_per_share, stock_ratio,
+                        cash_pay_date, stock_list_date, cash_status, stock_status,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        action_key,
+                        symbol,
+                        record_date,
+                        quantity,
+                        cash_per_share,
+                        stock_ratio,
+                        cash_pay_date,
+                        stock_list_date,
+                        "PENDING" if cash_per_share > 0 else "NOT_APPLICABLE",
+                        "PENDING" if stock_ratio > 0 else "NOT_APPLICABLE",
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return "DUPLICATE"
+        return "REGISTERED"
+
+    def settle_corporate_actions(
+        self, account_id: str, trade_date: str
+    ) -> list[dict[str, object]]:
+        settled: list[dict[str, object]] = []
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM corporate_entitlements
+                WHERE account_id = ? AND (
+                    (cash_status = 'PENDING' AND cash_pay_date <= ?)
+                    OR (stock_status = 'PENDING' AND stock_list_date <= ?)
+                )
+                ORDER BY symbol, action_key
+                """,
+                (account_id, trade_date, trade_date),
+            ).fetchall()
+            for row in rows:
+                if row["cash_status"] == "PENDING" and row["cash_pay_date"] <= trade_date:
+                    amount = int(row["entitled_quantity"]) * float(
+                        row["cash_per_share"]
+                    )
+                    connection.execute(
+                        "UPDATE accounts SET cash = cash + ?, updated_at = ? "
+                        "WHERE account_id = ?",
+                        (amount, datetime.now(UTC).isoformat(), account_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE corporate_entitlements SET cash_status = 'SETTLED'
+                        WHERE account_id = ? AND action_key = ?
+                        """,
+                        (account_id, row["action_key"]),
+                    )
+                    self._record_corporate_ledger(
+                        connection, account_id, row, trade_date,
+                        "CASH_DIVIDEND", amount, 0,
+                    )
+                    settled.append(
+                        {
+                            "symbol": row["symbol"],
+                            "action_type": "CASH_DIVIDEND",
+                            "cash_amount": amount,
+                            "share_quantity": 0,
+                        }
+                    )
+                if (
+                    row["stock_status"] == "PENDING"
+                    and row["stock_list_date"] <= trade_date
+                ):
+                    shares = int(
+                        int(row["entitled_quantity"]) * float(row["stock_ratio"])
+                    )
+                    if shares > 0:
+                        position = connection.execute(
+                            """
+                            SELECT quantity, available_quantity, avg_cost
+                            FROM positions WHERE account_id = ? AND symbol = ?
+                            """,
+                            (account_id, row["symbol"]),
+                        ).fetchone() or (0, 0, 0.0)
+                        held, available, avg_cost = (
+                            int(position[0]), int(position[1]), float(position[2])
+                        )
+                        new_quantity = held + shares
+                        new_avg = held * avg_cost / new_quantity if new_quantity else 0
+                        connection.execute(
+                            """
+                            INSERT INTO positions(
+                                account_id, symbol, quantity, available_quantity,
+                                avg_cost, last_buy_date
+                            ) VALUES (?, ?, ?, ?, ?, NULL)
+                            ON CONFLICT(account_id, symbol) DO UPDATE SET
+                                quantity=excluded.quantity,
+                                available_quantity=excluded.available_quantity,
+                                avg_cost=excluded.avg_cost
+                            """,
+                            (
+                                account_id,
+                                row["symbol"],
+                                new_quantity,
+                                available + shares,
+                                new_avg,
+                            ),
+                        )
+                    connection.execute(
+                        """
+                        UPDATE corporate_entitlements SET stock_status = 'SETTLED'
+                        WHERE account_id = ? AND action_key = ?
+                        """,
+                        (account_id, row["action_key"]),
+                    )
+                    self._record_corporate_ledger(
+                        connection, account_id, row, trade_date,
+                        "STOCK_DIVIDEND", 0.0, shares,
+                    )
+                    settled.append(
+                        {
+                            "symbol": row["symbol"],
+                            "action_type": "STOCK_DIVIDEND",
+                            "cash_amount": 0.0,
+                            "share_quantity": shares,
+                        }
+                    )
+        return settled
+
+    def corporate_actions(self, account_id: str) -> list[dict[str, object]]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM corporate_action_ledger
+                    WHERE account_id = ? ORDER BY trade_date DESC, id DESC
+                    """,
+                    (account_id,),
+                )
+            ]
 
     def _initialize(self) -> None:
         with sqlite3.connect(self.database) as connection:
@@ -378,6 +763,53 @@ class PaperBroker:
                     outcome TEXT NOT NULL,
                     reason_code TEXT
                 );
+                CREATE TABLE IF NOT EXISTS corporate_entitlements (
+                    account_id TEXT NOT NULL,
+                    action_key TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    record_date TEXT NOT NULL,
+                    entitled_quantity INTEGER NOT NULL,
+                    cash_per_share REAL NOT NULL,
+                    stock_ratio REAL NOT NULL,
+                    cash_pay_date TEXT,
+                    stock_list_date TEXT,
+                    cash_status TEXT NOT NULL,
+                    stock_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, action_key)
+                );
+                CREATE TABLE IF NOT EXISTS corporate_action_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    action_key TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    entitled_quantity INTEGER NOT NULL,
+                    cash_amount REAL NOT NULL,
+                    share_quantity INTEGER NOT NULL,
+                    UNIQUE(account_id, action_key, action_type)
+                );
+                CREATE TABLE IF NOT EXISTS account_risk_states (
+                    account_id TEXT PRIMARY KEY,
+                    effective_state TEXT NOT NULL,
+                    proposed_state TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    recovery_required INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_state_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    proposed_state TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    transition_type TEXT NOT NULL,
+                    operator TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -387,6 +819,35 @@ class PaperBroker:
                 connection.execute(
                     "ALTER TABLE orders ADD COLUMN account_id TEXT NOT NULL DEFAULT 'default'"
                 )
+
+    @staticmethod
+    def _record_corporate_ledger(
+        connection: sqlite3.Connection,
+        account_id: str,
+        row: sqlite3.Row,
+        trade_date: str,
+        action_type: str,
+        cash_amount: float,
+        share_quantity: int,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO corporate_action_ledger(
+                account_id, action_key, symbol, trade_date, action_type,
+                entitled_quantity, cash_amount, share_quantity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                row["action_key"],
+                row["symbol"],
+                trade_date,
+                action_type,
+                row["entitled_quantity"],
+                cash_amount,
+                share_quantity,
+            ),
+        )
 
     @staticmethod
     def _record_duplicate(

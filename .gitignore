@@ -9,4 +9,6 @@ data/raw/
 data/processed/
 logs/
 test-tmp-*/
+.tmp/
+.test-artifacts/
 state/

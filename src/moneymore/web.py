@@ -8,7 +8,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,8 @@ from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
 from .execution.paper import PaperBroker
 from .factors import build_default_registry
+from .model_registry import ModelRegistry
+from .monthly_acceptance import evaluate_monthly_cycle
 from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
@@ -105,6 +107,39 @@ class TaskService:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_step_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    step_name TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    error TEXT,
+                    UNIQUE(run_id, step_name, attempt)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    trade_date TEXT,
+                    run_id INTEGER,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    acknowledged_at TEXT
+                )
+                """
+            )
             for candidate in (
                 (
                     "600036.SH",
@@ -175,6 +210,209 @@ class TaskService:
                 "SELECT * FROM task_runs ORDER BY id DESC LIMIT ?", (limit,)
             )
             return [dict(row) for row in rows]
+
+    def steps(
+        self, limit: int = 100, run_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM task_step_runs"
+        params: list[object] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            return [dict(row) for row in connection.execute(query, params)]
+
+    def notifications(self, limit: int = 100) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT * FROM notifications ORDER BY id DESC LIMIT ?", (limit,)
+            )
+            result = [dict(row) for row in rows]
+        for row in result:
+            row["acknowledged"] = bool(row["acknowledged"])
+        return result
+
+    def acknowledge_notification(self, notification_id: int) -> dict[str, Any]:
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                UPDATE notifications
+                SET acknowledged = 1, acknowledged_at = ?
+                WHERE id = ?
+                """,
+                (datetime.now(SHANGHAI).isoformat(), notification_id),
+            )
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(notification_id)
+        result = dict(row)
+        result["acknowledged"] = bool(result["acknowledged"])
+        return result
+
+    def preview(self, trade_date: str) -> dict[str, object]:
+        step_names = [
+            "bank_pipeline",
+            "sector_research",
+            "multi_sector_execution",
+        ]
+        with sqlite3.connect(self.database) as connection:
+            completed = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT step_name FROM task_step_runs
+                    WHERE trade_date = ? AND status = 'COMPLETED'
+                    """,
+                    (trade_date,),
+                )
+            }
+            prior_runs = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE trade_date = ?",
+                    (trade_date,),
+                ).fetchone()[0]
+            )
+        return {
+            "trade_date": trade_date,
+            "prior_run_count": prior_runs,
+            "steps": [
+                {
+                    "step_name": name,
+                    "action": "SKIP_COMPLETED" if name in completed else "RUN",
+                }
+                for name in step_names
+            ],
+            "mutates_state": False,
+        }
+
+    def _notify(
+        self,
+        severity: str,
+        code: str,
+        title: str,
+        message: str,
+        *,
+        trade_date: str | None = None,
+        run_id: int | None = None,
+        dedupe_key: str | None = None,
+    ) -> None:
+        key = dedupe_key or f"{trade_date}:{run_id}:{code}"
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO notifications(
+                    created_at, severity, code, title, message,
+                    trade_date, run_id, dedupe_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(SHANGHAI).isoformat(),
+                    severity,
+                    code,
+                    title,
+                    message,
+                    trade_date,
+                    run_id,
+                    key,
+                ),
+            )
+
+    def _run_step(
+        self,
+        run_id: int,
+        trade_date: str,
+        step_name: str,
+        operation: Any,
+        max_attempts: int = 2,
+    ) -> tuple[str, Any]:
+        with sqlite3.connect(self.database) as connection:
+            completed = connection.execute(
+                """
+                SELECT 1
+                FROM task_step_runs
+                WHERE trade_date = ? AND step_name = ? AND status = 'COMPLETED'
+                LIMIT 1
+                """,
+                (trade_date, step_name),
+            ).fetchone()
+            if completed:
+                now = datetime.now(SHANGHAI).isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO task_step_runs(
+                        run_id, trade_date, step_name, attempt, status,
+                        started_at, finished_at
+                    ) VALUES (?, ?, ?, 0, 'SKIPPED_COMPLETED', ?, ?)
+                    """,
+                    (run_id, trade_date, step_name, now, now),
+                )
+                return "SKIPPED_COMPLETED", None
+
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            started_at = datetime.now(SHANGHAI).isoformat()
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO task_step_runs(
+                        run_id, trade_date, step_name, attempt, status, started_at
+                    ) VALUES (?, ?, ?, ?, 'RUNNING', ?)
+                    """,
+                    (run_id, trade_date, step_name, attempt, started_at),
+                )
+            try:
+                result = operation()
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        """
+                        UPDATE task_step_runs
+                        SET status = 'COMPLETED', finished_at = ?
+                        WHERE run_id = ? AND step_name = ? AND attempt = ?
+                        """,
+                        (
+                            datetime.now(SHANGHAI).isoformat(),
+                            run_id,
+                            step_name,
+                            attempt,
+                        ),
+                    )
+                return "COMPLETED", result
+            except Exception as error:  # noqa: BLE001 - retry boundary
+                last_error = error
+                detail = f"{type(error).__name__}: {error}"
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        """
+                        UPDATE task_step_runs
+                        SET status = 'FAILED', finished_at = ?, error = ?
+                        WHERE run_id = ? AND step_name = ? AND attempt = ?
+                        """,
+                        (
+                            datetime.now(SHANGHAI).isoformat(),
+                            detail,
+                            run_id,
+                            step_name,
+                            attempt,
+                        ),
+                    )
+        assert last_error is not None
+        self._notify(
+            "ERROR",
+            "PIPELINE_STEP_FAILED",
+            f"流水线步骤失败：{step_name}",
+            f"自动重试 {max_attempts} 次后仍失败：{type(last_error).__name__}: {last_error}",
+            trade_date=trade_date,
+            run_id=run_id,
+            dedupe_key=f"{trade_date}:{run_id}:step:{step_name}",
+        )
+        raise last_error
 
     def config(self) -> dict[str, object]:
         with sqlite3.connect(self.database) as connection:
@@ -305,25 +543,44 @@ class TaskService:
             store = ParquetStore(DATA)
             broker = PaperBroker(PAPER_DATABASE)
             config = BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml")
-            result = run_bank_daily_pipeline(
-                provider=provider,
-                store=store,
-                broker=broker,
-                config=config,
-                trade_date=trade_date,
-                signal_dir=STATE / "bank-signals",
-                report_dir=STATE / "bank-shadow",
+            _, result = self._run_step(
+                run_id,
+                trade_date,
+                "bank_pipeline",
+                lambda: run_bank_daily_pipeline(
+                    provider=provider,
+                    store=store,
+                    broker=broker,
+                    config=config,
+                    trade_date=trade_date,
+                    signal_dir=STATE / "bank-signals",
+                    report_dir=STATE / "bank-shadow",
+                ),
             )
-            if result.status == "COMPLETED":
-                subprocess.run(
-                    [sys.executable, str(ROOT / "scripts" / "research_sector_portfolio.py")],
+            if result is not None and result.status == "SKIPPED_MARKET_CLOSED":
+                self._finish(run_id, "COMPLETED", report_path=result.report_path)
+                return
+            if result is not None and result.status != "COMPLETED":
+                raise RuntimeError(f"bank pipeline status: {result.status}")
+
+            self._run_step(
+                run_id,
+                trade_date,
+                "sector_research",
+                lambda: subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts" / "research_sector_portfolio.py"),
+                    ],
                     cwd=ROOT,
                     check=True,
                     capture_output=True,
                     text=True,
                     timeout=300,
                 )
-                multi_result = run_multi_sector_daily(
+            )
+            def execute_multi_sector() -> Any:
+                value = run_multi_sector_daily(
                     store=store,
                     broker=broker,
                     config=config,
@@ -331,17 +588,78 @@ class TaskService:
                     signal_dir=STATE / "multi-sector-signals",
                     report_dir=STATE / "multi-sector-shadow",
                 )
-                if multi_result.status != "COMPLETED":
-                    raise RuntimeError(
-                        f"multi-sector pipeline status: {multi_result.status}"
+                if value.status != "COMPLETED":
+                    code = {
+                        "BLOCKED_DATA_QUALITY": "DATA_QUALITY_BLOCKED",
+                        "SUSPENDED_RISK": "RISK_SUSPENDED",
+                        "FAILED_RECONCILIATION": "RECONCILIATION_FAILED",
+                    }.get(value.status, "PIPELINE_STATUS_BLOCKED")
+                    self._notify(
+                        "ERROR",
+                        code,
+                        "综合组合流水线未完成",
+                        f"状态：{value.status}",
+                        trade_date=trade_date,
+                        run_id=run_id,
                     )
-            status = "COMPLETED" if result.status in {
-                "COMPLETED",
-                "SKIPPED_MARKET_CLOSED",
-            } else "FAILED"
-            self._finish(run_id, status, report_path=result.report_path)
+                    raise RuntimeError(
+                        f"multi-sector pipeline status: {value.status}"
+                    )
+                return value
+
+            _, multi_result = self._run_step(
+                run_id,
+                trade_date,
+                "multi_sector_execution",
+                execute_multi_sector,
+            )
+            deferred = (
+                []
+                if multi_result is None
+                else [
+                    row
+                    for row in multi_result.executions
+                    if str(row.get("status", "")).upper()
+                    in {"DEFERRED", "REJECTED", "BLOCKED"}
+                ]
+            )
+            if deferred:
+                self._notify(
+                    "WARN",
+                    "ORDER_DEFERRED",
+                    "存在延迟或受阻订单",
+                    f"本次流水线共有 {len(deferred)} 条执行未即时完成，请在撮合明细复核。",
+                    trade_date=trade_date,
+                    run_id=run_id,
+                )
+            prior_failure = any(
+                row["id"] != run_id
+                and row["trade_date"] == trade_date
+                and row["status"] == "FAILED"
+                for row in self.runs(100)
+            )
+            if prior_failure:
+                self._notify(
+                    "INFO",
+                    "PIPELINE_RECOVERED",
+                    "流水线恢复成功",
+                    "失败任务已从完成步骤后续跑通，无需重复执行已完成步骤。",
+                    trade_date=trade_date,
+                    run_id=run_id,
+                )
+            report_path = None if result is None else result.report_path
+            self._finish(run_id, "COMPLETED", report_path=report_path)
         except Exception as error:  # noqa: BLE001 - task failures must stay observable
-            self._finish(run_id, "FAILED", error=f"{type(error).__name__}: {error}")
+            detail = f"{type(error).__name__}: {error}"
+            self._finish(run_id, "FAILED", error=detail)
+            self._notify(
+                "ERROR",
+                "PIPELINE_FAILED",
+                "每日流水线失败",
+                detail,
+                trade_date=trade_date,
+                run_id=run_id,
+            )
         finally:
             self._run_lock.release()
 
@@ -650,6 +968,7 @@ def bank_execution() -> dict[str, object]:
 def multi_sector_execution() -> dict[str, object]:
     broker = PaperBroker(PAPER_DATABASE)
     broker.initialize_account(1_000_000, MULTI_SECTOR_ACCOUNT)
+    store = ParquetStore(DATA)
     with sqlite3.connect(PAPER_DATABASE) as connection:
         connection.row_factory = sqlite3.Row
         fills = [
@@ -675,6 +994,19 @@ def multi_sector_execution() -> dict[str, object]:
         if row.get("account_id") == MULTI_SECTOR_ACCOUNT
     ][:100]
     latest = _latest_multi_sector_shadow()
+    analytics: dict[str, list[dict[str, object]]] = {}
+    for api_key, table in {
+        "history": "multi_sector_account_daily",
+        "deviations": "multi_sector_deviation_daily",
+        "risk_alerts": "multi_sector_risk_alerts",
+    }.items():
+        try:
+            frame = store.read(table)
+            if api_key != "history" and not frame.empty:
+                frame = frame.loc[frame["trade_date"] == frame["trade_date"].max()]
+            analytics[api_key] = _records(frame)
+        except FileNotFoundError:
+            analytics[api_key] = []
     return {
         "account_id": MULTI_SECTOR_ACCOUNT,
         "status": latest.get("status", "AWAITING_FIRST_RUN"),
@@ -686,9 +1018,87 @@ def multi_sector_execution() -> dict[str, object]:
         "positions": positions,
         "portfolio": latest.get("portfolio"),
         "attribution": latest.get("attribution", []),
+        "return_attribution": latest.get("return_attribution", []),
+        "risk_attribution": latest.get("risk_attribution", []),
+        "execution_attribution": latest.get("execution_attribution", []),
+        "attribution_reconciliation": latest.get(
+            "attribution_reconciliation", {}
+        ),
+        "corporate_actions_today": latest.get(
+            "corporate_actions", {"registered": [], "settled": []}
+        ),
+        "corporate_action_ledger": broker.corporate_actions(MULTI_SECTOR_ACCOUNT),
+        "data_health": latest.get("data_health", {}),
+        "risk_state": broker.risk_state(MULTI_SECTOR_ACCOUNT),
+        "risk_transitions": broker.risk_transitions(MULTI_SECTOR_ACCOUNT)[:100],
+        "model_version": latest.get("model_version", {}),
+        "metrics": latest.get("metrics", {}),
+        **analytics,
         "reconciliation": asdict(broker.reconcile(MULTI_SECTOR_ACCOUNT)),
-        "symbol_names": _instrument_names(ParquetStore(DATA)),
+        "symbol_names": _instrument_names(store),
     }
+
+
+@app.post("/api/risk-state/recover")
+def recover_risk_state() -> dict[str, object]:
+    broker = PaperBroker(PAPER_DATABASE)
+    broker.initialize_account(1_000_000, MULTI_SECTOR_ACCOUNT)
+    return broker.approve_risk_recovery(MULTI_SECTOR_ACCOUNT)
+
+
+@app.get("/api/data-quality")
+def data_quality() -> dict[str, object]:
+    store = ParquetStore(DATA)
+    try:
+        history = store.read("data_health_daily").sort_values("trade_date")
+        checks = store.read("data_health_checks")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    latest_date = str(history.iloc[-1]["trade_date"])
+    latest_checks = checks.loc[checks["trade_date"].astype(str) == latest_date]
+    return {
+        "latest": _records(history.tail(1))[0],
+        "checks": _records(latest_checks.sort_values(["status", "category", "code"])),
+        "history": _records(history.tail(90)),
+        "symbol_names": _instrument_names(store),
+    }
+
+
+@app.get("/api/model-registry")
+def model_registry() -> dict[str, list[dict[str, Any]]]:
+    registry = ModelRegistry(
+        STATE / "model_registry.sqlite3",
+        STATE / "model-versions",
+    )
+    return registry.snapshot()
+
+
+@app.get("/api/monthly-acceptance")
+def monthly_acceptance() -> dict[str, object]:
+    store = ParquetStore(DATA)
+    try:
+        account_daily = store.read("multi_sector_account_daily")
+        records = _records(account_daily)
+        observation_date = str(account_daily["trade_date"].astype(str).max())
+    except FileNotFoundError:
+        records = []
+        observation_date = datetime.now(SHANGHAI).strftime("%Y%m%d")
+    broker = PaperBroker(PAPER_DATABASE)
+    registry = ModelRegistry(
+        STATE / "model_registry.sqlite3",
+        STATE / "model-versions",
+    )
+    result = evaluate_monthly_cycle(
+        account_daily=records,
+        fills=broker.fills(MULTI_SECTOR_ACCOUNT),
+        model_versions=registry.snapshot(100)["versions"],
+        start_date="20260727",
+        observation_date=observation_date,
+    )
+    payload = asdict(result)
+    report = STATE / "monthly-acceptance" / f"{result.cycle_id}.json"
+    payload["report_path"] = str(report) if report.exists() else None
+    return payload
 
 
 def _latest_bank_shadow() -> dict[str, object]:
@@ -874,6 +1284,232 @@ def research(symbol: str = SYMBOL) -> dict[str, object]:
 @app.get("/api/tasks")
 def tasks() -> list[dict[str, Any]]:
     return task_service.runs()
+
+
+@app.get("/api/task-operations")
+def task_operations() -> dict[str, object]:
+    return {
+        "runs": task_service.runs(30),
+        "steps": task_service.steps(100),
+        "notifications": task_service.notifications(100),
+    }
+
+
+@app.get("/api/operations-center")
+def operations_center() -> dict[str, object]:
+    now = datetime.now(SHANGHAI)
+    config = task_service.config()
+    scheduled = now.replace(
+        hour=int(config["hour"]),
+        minute=int(config["minute"]),
+        second=0,
+        microsecond=0,
+    )
+    if scheduled <= now:
+        scheduled += timedelta(days=1)
+    broker = PaperBroker(PAPER_DATABASE)
+    pending_orders = [
+        row
+        for row in reversed(broker.orders())
+        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
+        and row.get("status") == "PENDING"
+    ]
+    with sqlite3.connect(PAPER_DATABASE) as connection:
+        connection.row_factory = sqlite3.Row
+        attempts = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT a.*, o.account_id, o.symbol, o.side, o.quantity
+                FROM execution_attempts a
+                JOIN orders o ON o.idempotency_key = a.idempotency_key
+                WHERE o.account_id = ?
+                ORDER BY a.id DESC LIMIT 100
+                """,
+                (MULTI_SECTOR_ACCOUNT,),
+            )
+        ]
+    today = now.strftime("%Y%m%d")
+    preview = _daily_run_preview(today)
+    return {
+        "server_time": now.isoformat(),
+        "scheduler": {
+            **config,
+            "next_run": scheduled.isoformat(),
+            "seconds_to_next_run": max(
+                0, int((scheduled - now).total_seconds())
+            ),
+        },
+        "pending_orders": pending_orders,
+        "deferred_attempts": [
+            row for row in attempts if row["outcome"] != "FILLED"
+        ],
+        "recent_attempts": attempts,
+        "task_runs": task_service.runs(30),
+        "task_steps": task_service.steps(100),
+        "notifications": task_service.notifications(100),
+        "preview": preview,
+        "readiness": _operational_readiness(today),
+    }
+
+
+@app.get("/api/operational-readiness")
+def operational_readiness() -> dict[str, object]:
+    return _operational_readiness(
+        datetime.now(SHANGHAI).strftime("%Y%m%d")
+    )
+
+
+def _operational_readiness(trade_date: str) -> dict[str, object]:
+    store = ParquetStore(DATA)
+    checks = []
+    try:
+        calendar = store.read("trade_calendar")
+        current = calendar.loc[
+            calendar["cal_date"].astype(str) == trade_date
+        ]
+        covered = len(current) == 1
+        session = (
+            "OPEN"
+            if covered and int(current.iloc[0]["is_open"]) == 1
+            else "CLOSED"
+            if covered
+            else "UNKNOWN"
+        )
+    except FileNotFoundError:
+        covered = False
+        session = "UNKNOWN"
+    checks.append(
+        {
+            "code": "OFFICIAL_CALENDAR",
+            "status": "PASS" if covered else "REPAIR",
+            "message": (
+                f"正式日历确认当日{session}"
+                if covered
+                else "日度流水线启动后必须先同步正式交易日历"
+            ),
+        }
+    )
+    config = task_service.config()
+    scheduler_alive = bool(
+        task_service._thread and task_service._thread.is_alive()
+    )
+    checks.extend(
+        [
+            {
+                "code": "SCHEDULER_ENABLED",
+                "status": "PASS" if config["enabled"] else "BLOCK",
+                "message": "服务端日度调度已启用" if config["enabled"] else "调度已暂停",
+            },
+            {
+                "code": "SCHEDULER_THREAD",
+                "status": "PASS" if scheduler_alive else "BLOCK",
+                "message": (
+                    "调度线程正在运行"
+                    if scheduler_alive
+                    else "调度线程未运行，需要重启API服务"
+                ),
+            },
+        ]
+    )
+    blocking = sum(row["status"] == "BLOCK" for row in checks)
+    repair = sum(row["status"] == "REPAIR" for row in checks)
+    return {
+        "trade_date": trade_date,
+        "status": (
+            "BLOCKED" if blocking else "REQUIRES_SYNC" if repair else "READY"
+        ),
+        "market_session": session,
+        "blocking_count": blocking,
+        "repair_count": repair,
+        "checks": checks,
+    }
+
+
+@app.get("/api/tasks/daily-run/preview")
+def preview_daily_run(trade_date: str | None = None) -> dict[str, object]:
+    selected = trade_date or datetime.now(SHANGHAI).strftime("%Y%m%d")
+    if len(selected) != 8 or not selected.isdigit():
+        raise HTTPException(status_code=400, detail="trade_date must use YYYYMMDD")
+    try:
+        datetime.strptime(selected, "%Y%m%d").replace(tzinfo=SHANGHAI)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid trade_date") from error
+    return _daily_run_preview(selected)
+
+
+def _daily_run_preview(trade_date: str) -> dict[str, object]:
+    preview = task_service.preview(trade_date)
+    store = ParquetStore(DATA)
+    market_session = "UNKNOWN"
+    calendar_source = "LOCAL_TRADE_CALENDAR"
+    try:
+        calendar = store.read("trade_calendar")
+        row = calendar.loc[calendar["cal_date"].astype(str) == trade_date]
+        if not row.empty:
+            market_session = "OPEN" if int(row.iloc[-1]["is_open"]) == 1 else "CLOSED"
+        else:
+            calendar_source = "WEEKDAY_ESTIMATE"
+            market_session = (
+                "OPEN_ESTIMATED"
+                if datetime.strptime(trade_date, "%Y%m%d")
+                .replace(tzinfo=SHANGHAI)
+                .weekday()
+                < 5
+                else "CLOSED_ESTIMATED"
+            )
+    except FileNotFoundError:
+        calendar_source = "WEEKDAY_ESTIMATE"
+        market_session = (
+            "OPEN_ESTIMATED"
+            if datetime.strptime(trade_date, "%Y%m%d")
+            .replace(tzinfo=SHANGHAI)
+            .weekday()
+            < 5
+            else "CLOSED_ESTIMATED"
+        )
+    broker = PaperBroker(PAPER_DATABASE)
+    pending = [
+        row
+        for row in broker.orders()
+        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
+        and row.get("status") == "PENDING"
+    ]
+    eligible = [
+        row for row in pending if str(row["signal_date"]) < trade_date
+    ]
+    latest_shadow = _latest_multi_sector_shadow()
+    return {
+        **preview,
+        "market_session": market_session,
+        "calendar_source": calendar_source,
+        "pending_order_count": len(pending),
+        "eligible_for_execution_count": len(eligible),
+        "eligible_buy_count": sum(row["side"] == "BUY" for row in eligible),
+        "eligible_sell_count": sum(row["side"] == "SELL" for row in eligible),
+        "latest_shadow_date": latest_shadow.get("trade_date"),
+        "risk_state": broker.risk_state(MULTI_SECTOR_ACCOUNT),
+        "expected_effects": [
+            "同步并校验指定交易日数据",
+            f"最多尝试撮合 {len(eligible)} 笔此前待执行订单",
+            "重新计算五行业目标权重并生成幂等信号",
+            "更新模拟持仓、现金、归因、风险状态和对账",
+        ],
+        "warnings": (
+            ["本地交易日历未覆盖该日期，开闭市状态仅按工作日估计"]
+            if calendar_source == "WEEKDAY_ESTIMATE"
+            else []
+        ),
+        "mutates_state": False,
+    }
+
+
+@app.post("/api/notifications/{notification_id}/acknowledge")
+def acknowledge_notification(notification_id: int) -> dict[str, Any]:
+    try:
+        return task_service.acknowledge_notification(notification_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="notification not found") from error
 
 
 @app.get("/api/task-config")

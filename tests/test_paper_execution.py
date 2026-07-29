@@ -157,3 +157,55 @@ def test_limit_and_t_plus_one_defer_without_losing_order(tmp_path: Path):
     portfolio = broker.portfolio(41.0, "600036.SH")
     assert portfolio["position_quantity"] == 0
     assert broker.reconcile().matched
+
+
+def test_cancelled_order_can_be_reopened_after_data_correction(tmp_path: Path):
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000)
+    risk = _risk("corrected-buy", Side.BUY)
+
+    assert broker.submit(risk) == "PENDING"
+    assert broker.cancel_pending("default", "DATA_STALE", "20260105") == 1
+    assert broker.submit(risk) == "REOPENED"
+    assert broker.orders()[0]["status"] == "PENDING"
+
+
+def test_cash_and_stock_dividends_are_idempotent_and_reconcile(tmp_path: Path):
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000)
+    broker.submit(_risk("buy-for-dividend", Side.BUY))
+    broker.execute_pending(
+        ExecutionBar("600036.SH", "20260106", 40.0, 40.0), _config()
+    )
+
+    assert broker.register_corporate_entitlement(
+        "default",
+        "600036.SH",
+        "600036.SH:20251231:20260106",
+        "20260106",
+        cash_per_share=0.5,
+        stock_ratio=0.1,
+        cash_pay_date="20260107",
+        stock_list_date="20260107",
+    ) == "REGISTERED"
+    assert broker.register_corporate_entitlement(
+        "default",
+        "600036.SH",
+        "600036.SH:20251231:20260106",
+        "20260106",
+        cash_per_share=0.5,
+        stock_ratio=0.1,
+        cash_pay_date="20260107",
+        stock_list_date="20260107",
+    ) == "DUPLICATE"
+
+    settled = broker.settle_corporate_actions("default", "20260107")
+    assert [row["action_type"] for row in settled] == [
+        "CASH_DIVIDEND",
+        "STOCK_DIVIDEND",
+    ]
+    assert broker.settle_corporate_actions("default", "20260107") == []
+    portfolio = broker.portfolio(40.0, "600036.SH")
+    assert portfolio["position_quantity"] == 110
+    assert portfolio["cash"] == pytest.approx(96_044.2)
+    assert broker.reconcile().matched

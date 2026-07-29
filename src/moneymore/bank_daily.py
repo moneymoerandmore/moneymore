@@ -8,8 +8,9 @@ from pathlib import Path
 import pandas as pd
 
 from .config import BacktestConfig
+from .data.calendar import sync_trading_calendar
 from .data.provider import MarketDataProvider
-from .data.quality import validate_calendar, validate_daily_basic
+from .data.quality import validate_daily_basic
 from .data.research import load_point_in_time_features, load_total_return_stock_bars
 from .data.store import ParquetStore
 from .data.sync import sync_daily_history
@@ -56,9 +57,11 @@ def run_bank_daily_pipeline(
     report_dir: str | Path,
 ) -> BankDailyResult:
     broker.initialize_account(config.initial_cash, BANK_ACCOUNT)
-    calendar = provider.trading_calendar(trade_date, trade_date)
-    validate_calendar(calendar)
-    if not bool((calendar["is_open"].astype(str) == "1").any()):
+    calendar = sync_trading_calendar(provider, store, trade_date)
+    current_session = calendar.loc[
+        calendar["cal_date"].astype(str) == trade_date
+    ]
+    if not bool((current_session["is_open"].astype(str) == "1").any()):
         return _finish(
             trade_date,
             "SKIPPED_MARKET_CLOSED",

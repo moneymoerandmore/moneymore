@@ -12,6 +12,16 @@ test("dashboard presents the complete multi-sector portfolio", async () => {
   assert.match(source, /\/api\/sector-portfolio/);
   assert.match(source, /\/api\/bank-dashboard/);
   assert.match(source, /\/api\/multi-sector-execution/);
+  assert.match(source, /目标与实际仓位偏差/);
+  assert.match(source, /行业收益与持仓归因/);
+  assert.match(source, /风险监控/);
+  assert.match(source, /数据健康/);
+  assert.match(source, /\/api\/data-quality/);
+  assert.match(source, /DATA QUALITY CENTER/);
+  assert.match(source, /账户风险状态机/);
+  assert.match(source, /REDUCE_ONLY/);
+  assert.match(source, /SELL_ONLY/);
+  assert.match(source, /\/api\/risk-state\/recover/);
   assert.match(source, /symbol_names/);
   assert.match(source, /security\(v,names\)/);
   assert.match(source, /names\[s\]/);
