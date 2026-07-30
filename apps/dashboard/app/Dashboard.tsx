@@ -57,6 +57,11 @@ type Challenger = {
   latest: Row & { selected?: string[]; scores?: Row[]; portfolio?: Bank["shadow"]["portfolio"] };
   orders: Row[]; fills: Row[]; reconciliation: Row;
   baseline: { account_id: string; latest: Row };
+  historical_execution: Row & { strategies?: (Row & { summary?: Row })[] };
+  point_in_time: Row & { historical_replay_gate?: Row };
+  governance: Row & { releases?: Row[]; transitions?: Row[] };
+  drift: Row & { breaches?: string[] };
+  long_term_review: Row & { evaluation?: Row; criteria?: Record<string, boolean>; cost_ratios?: Row };
 };
 
 const nav: { id: Page; label: string; note: string }[] = [
@@ -143,7 +148,7 @@ export default function Dashboard() {
       {page === "overview" && <Overview sectors={sectors} execution={execution}/>}
       {page === "sectors" && <SectorPage bank={bank} sectors={sectors}/>}
       {page === "research" && <Research sectors={sectors} models={models}/>}
-      {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/></>}
+      {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <Operations bank={bank} execution={execution} operations={operations} acceptance={acceptance} names={sectors.symbol_names} onRefresh={refresh}/>}
     </main>
@@ -194,7 +199,27 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
 }
 
 function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
-  return <div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title="双策略同口径比较" subtitle="至少20个共同模拟交易日后才形成比较结论"><Table rows={challenger.comparison.metrics??[]} columns={[["account_id","账户"],["observation_days","观察日"],["total_return","累计收益"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel></div>;
+  const commonDays = Number(challenger.comparison.common_observation_days??0);
+  const commonStart = text(challenger.comparison.common_start_date);
+  const commonEnd = text(challenger.comparison.common_end_date);
+  const replayRows = (challenger.historical_execution.strategies??[]).map((row)=>({strategy_id:row.strategy_id,...(row.summary??{})}));
+  return <><section className="kpis"><Kpi label="公平 PK 状态" value={text(challenger.comparison.status)} note={Boolean(challenger.comparison.ready)?"已达到最低观察期":"暂不判定胜负"} accent={!Boolean(challenger.comparison.ready)}/><Kpi label="共同观察日" value={String(commonDays)} note="仅使用两个账户均有快照的交易日"/><Kpi label="共同区间" value={commonStart==="—"?"等待重叠数据":`${commonStart} → ${commonEnd}`} note="共同首日净值统一归一为 1"/><Kpi label="风险比较口径" value="10% 年化波动" note="仓位不同不能只比较原始收益"/></section><Panel title="M5.3 完整历史执行重放" subtitle={`${text(challenger.historical_execution.start_date)} → ${text(challenger.historical_execution.end_date)} · ${text(challenger.historical_execution.evidence_status)} · 与模拟盘共用 PaperBroker`}><Table rows={replayRows} columns={[["strategy_id","策略"],["observation_days","交易日"],["total_return","累计收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"],["order_count","订单"],["fill_count","成交"],["transaction_cost","交易成本"],["reconciled","对账"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct,transaction_cost:money}}/></Panel><div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title="双策略公平 PK 基线" subtitle="共同日期、净值归一、账户净收益；至少20个共同交易日后才形成结论"><Table rows={challenger.comparison.metrics??[]} columns={[["account_id","账户"],["observation_days","共同日"],["total_return","共同区间收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["risk_normalized_return","风险归一收益"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,risk_normalized_return:pct,sharpe:num,max_drawdown:pct}}/></Panel></div></>;
+}
+
+function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {
+  const gate = challenger.point_in_time.historical_replay_gate??{};
+  return <><section className="kpis"><Kpi label="M5.4 时点存储" value={text(challenger.point_in_time.status)} note={`${text(challenger.point_in_time.feature_rows)} 条特征快照`}/><Kpi label="股票池门禁" value={text(gate.status)} note="成分必须在当时已被系统捕获" accent={text(gate.status)!=="PASS"}/><Kpi label="历史订单覆盖" value={pct(gate.coverage)} note={`${text(gate.eligible_orders)} / ${text(gate.tested_orders)}`}/><Kpi label="可信起点" value={text(gate.earliest_trustworthy_date)} note="此前收益只能作为诊断"/></section><Panel title="时点数据可用规则" subtitle={`数据指纹 ${text(challenger.point_in_time.source_fingerprint).slice(0,16)}…`}><Table rows={Object.entries((challenger.point_in_time.availability_rules??{}) as Row).map(([source,rule])=>({source,rule}))} columns={[["source","数据层"],["rule","可用时间规则"]]}/></Panel></>;
+}
+
+function GovernanceEvidence({ challenger }: { challenger: Challenger }) {
+  return <><section className="kpis"><Kpi label="M5.5 部署状态" value={text(challenger.governance.lifecycle)} note={text(challenger.governance.release_id)}/><Kpi label="挑战者执行模式" value={text(challenger.governance.execution_mode)} note={text(challenger.governance.reason)} accent={text(challenger.governance.execution_mode)!=="PAPER_TRADING"}/><Kpi label="漂移状态" value={text(challenger.drift.status)} note={`${text(challenger.drift.matured_forward_days)} 个成熟前瞻日`} accent={text(challenger.drift.status)==="BREACH"}/><Kpi label="滚动 Rank IC" value={num(challenger.drift.rolling_rank_ic)} note={`换手 ${pct(challenger.drift.average_turnover)} · 成本率 ${pct(challenger.drift.cost_ratio)}`}/></section><div className="two-col"><Panel title="模型发布注册表" subtitle="候选模型不会自动替换当前挑战者"><Table rows={challenger.governance.releases??[]} columns={[["release_id","版本"],["model_id","模型"],["lifecycle","生命周期"],["data_cutoff","数据截止"],["artifact_hash","产物指纹"]]}/></Panel><Panel title="部署状态转换" subtitle="自动操作只能降级；晋级和恢复必须通过门禁"><Table rows={challenger.governance.transitions??[]} columns={[["created_at","时间"],["from_lifecycle","原状态"],["to_lifecycle","新状态"],["to_mode","执行模式"],["transition_type","类型"],["reason","原因"]]}/></Panel></div><Panel title="漂移监控" subtitle="滚动 IC、预测 PSI、特征 PSI、换手和成本共同决定是否降级"><Table rows={[challenger.drift]} columns={[["status","状态"],["observed_prediction_days","预测日"],["matured_forward_days","成熟日"],["rolling_rank_ic","滚动IC"],["score_psi","预测PSI"],["maximum_feature_psi","特征PSI"],["average_turnover","换手"],["cost_ratio","成本率"],["breaches","触发项"]]} format={{rolling_rank_ic:num,score_psi:num,maximum_feature_psi:num,average_turnover:pct,cost_ratio:pct}}/></Panel></>;
+}
+
+function LongTermReview({ challenger }: { challenger: Challenger }) {
+  const review=challenger.long_term_review;
+  const evaluation=review.evaluation??{};
+  const checks=Object.entries(review.criteria??{}).map(([criterion,passed])=>({criterion,status:passed?"PASS":"WAIT"}));
+  return <><Intro tag="M5.6 LONG-TERM REVIEW" title="20日只观察，60日后才允许提出晋级">评审只使用2026-07-30之后两个账户共有的可信交易日。Bootstrap置信区间、风险归一收益、回撤、成本、漂移和前瞻门禁必须同时通过；系统永远不会自动替换因子Champion。</Intro><section className="kpis"><Kpi label="评审状态" value={text(review.status)} note={text(review.decision_authority)} accent={text(review.status)!=="ELIGIBLE_FOR_MANUAL_PROMOTION_REVIEW"}/><Kpi label="可信共同日" value={text(evaluation.common_observation_days)} note={`初评 ${text(review.minimum_preliminary_days)} · 正式 ${text(review.minimum_formal_days)}`}/><Kpi label="年化配对超额" value={pct(evaluation.annualized_excess_return)} note={`CI ${pct(evaluation.annualized_excess_ci_low)} → ${pct(evaluation.annualized_excess_ci_high)}`}/><Kpi label="Deflated Sharpe置信度" value={pct(evaluation.deflated_sharpe_probability)} note={`${text(evaluation.trial_count)} 个模型试验修正`}/></section><div className="two-col"><Panel title="风险归一比较" subtitle="统一到10%年化波动后比较"><Table rows={[{account:"因子 Champion",total_return:evaluation.factor_total_return,risk_return:evaluation.factor_risk_normalized_return,volatility:evaluation.factor_annualized_volatility,max_drawdown:evaluation.factor_max_drawdown},{account:"Qlib Challenger",total_return:evaluation.qlib_total_return,risk_return:evaluation.qlib_risk_normalized_return,volatility:evaluation.qlib_annualized_volatility,max_drawdown:evaluation.qlib_max_drawdown}]} columns={[["account","账户"],["total_return","累计收益"],["risk_return","风险归一收益"],["volatility","年化波动"],["max_drawdown","最大回撤"]]} format={{total_return:pct,risk_return:pct,volatility:pct,max_drawdown:pct}}/></Panel><Panel title="正式晋级门禁" subtitle="全部通过也只获得人工评审资格"><Table rows={checks} columns={[["criterion","门禁"],["status","状态"]]}/></Panel></div></>;
 }
 
 function DataHealth({ quality }: { quality: DataQuality }) {

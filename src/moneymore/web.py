@@ -28,15 +28,21 @@ from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
 from .execution.paper import PaperBroker
 from .factors import build_default_registry
+from .long_term_review import evaluate_long_term_review
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle
 from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
 )
+from .point_in_time import materialize_point_in_time_store
 from .qlib_challenger_daily import (
     QLIB_CHALLENGER_ACCOUNT,
     run_qlib_challenger_daily,
+)
+from .qlib_governance import (
+    bootstrap_qlib_release,
+    evaluate_qlib_drift,
 )
 from .research.adaptive import research_weighted_strategies
 from .research.detail import (
@@ -48,6 +54,7 @@ from .research.detail import (
 from .research.governance import evaluate_bank_model_promotion
 from .research.single_stock import research_single_stock, robustness_single_stock
 from .signals import trend_decision
+from .strategy_comparison import build_fair_comparison
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "state"
@@ -607,6 +614,16 @@ class TaskService:
             self._run_step(
                 run_id,
                 trade_date,
+                "point_in_time_refresh",
+                lambda: materialize_point_in_time_store(
+                    ROOT,
+                    captured_date=trade_date,
+                    feature_start=pd.Timestamp(trade_date).strftime("%Y-%m-%d"),
+                ),
+            )
+            self._run_step(
+                run_id,
+                trade_date,
                 "sector_research",
                 lambda: subprocess.run(
                     [
@@ -686,6 +703,28 @@ class TaskService:
                         trade_date=trade_date,
                         signal_dir=STATE / "qlib-challenger-signals",
                         report_dir=STATE / "qlib-challenger-shadow",
+                    ),
+                )
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "qlib_drift_monitoring",
+                    lambda: evaluate_qlib_drift(
+                        ROOT,
+                        store,
+                        broker,
+                        trade_date,
+                    ),
+                )
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "qlib_long_term_review",
+                    lambda: evaluate_long_term_review(
+                        ROOT,
+                        store,
+                        broker,
+                        trade_date,
                     ),
                 )
             except Exception as challenger_error:  # noqa: BLE001
@@ -1178,6 +1217,7 @@ def qlib_challenger() -> dict[str, object]:
     broker.initialize_account(1_000_000, QLIB_CHALLENGER_ACCOUNT)
     research_path = STATE / "qlib-challenger" / "latest-research.json"
     forward_path = STATE / "qlib-challenger" / "forward-evaluation.json"
+    historical_path = STATE / "historical-pk" / "latest.json"
     reports_dir = STATE / "qlib-challenger-shadow"
     reports = sorted(reports_dir.glob("*.json")) if reports_dir.exists() else []
     latest = (
@@ -1214,6 +1254,34 @@ def qlib_challenger() -> dict[str, object]:
         json.loads(forward_path.read_text(encoding="utf-8"))
         if forward_path.exists()
         else {"matured_days": 0, "rank_ic": None, "rank_ic_ir": None, "daily": []}
+    )
+    historical_execution = (
+        json.loads(historical_path.read_text(encoding="utf-8"))
+        if historical_path.exists()
+        else {
+            "status": "AWAITING_REPLAY",
+            "evidence_status": "NO_EXECUTION_EVIDENCE",
+            "strategies": [],
+        }
+    )
+    point_in_time_path = STATE / "point-in-time" / "latest.json"
+    point_in_time = (
+        json.loads(point_in_time_path.read_text(encoding="utf-8"))
+        if point_in_time_path.exists()
+        else {"status": "AWAITING_MATERIALIZATION"}
+    )
+    governance = bootstrap_qlib_release(ROOT)
+    drift_path = STATE / "qlib-governance" / "latest-drift.json"
+    drift = (
+        json.loads(drift_path.read_text(encoding="utf-8"))
+        if drift_path.exists()
+        else {"status": "AWAITING_OBSERVATIONS"}
+    )
+    review_path = STATE / "qlib-governance" / "long-term-review.json"
+    long_term_review = (
+        json.loads(review_path.read_text(encoding="utf-8"))
+        if review_path.exists()
+        else {"status": "COLLECTING_EVIDENCE", "criteria": {}, "evaluation": {}}
     )
     challenger_config = yaml.safe_load(
         (ROOT / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
@@ -1268,8 +1336,7 @@ def qlib_challenger() -> dict[str, object]:
         for row in reversed(broker.orders())
         if row.get("account_id") == QLIB_CHALLENGER_ACCOUNT
     ][:100]
-    comparison_histories: dict[str, list[dict[str, object]]] = {}
-    comparison_metrics: list[dict[str, object]] = []
+    comparison_sources: dict[str, pd.DataFrame] = {}
     for account_id, table in (
         (MULTI_SECTOR_ACCOUNT, "multi_sector_account_daily"),
         (QLIB_CHALLENGER_ACCOUNT, "qlib_challenger_account_daily"),
@@ -1278,8 +1345,12 @@ def qlib_challenger() -> dict[str, object]:
             history = ParquetStore(DATA).read(table).sort_values("trade_date")
         except FileNotFoundError:
             history = pd.DataFrame()
-        comparison_histories[account_id] = _records(history)
-        comparison_metrics.append(_account_performance(account_id, history))
+        comparison_sources[account_id] = history
+    fair_comparison = build_fair_comparison(
+        comparison_sources,
+        minimum_observation_days=20,
+        target_volatility=0.10,
+    )
     return {
         "account_id": QLIB_CHALLENGER_ACCOUNT,
         "research": research,
@@ -1288,14 +1359,12 @@ def qlib_challenger() -> dict[str, object]:
         "orders": orders,
         "fills": broker.fills(QLIB_CHALLENGER_ACCOUNT),
         "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
-        "comparison": {
-            "metrics": comparison_metrics,
-            "histories": comparison_histories,
-            "ready": all(
-                int(row["observation_days"]) >= 20 for row in comparison_metrics
-            ),
-            "minimum_observation_days": 20,
-        },
+        "comparison": fair_comparison,
+        "historical_execution": historical_execution,
+        "point_in_time": point_in_time,
+        "governance": governance,
+        "drift": drift,
+        "long_term_review": long_term_review,
         "baseline": {
             "account_id": MULTI_SECTOR_ACCOUNT,
             "latest": _latest_multi_sector_shadow(),

@@ -370,6 +370,24 @@ class PaperBroker:
             query += " ORDER BY id"
             return [dict(row) for row in connection.execute(query, parameters)]
 
+    def execution_attempts(
+        self, account_id: str
+    ) -> list[dict[str, object]]:
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT a.* FROM execution_attempts a
+                    JOIN orders o ON o.idempotency_key = a.idempotency_key
+                    WHERE o.account_id = ?
+                    ORDER BY a.id
+                    """,
+                    (account_id,),
+                )
+            ]
+
     def cancel_pending(
         self,
         account_id: str,

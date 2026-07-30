@@ -41,3 +41,17 @@ model:
   batch_size: 1024
   learning_rate: 0.001
   seeds: [17, 23, 42, 71, 101]
+training_policy:
+  frequency: monthly
+  automatic_promotion: false
+  candidate_only: true
+drift_monitoring:
+  reference_window: 20
+  recent_window: 20
+  minimum_observations: 20
+  minimum_rolling_rank_ic: -0.02
+  maximum_score_psi: 0.25
+  maximum_feature_psi: 0.25
+  enforce_feature_psi: false
+  maximum_turnover: 0.50
+  maximum_cost_ratio: 0.005

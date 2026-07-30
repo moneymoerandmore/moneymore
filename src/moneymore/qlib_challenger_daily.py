@@ -20,6 +20,7 @@ from .qlib_challenger import (
     challenger_universe,
     evaluate_forward_observations,
 )
+from .qlib_governance import bootstrap_qlib_release
 from .signals import SignalDecision, write_signal_artifact
 
 QLIB_CHALLENGER_ACCOUNT = "qlib_gru_shadow"
@@ -78,6 +79,7 @@ def run_qlib_challenger_daily(
             report_dir,
         )
     research = json.loads(research_path.read_text(encoding="utf-8"))
+    deployment = bootstrap_qlib_release(root)
     gru_metrics = next(
         (row for row in research["metrics"] if row["model_id"] == model_id),
         None,
@@ -94,6 +96,7 @@ def run_qlib_challenger_daily(
         and int(stability.get("seed_count", 0)) >= int(gate["minimum_seed_count"])
         and float(stability.get("positive_seed_ratio", 0))
         >= float(gate["minimum_positive_seed_ratio"])
+        and deployment.get("execution_mode") == "PAPER_TRADING"
     )
     universe = challenger_universe(root, store)
     frame = build_challenger_dataset(

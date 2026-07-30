@@ -21,6 +21,7 @@ from moneymore.qlib_challenger import (
     evaluate_predictions,
     metrics_payload,
 )
+from moneymore.qlib_governance import register_qlib_candidate
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = yaml.safe_load(
@@ -157,7 +158,8 @@ stability = {
     "rank_ic_min": min(float(row["rank_ic"]) for row in seed_metrics),
     "rank_ic_max": max(float(row["rank_ic"]) for row in seed_metrics),
 }
-(MODELS / f"{base_model_id}_ensemble.json").write_text(
+ensemble_artifact = MODELS / f"{base_model_id}_ensemble.json"
+ensemble_artifact.write_text(
     json.dumps({"models": deployment_models}, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
@@ -173,6 +175,12 @@ payload = {
     "metrics": metrics,
     "stability": stability,
 }
+payload["candidate_release"] = register_qlib_candidate(
+    ROOT,
+    model_id=base_model_id,
+    artifact_path=ensemble_artifact,
+    data_cutoff=str(frame.index.get_level_values("datetime").max().date()),
+)
 (ARTIFACTS / "latest-research.json").write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
