@@ -86,6 +86,7 @@ const factorLabels: Record<string, string> = {
 };
 const pct = (v: unknown) => `${(Number(v ?? 0) * 100).toFixed(1)}%`;
 const num = (v: unknown) => Number(v ?? 0).toFixed(2);
+const modelScore = (v: unknown) => Number(v ?? 0).toFixed(6);
 const text = (v: unknown) => v == null ? "—" : String(v);
 const security = (v: unknown, names: Record<string, string>) => {
   const code = text(v);
@@ -186,13 +187,20 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
 
 function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
   const metrics = challenger.research.metrics??[];
+  const selected = new Set(challenger.latest.selected??[]);
+  const sectorRanks: Record<string, number> = {};
+  const rankedScores = (challenger.latest.scores??[]).map((row) => {
+    const sector = text(row.sector);
+    sectorRanks[sector] = (sectorRanks[sector]??0) + 1;
+    return {...row, sector_rank:sectorRanks[sector], selected:selected.has(text(row.instrument))};
+  });
   const challengerEquity = Number(challenger.latest.portfolio?.equity??1_000_000);
   const baselinePortfolio = challenger.baseline.latest.portfolio as Row|undefined;
   const baselineEquity = Number(baselinePortfolio?.equity??1_000_000);
   return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
     <section className="kpis"><Kpi label="挑战者状态" value={text(challenger.latest.status)} note={challenger.account_id} accent={text(challenger.latest.status)!=="COMPLETED"}/><Kpi label="GPU训练" value={Boolean(challenger.research.cuda_available)?"CUDA":"未启用"} note={text(challenger.research.cuda_device)}/><Kpi label="挑战者权益" value={money(challengerEquity)} note={`累计 ${pct(challengerEquity/1_000_000-1)}`}/><Kpi label="因子基线权益" value={money(baselineEquity)} note={`累计 ${pct(baselineEquity/1_000_000-1)}`}/></section>
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
-    <div className="two-col"><Panel title="GRU最新排名" subtitle="每行业Top-2进入独立挑战者账户"><Table rows={(challenger.latest.scores??[]).slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["score","预测分数"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:num}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
+    <div className="two-col"><Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
     <Panel title="挑战者订单与成交" subtitle="仍采用T+1开盘撮合、费用、滑点和对账规则"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel>
     <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
   </>;
