@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pandas as pd
+
+from moneymore.data.store import ParquetStore
 from moneymore.web import TaskService
 
 
@@ -91,3 +94,33 @@ def test_daily_run_preview_is_read_only_and_marks_resume_steps(tmp_path: Path):
         {"step_name": "multi_sector_execution", "action": "RUN"},
         {"step_name": "qlib_challenger_execution", "action": "RUN"},
     ]
+
+
+def test_recovery_dates_fill_every_missing_open_session(tmp_path: Path):
+    service = TaskService(tmp_path / "service.sqlite3")
+    store = ParquetStore(tmp_path / "data")
+    store.merge_curated(
+        "daily",
+        [
+            pd.DataFrame(
+                {"ts_code": ["A", "A"], "trade_date": ["20260727", "20260730"]}
+            )
+        ],
+        ["ts_code", "trade_date"],
+    )
+    store.merge_curated(
+        "trade_calendar",
+        [
+            pd.DataFrame(
+                {
+                    "cal_date": ["20260727", "20260728", "20260729", "20260730"],
+                    "is_open": [1, 0, 1, 1],
+                }
+            )
+        ],
+        ["cal_date"],
+    )
+    completed = service._create_run("daily_pipeline", "20260727", "TEST")
+    service._finish(completed, "COMPLETED")
+
+    assert service._recovery_dates(store, "20260730") == ["20260729", "20260730"]

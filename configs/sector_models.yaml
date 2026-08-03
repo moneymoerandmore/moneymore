@@ -111,6 +111,62 @@ universes:
       688072.SH: 0.0206
       002049.SZ: 0.0199
 
+  science50:
+    name: 华夏科创50ETF前十大
+    etf_code: 588000.SH
+    style: hard_technology_growth_momentum
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.16
+    factors:
+      momentum_252_21: 0.30
+      return_120: 0.15
+      quarterly_revenue_growth: 0.20
+      roe: 0.10
+      price_to_ma_60: 0.10
+      volatility_60: 0.10
+      earnings_yield: 0.05
+    holdings:
+      688256.SH: 0.0930
+      688008.SH: 0.0813
+      688012.SH: 0.0800
+      688041.SH: 0.0789
+      688981.SH: 0.0741
+      688498.SH: 0.0494
+      688525.SH: 0.0483
+      688521.SH: 0.0406
+      688072.SH: 0.0403
+      688347.SH: 0.0362
+
+  consumer:
+    name: 汇添富中证主要消费ETF前十大
+    etf_code: 159928.SZ
+    style: consumer_quality_brand_defensive
+    top_k: 3
+    exit_rank: 5
+    max_replacements: 1
+    risk_target: 0.11
+    factors:
+      roe: 0.20
+      quarterly_revenue_growth: 0.15
+      dividend_yield_ttm: 0.20
+      earnings_yield: 0.15
+      volatility_60: 0.15
+      drawdown_120: 0.10
+      momentum_252_21: 0.05
+    holdings:
+      600887.SH: 0.0993
+      600519.SH: 0.0987
+      000858.SZ: 0.0973
+      002714.SZ: 0.0910
+      300498.SZ: 0.0624
+      000568.SZ: 0.0543
+      603288.SH: 0.0527
+      600809.SH: 0.0508
+      002311.SZ: 0.0350
+      605499.SH: 0.0318
+
 allocation:
   method: inverse_volatility
   lookback: 60

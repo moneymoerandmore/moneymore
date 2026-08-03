@@ -57,14 +57,17 @@ def expand_sleeve_targets(recommendation: object) -> tuple[
 ]:
     target_weights: dict[str, float] = {}
     symbol_sectors: dict[str, str] = {}
+    primary_contribution: dict[str, float] = {}
     for row in recommendation.to_dict("records"):  # type: ignore[attr-defined]
         symbols = [item for item in str(row["selected"]).split(",") if item]
         if not symbols:
             continue
         weight = float(row["target_weight"]) / len(symbols)
         for symbol in symbols:
-            target_weights[symbol] = weight
-            symbol_sectors[symbol] = str(row["sector"])
+            target_weights[symbol] = min(target_weights.get(symbol, 0.0) + weight, 0.10)
+            if weight > primary_contribution.get(symbol, -1):
+                primary_contribution[symbol] = weight
+                symbol_sectors[symbol] = str(row["sector"])
     return target_weights, symbol_sectors
 
 

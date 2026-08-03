@@ -143,16 +143,38 @@ def run_qlib_challenger_daily(
         int(challenger_config["exit_rank_per_sector"]),
         int(challenger_config["rebalance_interval"]),
     )
+    account_before = broker.account_snapshot({}, QLIB_CHALLENGER_ACCOUNT)
+    held = {
+        str(row["symbol"])
+        for row in account_before["positions"]  # type: ignore[index]
+    }
+    marks, bars = _latest_market_state(
+        store,
+        set(universe) | held,
+        cutoff,
+        trade_date,
+    )
     if not gate_passed:
+        # A research-gate downgrade prevents *new* Qlib signals, but it must
+        # never abandon orders already created on a prior trading day.  Those
+        # orders remain part of the paper ledger and are settled at the next
+        # available market bar under the same T+1 rule as normal operation.
+        executions = []
+        for symbol, bar in sorted(bars.items()):
+            executions.extend(
+                broker.execute_pending(bar, config, QLIB_CHALLENGER_ACCOUNT)
+            )
+        portfolio = broker.account_snapshot(marks, QLIB_CHALLENGER_ACCOUNT)
+        _record_account_history(store, trade_date, portfolio)
         result = _finish(
             trade_date,
             "OBSERVATION_ONLY",
             model_id,
             selected,
             score_frame.sort_values("score", ascending=False).to_dict("records"),
+            executions,
             [],
-            [],
-            broker.account_snapshot({}, QLIB_CHALLENGER_ACCOUNT),
+            portfolio,
             broker,
             report_dir,
             selection_metadata,
@@ -163,31 +185,7 @@ def run_qlib_challenger_daily(
             int(challenger_config["label_horizon"]),
         )
         return result
-    marks: dict[str, float] = {}
-    bars: dict[str, ExecutionBar] = {}
-    account_before = broker.account_snapshot({}, QLIB_CHALLENGER_ACCOUNT)
-    held = {
-        str(row["symbol"])
-        for row in account_before["positions"]  # type: ignore[index]
-    }
-    for symbol in sorted(set(universe) | held):
-        history = load_total_return_stock_bars(store, symbol)
-        eligible = history.loc[
-            pd.to_datetime(history["date"]) <= cutoff
-        ]
-        if eligible.empty:
-            continue
-        row = eligible.iloc[-1]
-        marks[symbol] = float(row["raw_close"])
-        if pd.Timestamp(row["date"]).strftime("%Y%m%d") == trade_date:
-            bars[symbol] = ExecutionBar(
-                symbol=symbol,
-                trade_date=trade_date,
-                open=float(row["raw_open"]),
-                close=float(row["raw_close"]),
-                can_buy=bool(row.get("can_buy", True)),
-                can_sell=bool(row.get("can_sell", True)),
-            )
+
     executions = []
     for symbol, bar in sorted(bars.items()):
         executions.extend(
@@ -266,6 +264,33 @@ def run_qlib_challenger_daily(
         report_dir,
         selection_metadata,
     )
+
+
+def _latest_market_state(
+    store: ParquetStore,
+    symbols: set[str],
+    cutoff: pd.Timestamp,
+    trade_date: str,
+) -> tuple[dict[str, float], dict[str, ExecutionBar]]:
+    marks: dict[str, float] = {}
+    bars: dict[str, ExecutionBar] = {}
+    for symbol in sorted(symbols):
+        history = load_total_return_stock_bars(store, symbol)
+        eligible = history.loc[pd.to_datetime(history["date"]) <= cutoff]
+        if eligible.empty:
+            continue
+        row = eligible.iloc[-1]
+        marks[symbol] = float(row["raw_close"])
+        if pd.Timestamp(row["date"]).strftime("%Y%m%d") == trade_date:
+            bars[symbol] = ExecutionBar(
+                symbol=symbol,
+                trade_date=trade_date,
+                open=float(row["raw_open"]),
+                close=float(row["raw_close"]),
+                can_buy=bool(row.get("can_buy", True)),
+                can_sell=bool(row.get("can_sell", True)),
+            )
+    return marks, bars
 
 
 def _scheduled_selection(
@@ -376,10 +401,9 @@ def _finish(
             target = report_dir / f"{trade_date}_{status}.json"
             payload["report_path"] = str(target)
             content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    if not target.exists():
-        temporary = target.with_suffix(".json.tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(target)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(target)
     return ChallengerDailyResult(
         **{key: payload[key] for key in ChallengerDailyResult.__dataclass_fields__}
     )

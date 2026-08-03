@@ -199,11 +199,10 @@ def challenger_universe(root: Path, store: ParquetStore) -> dict[str, str]:
     config = yaml.safe_load(
         (root / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
     )
-    result = {
-        symbol: sector
-        for sector, item in config["universes"].items()
-        for symbol in item["holdings"]
-    }
+    result: dict[str, str] = {}
+    for sector, item in config["universes"].items():
+        for symbol in item["holdings"]:
+            result.setdefault(symbol, sector)
     membership = store.read(
         "universe_membership",
         filters=[("universe", "==", "bank_cn")],

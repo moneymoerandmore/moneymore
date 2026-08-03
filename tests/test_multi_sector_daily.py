@@ -33,6 +33,18 @@ def test_expand_sleeve_targets_splits_each_sleeve_equally() -> None:
     }
 
 
+def test_expand_sleeve_targets_aggregates_overlap_and_caps_single_stock() -> None:
+    recommendation = pd.DataFrame(
+        [
+            {"sector": "chip", "target_weight": 0.18, "selected": "A,B"},
+            {"sector": "science50", "target_weight": 0.12, "selected": "A,C"},
+        ]
+    )
+    targets, sectors = expand_sleeve_targets(recommendation)
+    assert targets == {"A": 0.10, "B": 0.09, "C": 0.06}
+    assert sectors["A"] == "chip"
+
+
 def test_weight_deviation_explains_below_one_lot() -> None:
     rows = _weight_deviations(
         {"equity": 1_000_000, "positions": []},

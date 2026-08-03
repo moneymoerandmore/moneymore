@@ -77,6 +77,8 @@ const meta: Record<string, { label: string; color: string; thesis: string }> = {
   dividend: { label: "红利", color: "#f1be62", thesis: "股息 · 低波 · 价值" },
   metals: { label: "工业有色", color: "#db806e", thesis: "周期 · 动量 · 估值" },
   chip: { label: "芯片", color: "#7e91e8", thesis: "成长 · 景气 · 趋势" },
+  science50: { label: "科创50", color: "#a07ce5", thesis: "硬科技 · 成长 · 动量" },
+  consumer: { label: "主要消费", color: "#e89a5b", thesis: "品牌 · 质量 · 防御" },
   growth: { label: "创业板成长", color: "#53bfb0", thesis: "营收增长 · ROE · 动量" },
 };
 const factorLabels: Record<string, string> = {
@@ -144,7 +146,7 @@ export default function Dashboard() {
       <div className="aside-foot"><i/> PAPER ONLY<br/><small>{bank.scheduler.time} · {bank.scheduler.timezone}</small></div>
     </aside>
     <main className="workspace">
-      <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> 数据日 {sectors.latest_date}</span><button onClick={() => void refresh()}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "运行中…" : "运行今日流水线"}</button></div></header>
+      <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> 数据日 {sectors.latest_date}</span><button onClick={() => void refresh()}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "恢复中…" : "恢复并重算"}</button></div></header>
       {error && <div className="error">{error}</div>}
       {page === "overview" && <Overview sectors={sectors} execution={execution}/>}
       {page === "sectors" && <SectorPage bank={bank} sectors={sectors}/>}
@@ -187,6 +189,7 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
 
 function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
   const metrics = challenger.research.metrics??[];
+  const researchGate = challenger.research.gate??{};
   const selected = new Set(challenger.latest.selected??[]);
   const sectorRanks: Record<string, number> = {};
   const rankedScores = (challenger.latest.scores??[]).map((row) => {
@@ -201,7 +204,8 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
     <section className="kpis"><Kpi label="挑战者状态" value={text(challenger.latest.status)} note={challenger.account_id} accent={text(challenger.latest.status)!=="COMPLETED"}/><Kpi label="GPU训练" value={Boolean(challenger.research.cuda_available)?"CUDA":"未启用"} note={text(challenger.research.cuda_device)}/><Kpi label="挑战者权益" value={money(challengerEquity)} note={`累计 ${pct(challengerEquity/1_000_000-1)}`}/><Kpi label="因子基线权益" value={money(baselineEquity)} note={`累计 ${pct(baselineEquity/1_000_000-1)}`}/></section>
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
     <div className="two-col"><Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
-    <Panel title="挑战者订单与成交" subtitle="仍采用T+1开盘撮合、费用、滑点和对账规则"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel>
+    <div className="two-col"><Panel title="挑战者委托" subtitle="信号日产生；等待下一交易日开盘撮合"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel><Panel title="挑战者成交" subtitle="按真实成交日展示，包含费用与滑点后的成交价"><Table rows={challenger.fills.slice(0,30)} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
+    <Panel title="下一交易日委托计划" subtitle="收盘选股，下一交易日开盘撮合；研究门禁未通过时只保留分析结果"><Table rows={[{as_of_date:challenger.latest.trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED":"BLOCKED",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:Boolean(researchGate.passed)?"生成T+1委托":"不生成委托（观察模式）"}]} columns={[["as_of_date","分析日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
     <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
   </>;
 }

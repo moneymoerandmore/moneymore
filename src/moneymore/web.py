@@ -220,16 +220,7 @@ class TaskService:
             self._thread.join(timeout=5)
 
     def trigger(self, trade_date: str, source: str = "MANUAL") -> int:
-        with sqlite3.connect(self.database) as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO task_runs(
-                    task_name, trade_date, source, status, started_at
-                ) VALUES ('daily_pipeline', ?, ?, 'QUEUED', ?)
-                """,
-                (trade_date, source, datetime.now(SHANGHAI).isoformat()),
-            )
-            run_id = int(cursor.lastrowid)
+        run_id = self._create_run("daily_pipeline", trade_date, source)
         threading.Thread(
             target=self._execute,
             args=(run_id, trade_date),
@@ -237,6 +228,28 @@ class TaskService:
             daemon=True,
         ).start()
         return run_id
+
+    def trigger_recovery(self, as_of_date: str, source: str = "MANUAL_RECOVERY") -> int:
+        run_id = self._create_run("recovery_pipeline", as_of_date, source)
+        threading.Thread(
+            target=self._execute_recovery,
+            args=(run_id, as_of_date),
+            name=f"recovery-run-{run_id}",
+            daemon=True,
+        ).start()
+        return run_id
+
+    def _create_run(self, task_name: str, trade_date: str, source: str) -> int:
+        with sqlite3.connect(self.database) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO task_runs(
+                    task_name, trade_date, source, status, started_at
+                ) VALUES (?, ?, ?, 'QUEUED', ?)
+                """,
+                (task_name, trade_date, source, datetime.now(SHANGHAI).isoformat()),
+            )
+            return int(cursor.lastrowid)
 
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         with sqlite3.connect(self.database) as connection:
@@ -567,7 +580,125 @@ class TaskService:
                     (trade_date,),
                 ).fetchone()
             if not exists:
-                self.trigger(trade_date, "SCHEDULED")
+                self.trigger_recovery(trade_date, "SCHEDULED")
+
+    def _recovery_dates(
+        self, store: ParquetStore, as_of_date: str
+    ) -> list[str]:
+        daily = store.read("daily", columns=["trade_date"])
+        if daily.empty:
+            raise RuntimeError("cannot recover without locally stored daily history")
+        latest_data_date = str(daily["trade_date"].astype(str).max())
+        calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
+        calendar["cal_date"] = calendar["cal_date"].astype(str)
+        dates = calendar.loc[
+            (calendar["cal_date"] > latest_data_date)
+            & (calendar["cal_date"] <= as_of_date)
+            & (calendar["is_open"].astype(int) == 1),
+            "cal_date",
+        ].sort_values().tolist()
+        # Data can be present while the service was offline before the
+        # downstream strategy/execution stages ran.  The recovery watermark is
+        # therefore the latest *completed workflow*, not only the latest bar.
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(trade_date) FROM task_runs
+                WHERE task_name = 'daily_pipeline' AND status = 'COMPLETED'
+                  AND trade_date <= ?
+                """,
+                (latest_data_date,),
+            ).fetchone()
+        latest_completed_date = str(row[0]) if row and row[0] else ""
+        workflow_gap = calendar.loc[
+            (calendar["cal_date"] > latest_completed_date)
+            & (calendar["cal_date"] <= latest_data_date)
+            & (calendar["is_open"].astype(int) == 1),
+            "cal_date",
+        ].tolist()
+        dates = sorted(set(dates) | set(workflow_gap))
+        # Intraday vendors do not guarantee a complete daily bar.  A manual
+        # recovery before the configured end-of-day schedule must leave the
+        # current session pending instead of creating an empty-data failure.
+        now = datetime.now(SHANGHAI)
+        config = self.config()
+        if (
+            as_of_date == now.strftime("%Y%m%d")
+            and (now.hour, now.minute) < (int(config["hour"]), int(config["minute"]))
+        ):
+            dates = [item for item in dates if item != as_of_date]
+        return dates
+
+    def _execute_recovery(self, run_id: int, as_of_date: str) -> None:
+        try:
+            self._set_running(run_id)
+            store = ParquetStore(DATA)
+            dates = self._recovery_dates(store, as_of_date)
+            if not dates:
+                self._defer_empty_daily_failures(as_of_date)
+                self._finish(
+                    run_id,
+                    "WAITING_MARKET_DATA",
+                )
+                self._notify(
+                    "INFO",
+                    "MARKET_DATA_PENDING",
+                    "等待行情发布",
+                    "当日尚无完整日线；已保留上一交易日的 T+1 待撮合委托，行情发布后将自动恢复执行。",
+                    trade_date=as_of_date,
+                    run_id=run_id,
+                    dedupe_key=f"{as_of_date}:market-data-pending",
+                )
+                return
+            completed: list[str] = []
+            for trade_date in dates:
+                child_run_id = self._create_run(
+                    "daily_pipeline", trade_date, "RECOVERY"
+                )
+                self._execute(child_run_id, trade_date)
+                child = next(row for row in self.runs(100) if row["id"] == child_run_id)
+                if child["status"] != "COMPLETED":
+                    raise RuntimeError(
+                        f"recovery stopped at {trade_date}: {child['status']} {child.get('error') or ''}"
+                    )
+                completed.append(trade_date)
+            self._finish(run_id, "COMPLETED", report_path=",".join(completed))
+        except Exception as error:  # noqa: BLE001 - recovery must remain observable
+            detail = f"{type(error).__name__}: {error}"
+            self._finish(run_id, "FAILED", error=detail)
+            self._notify(
+                "ERROR",
+                "RECOVERY_FAILED",
+                "恢复流水线失败",
+                detail,
+                trade_date=as_of_date,
+                run_id=run_id,
+            )
+
+    def _defer_empty_daily_failures(self, trade_date: str) -> None:
+        """Resolve obsolete same-day empty-bar failures into a retryable wait state."""
+        now = datetime.now(SHANGHAI).isoformat()
+        marker = f"daily[{trade_date}] is empty"
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                UPDATE task_runs
+                SET status = 'WAITING_MARKET_DATA', error = NULL, finished_at = ?
+                WHERE task_name = 'daily_pipeline' AND trade_date = ?
+                  AND status = 'FAILED' AND error LIKE ?
+                """,
+                (now, trade_date, f"%{marker}%"),
+            )
+            connection.execute(
+                """
+                UPDATE notifications
+                SET acknowledged = 1, acknowledged_at = ?
+                WHERE trade_date = ? AND acknowledged = 0
+                  AND code IN ('PIPELINE_FAILED', 'PIPELINE_STEP_FAILED')
+                  AND message LIKE ?
+                """,
+                (now, trade_date, f"%{marker}%"),
+            )
 
     def _execute(self, run_id: int, trade_date: str) -> None:
         if not self._run_lock.acquire(blocking=False):
@@ -998,18 +1129,12 @@ def sector_portfolio() -> dict[str, object]:
         how="left",
     ).sort_values(["sector", "rank", "score"], ascending=[True, True, False])
 
-    display_names = {
-        "growth": "创业板ETF易方达前十大",
-        "metals": "工业有色ETF万家前十大",
-        "dividend": "红利ETF易方达前十大",
-        "chip": "芯片ETF国泰前十大",
-    }
     universes = []
     for sector, definition in config["universes"].items():
         universes.append(
             {
                 "sector": sector,
-                "name": display_names[sector],
+                "name": definition["name"],
                 "fund_code": definition["etf_code"],
                 "style": definition["style"],
                 "factor_weights": definition["factors"],
@@ -1862,7 +1987,11 @@ def trigger_daily(payload: dict[str, str] | None = None) -> dict[str, object]:
     )
     if len(trade_date) != 8 or not trade_date.isdigit():
         raise HTTPException(status_code=400, detail="trade_date must use YYYYMMDD")
-    return {"run_id": task_service.trigger(trade_date), "status": "QUEUED"}
+    return {
+        "run_id": task_service.trigger_recovery(trade_date),
+        "status": "QUEUED_RECOVERY",
+        "mode": "RECOVER_MISSING_TRADING_DAYS_THEN_RECALCULATE",
+    }
 
 
 @app.get("/api/reports/{filename}")
