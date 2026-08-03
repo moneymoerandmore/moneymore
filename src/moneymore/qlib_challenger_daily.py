@@ -86,7 +86,7 @@ def run_qlib_challenger_daily(
     )
     gate = challenger_config["research_gate"]
     stability = research.get("stability", {})
-    gate_passed = (
+    research_gate_passed = (
         gru_metrics is not None
         and int(gru_metrics["samples"]) >= int(gate["minimum_samples"])
         and float(gru_metrics["rank_ic"]) >= float(gate["minimum_rank_ic"])
@@ -96,7 +96,10 @@ def run_qlib_challenger_daily(
         and int(stability.get("seed_count", 0)) >= int(gate["minimum_seed_count"])
         and float(stability.get("positive_seed_ratio", 0))
         >= float(gate["minimum_positive_seed_ratio"])
-        and deployment.get("execution_mode") == "PAPER_TRADING"
+    )
+    execution_policy = challenger_config.get("execution_policy", {})
+    experimental_paper_enabled = bool(
+        execution_policy.get("experimental_paper_enabled", True)
     )
     universe = challenger_universe(root, store)
     frame = build_challenger_dataset(
@@ -154,11 +157,10 @@ def run_qlib_challenger_daily(
         cutoff,
         trade_date,
     )
-    if not gate_passed:
-        # A research-gate downgrade prevents *new* Qlib signals, but it must
-        # never abandon orders already created on a prior trading day.  Those
-        # orders remain part of the paper ledger and are settled at the next
-        # available market bar under the same T+1 rule as normal operation.
+    if not experimental_paper_enabled:
+        # Explicitly disabled experiments still settle prior T+1 orders, but
+        # create no new ones.  A failed research gate is deliberately *not*
+        # such a condition: it blocks promotion, not forward paper evidence.
         executions = []
         for symbol, bar in sorted(bars.items()):
             executions.extend(
@@ -166,7 +168,7 @@ def run_qlib_challenger_daily(
             )
         portfolio = broker.account_snapshot(marks, QLIB_CHALLENGER_ACCOUNT)
         _record_account_history(store, trade_date, portfolio)
-        result = _finish(
+        return _finish(
             trade_date,
             "OBSERVATION_ONLY",
             model_id,
@@ -177,14 +179,13 @@ def run_qlib_challenger_daily(
             portfolio,
             broker,
             report_dir,
-            selection_metadata,
+            {
+                **selection_metadata,
+                "research_gate_passed": research_gate_passed,
+                "deployment_mode": deployment.get("execution_mode"),
+                "observation_reason": "EXPERIMENTAL_PAPER_DISABLED",
+            },
         )
-        evaluate_forward_observations(
-            root,
-            store,
-            int(challenger_config["label_horizon"]),
-        )
-        return result
 
     executions = []
     for symbol, bar in sorted(bars.items()):
@@ -262,7 +263,13 @@ def run_qlib_challenger_daily(
         portfolio,
         broker,
         report_dir,
-        selection_metadata,
+        {
+            **selection_metadata,
+            "research_gate_passed": research_gate_passed,
+            "deployment_mode": deployment.get("execution_mode"),
+            "promotion_eligible": research_gate_passed
+            and deployment.get("execution_mode") == "PAPER_TRADING",
+        },
     )
 
 

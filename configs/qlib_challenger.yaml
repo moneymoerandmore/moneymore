@@ -44,7 +44,10 @@ model:
 training_policy:
   frequency: monthly
   automatic_promotion: false
-  candidate_only: true
+  candidate_only: false
+execution_policy:
+  experimental_paper_enabled: true
+  research_gate_blocks_promotion_only: true
 drift_monitoring:
   reference_window: 20
   recent_window: 20

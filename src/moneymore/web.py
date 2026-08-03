@@ -229,11 +229,16 @@ class TaskService:
         ).start()
         return run_id
 
-    def trigger_recovery(self, as_of_date: str, source: str = "MANUAL_RECOVERY") -> int:
+    def trigger_recovery(
+        self,
+        as_of_date: str,
+        source: str = "MANUAL_RECOVERY",
+        force_current_session: bool = False,
+    ) -> int:
         run_id = self._create_run("recovery_pipeline", as_of_date, source)
         threading.Thread(
             target=self._execute_recovery,
-            args=(run_id, as_of_date),
+            args=(run_id, as_of_date, force_current_session),
             name=f"recovery-run-{run_id}",
             daemon=True,
         ).start()
@@ -583,7 +588,7 @@ class TaskService:
                 self.trigger_recovery(trade_date, "SCHEDULED")
 
     def _recovery_dates(
-        self, store: ParquetStore, as_of_date: str
+        self, store: ParquetStore, as_of_date: str, force_current_session: bool = False
     ) -> list[str]:
         daily = store.read("daily", columns=["trade_date"])
         if daily.empty:
@@ -625,15 +630,23 @@ class TaskService:
         if (
             as_of_date == now.strftime("%Y%m%d")
             and (now.hour, now.minute) < (int(config["hour"]), int(config["minute"]))
+            and not force_current_session
         ):
             dates = [item for item in dates if item != as_of_date]
         return dates
 
-    def _execute_recovery(self, run_id: int, as_of_date: str) -> None:
+    def _execute_recovery(
+        self, run_id: int, as_of_date: str, force_current_session: bool = False
+    ) -> None:
         try:
             self._set_running(run_id)
             store = ParquetStore(DATA)
-            dates = self._recovery_dates(store, as_of_date)
+            dates = self._recovery_dates(store, as_of_date, force_current_session)
+            if force_current_session and as_of_date in dates:
+                load_dotenv(ROOT / ".env")
+                probe = TushareProvider().daily_bars(as_of_date)
+                if probe.empty:
+                    dates = [item for item in dates if item != as_of_date]
             if not dates:
                 self._defer_empty_daily_failures(as_of_date)
                 self._finish(
@@ -1988,7 +2001,9 @@ def trigger_daily(payload: dict[str, str] | None = None) -> dict[str, object]:
     if len(trade_date) != 8 or not trade_date.isdigit():
         raise HTTPException(status_code=400, detail="trade_date must use YYYYMMDD")
     return {
-        "run_id": task_service.trigger_recovery(trade_date),
+        "run_id": task_service.trigger_recovery(
+            trade_date, force_current_session=True
+        ),
         "status": "QUEUED_RECOVERY",
         "mode": "RECOVER_MISSING_TRADING_DAYS_THEN_RECALCULATE",
     }

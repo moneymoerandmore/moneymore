@@ -202,10 +202,11 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
   const baselineEquity = Number(baselinePortfolio?.equity??1_000_000);
   return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
     <section className="kpis"><Kpi label="挑战者状态" value={text(challenger.latest.status)} note={challenger.account_id} accent={text(challenger.latest.status)!=="COMPLETED"}/><Kpi label="GPU训练" value={Boolean(challenger.research.cuda_available)?"CUDA":"未启用"} note={text(challenger.research.cuda_device)}/><Kpi label="挑战者权益" value={money(challengerEquity)} note={`累计 ${pct(challengerEquity/1_000_000-1)}`}/><Kpi label="因子基线权益" value={money(baselineEquity)} note={`累计 ${pct(baselineEquity/1_000_000-1)}`}/></section>
+    <PerformanceComparisonCharts comparison={challenger.comparison}/>
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
     <div className="two-col"><Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
     <div className="two-col"><Panel title="挑战者委托" subtitle="信号日产生；等待下一交易日开盘撮合"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel><Panel title="挑战者成交" subtitle="按真实成交日展示，包含费用与滑点后的成交价"><Table rows={challenger.fills.slice(0,30)} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
-    <Panel title="下一交易日委托计划" subtitle="收盘选股，下一交易日开盘撮合；研究门禁未通过时只保留分析结果"><Table rows={[{as_of_date:challenger.latest.trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED":"BLOCKED",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:Boolean(researchGate.passed)?"生成T+1委托":"不生成委托（观察模式）"}]} columns={[["as_of_date","分析日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
+    <Panel title="下一交易日委托计划" subtitle="收盘选股、下一交易日开盘撮合；研究门禁只限制晋级，不中断独立实验模拟盘"><Table rows={[{as_of_date:challenger.latest.trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED（可申请晋级）":"BLOCKED（不可晋级）",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:"实验模拟盘持续生成 T+1 委托"}]} columns={[["as_of_date","分析日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
     <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
   </>;
 }
@@ -216,6 +217,40 @@ function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
   const commonEnd = text(challenger.comparison.common_end_date);
   const replayRows = (challenger.historical_execution.strategies??[]).map((row)=>({strategy_id:row.strategy_id,...(row.summary??{})}));
   return <><section className="kpis"><Kpi label="公平 PK 状态" value={text(challenger.comparison.status)} note={Boolean(challenger.comparison.ready)?"已达到最低观察期":"暂不判定胜负"} accent={!Boolean(challenger.comparison.ready)}/><Kpi label="共同观察日" value={String(commonDays)} note="仅使用两个账户均有快照的交易日"/><Kpi label="共同区间" value={commonStart==="—"?"等待重叠数据":`${commonStart} → ${commonEnd}`} note="共同首日净值统一归一为 1"/><Kpi label="风险比较口径" value="10% 年化波动" note="仓位不同不能只比较原始收益"/></section><Panel title="M5.3 完整历史执行重放" subtitle={`${text(challenger.historical_execution.start_date)} → ${text(challenger.historical_execution.end_date)} · ${text(challenger.historical_execution.evidence_status)} · 与模拟盘共用 PaperBroker`}><Table rows={replayRows} columns={[["strategy_id","策略"],["observation_days","交易日"],["total_return","累计收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"],["order_count","订单"],["fill_count","成交"],["transaction_cost","交易成本"],["reconciled","对账"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct,transaction_cost:money}}/></Panel><div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title="双策略公平 PK 基线" subtitle="共同日期、净值归一、账户净收益；至少20个共同交易日后才形成结论"><Table rows={challenger.comparison.metrics??[]} columns={[["account_id","账户"],["observation_days","共同日"],["total_return","共同区间收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["risk_normalized_return","风险归一收益"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,risk_normalized_return:pct,sharpe:num,max_drawdown:pct}}/></Panel></div></>;
+}
+
+const chartPalette: Record<string, { label: string; color: string }> = {
+  "multi_sector_shadow": { label: "因子基线", color: "#102c24" },
+  "qlib_gru_shadow": { label: "Qlib GRU 挑战者", color: "#ef7655" },
+};
+
+function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["comparison"] }) {
+  const histories = comparison.histories??{};
+  const series = Object.entries(histories).map(([accountId, rows]) => ({
+    accountId,
+    label: chartPalette[accountId]?.label??accountId,
+    color: chartPalette[accountId]?.color??"#7e91e8",
+    rows: rows as Row[],
+  })).filter((series)=>series.rows.length > 0);
+  return <div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="共同首日统一为 100；用于观察累计相对表现" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`}/><LineComparisonChart title="每日收益率波动" subtitle="按账户净权益逐日计算；虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine/></div>;
+}
+
+function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean }) {
+  const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
+  const points = series.flatMap((item)=>item.rows.map((row, index)=>({ index, value: Number(row[valueKey]) })).filter((point)=>Number.isFinite(point.value)));
+  if (!points.length) return <Panel title={title} subtitle={subtitle}><p className="empty">等待两个账户产生共同日度权益快照</p></Panel>;
+  const count = Math.max(...series.map((item)=>item.rows.length), 1);
+  const rawMin = Math.min(...points.map((point)=>point.value), zeroLine ? 0 : Infinity);
+  const rawMax = Math.max(...points.map((point)=>point.value), zeroLine ? 0 : -Infinity);
+  const padding = Math.max((rawMax - rawMin) * 0.12, zeroLine ? 0.001 : 0.005);
+  const min = rawMin - padding, max = rawMax + padding, span = Math.max(max - min, 0.000001);
+  const x = (index: number) => left + (count <= 1 ? 0 : index / (count - 1)) * (width - left - right);
+  const y = (value: number) => top + (max - value) / span * (height - top - bottom);
+  const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(index).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
+  const labels = series[0]?.rows??[];
+  const last = series.map((item)=>({ ...item, value: Number(item.rows.at(-1)?.[valueKey]??0) }));
+  const ticks = [0, 0.5, 1];
+  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=><span key={item.accountId}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></span>)}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{series.map((item)=><path key={item.accountId} d={path(item.rows)} fill="none" stroke={item.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>)}<text x={left} y={height-8}>{text(labels[0]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(labels.at(-1)?.trade_date)}</text></svg></Panel>;
 }
 
 function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {
