@@ -48,6 +48,7 @@ training_policy:
 execution_policy:
   experimental_paper_enabled: true
   research_gate_blocks_promotion_only: true
+  minimum_rebalance_notional: 5000
 drift_monitoring:
   reference_window: 20
   recent_window: 20

@@ -55,6 +55,27 @@ def test_weight_above_limit_is_rejected():
     assert result.rejection_code == "TARGET_WEIGHT_EXCEEDS_LIMIT"
 
 
+def test_small_tracking_adjustment_is_skipped_but_exit_is_not():
+    decision = trend_decision(_bars(), "20251231")
+    decision = decision.__class__(**{**decision.to_dict(), "target_weight": 0.05})
+    small = create_order_intent(
+        decision,
+        PortfolioSnapshot(cash=100_000, equity=100_000, position_quantity=4900, reference_price=1),
+        minimum_rebalance_notional=500,
+    )
+    assert small.rejection_code == "BELOW_MINIMUM_REBALANCE_NOTIONAL"
+
+    exit_decision = decision.__class__(**{**decision.to_dict(), "target_weight": 0.0})
+    exit_order = create_order_intent(
+        exit_decision,
+        PortfolioSnapshot(cash=100_000, equity=100_000, position_quantity=100, reference_price=1),
+        minimum_rebalance_notional=500,
+    )
+    assert exit_order.accepted
+    assert exit_order.intent is not None
+    assert exit_order.intent.side is Side.SELL
+
+
 def test_paper_broker_is_idempotent(tmp_path: Path):
     decision = trend_decision(_bars(), "20251231")
     result = create_order_intent(

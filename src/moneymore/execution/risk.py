@@ -37,6 +37,7 @@ def create_order_intent(
     portfolio: PortfolioSnapshot,
     lot_size: int = 100,
     max_symbol_weight: float = 0.10,
+    minimum_rebalance_notional: float = 0.0,
 ) -> RiskResult:
     if portfolio.equity <= 0 or portfolio.reference_price <= 0:
         return RiskResult(False, None, "INVALID_PORTFOLIO_SNAPSHOT")
@@ -52,6 +53,14 @@ def create_order_intent(
     if side is Side.SELL:
         quantity = min(quantity, portfolio.position_quantity)
     estimated_cost = quantity * portfolio.reference_price
+    # Ignore small tracking adjustments, but never suppress a full exit.  The
+    # latter remains necessary for risk control even when the position value
+    # is below the normal execution threshold.
+    if (
+        decision.target_weight > 0
+        and estimated_cost < minimum_rebalance_notional
+    ):
+        return RiskResult(False, None, "BELOW_MINIMUM_REBALANCE_NOTIONAL")
     if side is Side.BUY and estimated_cost > portfolio.cash:
         return RiskResult(False, None, "INSUFFICIENT_CASH")
     key = (

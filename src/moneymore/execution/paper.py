@@ -423,6 +423,41 @@ class PaperBroker:
                 )
         return len(keys)
 
+    def cancel_pending_symbol(
+        self,
+        account_id: str,
+        symbol: str,
+        signal_date: str,
+        reason_code: str,
+    ) -> int:
+        """Cancel stale same-day intents after an execution-rule update."""
+        with sqlite3.connect(self.database) as connection:
+            keys = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT idempotency_key FROM orders
+                    WHERE account_id = ? AND symbol = ? AND signal_date = ?
+                      AND status = 'PENDING'
+                    """,
+                    (account_id, symbol, signal_date),
+                )
+            ]
+            for key in keys:
+                connection.execute(
+                    "UPDATE orders SET status = 'CANCELLED' WHERE idempotency_key = ?",
+                    (key,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO execution_attempts(
+                        idempotency_key, trade_date, outcome, reason_code
+                    ) VALUES (?, ?, 'CANCELLED', ?)
+                    """,
+                    (key, signal_date, reason_code),
+                )
+        return len(keys)
+
     def restore_cancelled(
         self,
         account_id: str,

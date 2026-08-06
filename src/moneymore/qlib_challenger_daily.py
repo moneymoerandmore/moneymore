@@ -227,7 +227,17 @@ def run_qlib_challenger_daily(
             ),
             lot_size=config.lot_size,
             max_symbol_weight=config.max_position_weight,
+            minimum_rebalance_notional=float(
+                execution_policy.get("minimum_rebalance_notional", 0)
+            ),
         )
+        if risk.rejection_code == "BELOW_MINIMUM_REBALANCE_NOTIONAL":
+            broker.cancel_pending_symbol(
+                QLIB_CHALLENGER_ACCOUNT,
+                symbol,
+                trade_date,
+                "BELOW_MINIMUM_REBALANCE_NOTIONAL",
+            )
         write_signal_artifact(decision, signal_dir)
         decision_status = broker.record_decision(decision)
         submit_status = (
