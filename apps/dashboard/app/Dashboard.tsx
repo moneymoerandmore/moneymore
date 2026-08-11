@@ -52,6 +52,7 @@ type MonthlyAcceptance = {
 };
 type Challenger = {
   account_id: string; research: Row & { metrics?: Row[] };
+  next_trade_date?: string | null;
   forward: Row & { daily?: Row[] };
   comparison: Row & { metrics?: Row[]; histories?: Record<string, Row[]> };
   latest: Row & { selected?: string[]; scores?: Row[]; portfolio?: Bank["shadow"]["portfolio"] };
@@ -206,7 +207,7 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
     <div className="two-col"><Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
     <div className="two-col"><Panel title="挑战者委托" subtitle="信号日产生；等待下一交易日开盘撮合"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel><Panel title="挑战者成交" subtitle="按真实成交日展示，包含费用与滑点后的成交价"><Table rows={challenger.fills.slice(0,30)} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
-    <Panel title="下一交易日委托计划" subtitle="收盘选股、下一交易日开盘撮合；研究门禁只限制晋级，不中断独立实验模拟盘"><Table rows={[{as_of_date:challenger.latest.trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED（可申请晋级）":"BLOCKED（不可晋级）",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:"实验模拟盘持续生成 T+1 委托"}]} columns={[["as_of_date","分析日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
+    <Panel title="下一交易日委托计划" subtitle="信号在收盘后生成，计划在下一交易日开盘撮合；两个日期必须分开理解"><Table rows={[{signal_date:challenger.latest.trade_date,planned_trade_date:challenger.next_trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED（可申请晋级）":"BLOCKED（不可晋级）",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:"实验模拟盘持续生成 T+1 委托"}]} columns={[["signal_date","信号生成日"],["planned_trade_date","计划成交日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
     <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
   </>;
 }

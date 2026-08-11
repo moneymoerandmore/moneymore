@@ -1,9 +1,11 @@
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from moneymore.data.store import ParquetStore
-from moneymore.web import TaskService
+from moneymore.web import TaskService, _next_open_trade_date
 
 
 def test_task_configuration_is_persistent(tmp_path: Path):
@@ -124,3 +126,39 @@ def test_recovery_dates_fill_every_missing_open_session(tmp_path: Path):
     service._finish(completed, "COMPLETED")
 
     assert service._recovery_dates(store, "20260730") == ["20260729", "20260730"]
+
+
+def test_scheduler_accepts_completed_recovery_and_throttles_waiting(tmp_path: Path):
+    service = TaskService(tmp_path / "service.sqlite3")
+    timezone = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(timezone)
+
+    waiting = service._create_run("recovery_pipeline", "20260810", "SCHEDULED")
+    service._finish(waiting, "WAITING_MARKET_DATA")
+    assert not service._scheduler_should_trigger("20260810", now)
+    assert service._scheduler_should_trigger(
+        "20260810", now + timedelta(minutes=11)
+    )
+
+    completed = service._create_run("daily_pipeline", "20260810", "RECOVERY")
+    service._finish(completed, "COMPLETED")
+    assert not service._scheduler_should_trigger(
+        "20260810", now + timedelta(hours=1)
+    )
+
+
+def test_next_open_trade_date_uses_official_calendar(tmp_path: Path):
+    store = ParquetStore(tmp_path / "data")
+    store.merge_curated(
+        "trade_calendar",
+        [
+            pd.DataFrame(
+                {
+                    "cal_date": ["20260810", "20260811", "20260812"],
+                    "is_open": [1, 1, 0],
+                }
+            )
+        ],
+        ["cal_date"],
+    )
+    assert _next_open_trade_date(store, "20260810") == "20260811"

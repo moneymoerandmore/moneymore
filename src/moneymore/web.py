@@ -88,6 +88,19 @@ def _composite_universe_symbols(store: ParquetStore) -> list[str]:
     return sorted(symbols)
 
 
+def _next_open_trade_date(store: ParquetStore, trade_date: str) -> str | None:
+    if not trade_date:
+        return None
+    calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
+    calendar["cal_date"] = calendar["cal_date"].astype(str)
+    future = calendar.loc[
+        (calendar["cal_date"] > trade_date)
+        & (calendar["is_open"].astype(int) == 1),
+        "cal_date",
+    ].sort_values()
+    return str(future.iloc[0]) if not future.empty else None
+
+
 class TaskService:
     def __init__(self, database: Path = SERVICE_DATABASE) -> None:
         self.database = database
@@ -575,17 +588,43 @@ class TaskService:
             if (now.hour, now.minute) < (int(config["hour"]), int(config["minute"])):
                 continue
             trade_date = now.strftime("%Y%m%d")
-            with sqlite3.connect(self.database) as connection:
-                exists = connection.execute(
-                    """
-                    SELECT 1 FROM task_runs
-                    WHERE task_name = 'daily_pipeline' AND trade_date = ?
-                      AND source = 'SCHEDULED'
-                    """,
-                    (trade_date,),
-                ).fetchone()
-            if not exists:
+            if self._scheduler_should_trigger(trade_date, now):
                 self.trigger_recovery(trade_date, "SCHEDULED")
+
+    def _scheduler_should_trigger(
+        self,
+        trade_date: str,
+        now: datetime,
+        retry_interval: timedelta = timedelta(minutes=10),
+    ) -> bool:
+        """Avoid duplicate recovery storms while retaining delayed-data retries."""
+        with sqlite3.connect(self.database) as connection:
+            completed = connection.execute(
+                """
+                SELECT 1 FROM task_runs
+                WHERE task_name = 'daily_pipeline' AND trade_date = ?
+                  AND status = 'COMPLETED'
+                LIMIT 1
+                """,
+                (trade_date,),
+            ).fetchone()
+            if completed:
+                return False
+            latest = connection.execute(
+                """
+                SELECT status, started_at FROM task_runs
+                WHERE task_name = 'recovery_pipeline' AND trade_date = ?
+                  AND source = 'SCHEDULED'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (trade_date,),
+            ).fetchone()
+        if latest is None:
+            return True
+        status, started_at = str(latest[0]), datetime.fromisoformat(str(latest[1]))
+        if status in {"QUEUED", "RUNNING", "COMPLETED"}:
+            return False
+        return now - started_at >= retry_interval
 
     def _recovery_dates(
         self, store: ParquetStore, as_of_date: str, force_current_session: bool = False
@@ -1352,6 +1391,7 @@ def model_registry() -> dict[str, list[dict[str, Any]]]:
 @app.get("/api/qlib-challenger")
 def qlib_challenger() -> dict[str, object]:
     broker = PaperBroker(PAPER_DATABASE)
+    store = ParquetStore(DATA)
     broker.initialize_account(1_000_000, QLIB_CHALLENGER_ACCOUNT)
     research_path = STATE / "qlib-challenger" / "latest-research.json"
     forward_path = STATE / "qlib-challenger" / "forward-evaluation.json"
@@ -1480,7 +1520,7 @@ def qlib_challenger() -> dict[str, object]:
         (QLIB_CHALLENGER_ACCOUNT, "qlib_challenger_account_daily"),
     ):
         try:
-            history = ParquetStore(DATA).read(table).sort_values("trade_date")
+            history = store.read(table).sort_values("trade_date")
         except FileNotFoundError:
             history = pd.DataFrame()
         comparison_sources[account_id] = history
@@ -1494,6 +1534,9 @@ def qlib_challenger() -> dict[str, object]:
         "research": research,
         "forward": forward_evaluation,
         "latest": latest,
+        "next_trade_date": _next_open_trade_date(
+            store, str(latest.get("trade_date", ""))
+        ),
         "orders": orders,
         "fills": broker.fills(QLIB_CHALLENGER_ACCOUNT),
         "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
