@@ -32,6 +32,8 @@ class MultiSectorDailyResult:
     trade_date: str
     status: str
     target_weights: dict[str, float]
+    theoretical_target_weights: dict[str, float]
+    target_adjustments: list[dict[str, object]]
     symbol_sectors: dict[str, str]
     executions: list[dict[str, object]]
     orders: list[dict[str, object]]
@@ -55,7 +57,7 @@ class MultiSectorDailyResult:
 def expand_sleeve_targets(recommendation: object) -> tuple[
     dict[str, float], dict[str, str]
 ]:
-    target_weights: dict[str, float] = {}
+    raw_weights: dict[str, float] = {}
     symbol_sectors: dict[str, str] = {}
     primary_contribution: dict[str, float] = {}
     for row in recommendation.to_dict("records"):  # type: ignore[attr-defined]
@@ -64,11 +66,117 @@ def expand_sleeve_targets(recommendation: object) -> tuple[
             continue
         weight = float(row["target_weight"]) / len(symbols)
         for symbol in symbols:
-            target_weights[symbol] = min(target_weights.get(symbol, 0.0) + weight, 0.10)
+            raw_weights[symbol] = raw_weights.get(symbol, 0.0) + weight
             if weight > primary_contribution.get(symbol, -1):
                 primary_contribution[symbol] = weight
                 symbol_sectors[symbol] = str(row["sector"])
+    gross_budget = sum(raw_weights.values())
+    target_weights = _capped_pro_rata_allocations(gross_budget, raw_weights, 0.10)
     return target_weights, symbol_sectors
+
+
+def executable_target_weights(
+    theoretical: dict[str, float],
+    sectors: dict[str, str],
+    marks: dict[str, float],
+    equity: float,
+    lot_size: int,
+    max_symbol_weight: float,
+) -> tuple[dict[str, float], list[dict[str, object]]]:
+    """Convert model weights into an A-share whole-lot executable portfolio.
+
+    Infeasible names do not consume a sleeve's displayed target exposure. Their
+    budget is redistributed pro-rata within the same sleeve, subject to the
+    single-name cap. If no feasible name remains, the sleeve budget stays cash.
+    """
+    if equity <= 0:
+        return {}, []
+    adjustments: list[dict[str, object]] = []
+    budget = sum(float(weight) for weight in theoretical.values() if weight > 0)
+    candidates = {
+        symbol
+        for symbol, weight in theoretical.items()
+        if weight > 0
+        and float(marks.get(symbol, 0)) > 0
+        and float(marks[symbol]) * lot_size / equity <= max_symbol_weight + 1e-12
+    }
+    allocations: dict[str, float] = {}
+    while candidates:
+        allocations = _capped_pro_rata_allocations(
+            budget,
+            {symbol: float(theoretical[symbol]) for symbol in candidates},
+            max_symbol_weight,
+        )
+        infeasible = {
+            symbol
+            for symbol, weight in allocations.items()
+            if weight + 1e-12 < float(marks[symbol]) * lot_size / equity
+        }
+        if not infeasible:
+            break
+        candidates -= infeasible
+    else:
+        allocations = {}
+
+    for symbol, theoretical_weight_raw in theoretical.items():
+        theoretical_weight = float(theoretical_weight_raw)
+        executable_weight = float(allocations.get(symbol, 0.0))
+        if abs(executable_weight - theoretical_weight) <= 1e-12:
+            continue
+        lot_weight = (
+            float(marks.get(symbol, 0)) * lot_size / equity
+            if marks.get(symbol)
+            else None
+        )
+        adjustments.append(
+            {
+                "symbol": symbol,
+                "sector": sectors.get(symbol, "unmapped"),
+                "theoretical_weight": theoretical_weight,
+                "executable_weight": executable_weight,
+                "minimum_lot_weight": lot_weight,
+                "reason": (
+                    "INFEASIBLE_ONE_LOT"
+                    if executable_weight == 0
+                    else "PORTFOLIO_BUDGET_REALLOCATED"
+                ),
+            }
+        )
+    return allocations, adjustments
+
+
+def _capped_pro_rata_allocations(
+    budget: float,
+    source_weights: dict[str, float],
+    cap: float,
+) -> dict[str, float]:
+    allocations = {symbol: 0.0 for symbol in source_weights}
+    active = set(source_weights)
+    remaining = budget
+    while active and remaining > 1e-12:
+        denominator = sum(source_weights[symbol] for symbol in active)
+        if denominator <= 0:
+            break
+        proposed = {
+            symbol: remaining * source_weights[symbol] / denominator
+            for symbol in active
+        }
+        capped = {
+            symbol
+            for symbol, increment in proposed.items()
+            if allocations[symbol] + increment >= cap - 1e-12
+        }
+        if not capped:
+            for symbol, increment in proposed.items():
+                allocations[symbol] += increment
+            remaining = 0.0
+            break
+        for symbol in capped:
+            addition = max(0.0, cap - allocations[symbol])
+            allocations[symbol] += addition
+            remaining -= addition
+            active.remove(symbol)
+    return {symbol: weight for symbol, weight in allocations.items() if weight > 1e-12}
 
 
 def run_multi_sector_daily(
@@ -80,8 +188,19 @@ def run_multi_sector_daily(
     report_dir: str | Path,
 ) -> MultiSectorDailyResult:
     broker.initialize_account(config.initial_cash, MULTI_SECTOR_ACCOUNT)
-    recommendation = store.read("sector_portfolio_recommendation")
-    target_weights, symbol_sectors = expand_sleeve_targets(recommendation)
+    recommendation = store.read("global_factor_recommendation")
+    selected_recommendation = recommendation.loc[
+        recommendation["selected"].astype(bool)
+    ].copy()
+    theoretical_target_weights = {
+        str(row["symbol"]): float(row["target_weight"])
+        for row in selected_recommendation.to_dict("records")
+    }
+    symbol_sectors = {
+        str(row["symbol"]): str(row.get("sector", "unmapped"))
+        for row in recommendation.to_dict("records")
+    }
+    target_weights = theoretical_target_weights
     data_health_report = run_data_health_checks(
         store, trade_date, set(target_weights)
     )
@@ -159,7 +278,7 @@ def run_multi_sector_daily(
         version.version_id,
         "PORTFOLIO_RECOMMENDATION",
         "FORWARD_CANDIDATE",
-        f"sector_portfolio_recommendation:{trade_date}",
+        f"global_factor_recommendation:{trade_date}",
     )
     data_fresh = not stale_symbols
     pre_portfolio = broker.account_snapshot(marks, MULTI_SECTOR_ACCOUNT)
@@ -215,6 +334,14 @@ def run_multi_sector_daily(
         store, broker, MULTI_SECTOR_ACCOUNT, trade_date, set(symbols)
     )
     account = broker.account_snapshot(marks, MULTI_SECTOR_ACCOUNT)
+    target_weights, target_adjustments = executable_target_weights(
+        theoretical_target_weights,
+        symbol_sectors,
+        marks,
+        float(account["equity"]),
+        config.lot_size,
+        config.max_position_weight,
+    )
     positions = {
         str(row["symbol"]): row for row in account["positions"]  # type: ignore[index]
     }
@@ -345,6 +472,9 @@ def run_multi_sector_daily(
     metrics = _daily_metrics(
         store, trade_date, portfolio, target_weights, reconciliation
     )
+    metrics["theoretical_target_exposure"] = sum(
+        theoretical_target_weights.values()
+    )
     risk_alerts = _risk_alerts(
         config,
         metrics,
@@ -371,6 +501,8 @@ def run_multi_sector_daily(
         "trade_date": trade_date,
         "status": status,
         "target_weights": target_weights,
+        "theoretical_target_weights": theoretical_target_weights,
+        "target_adjustments": target_adjustments,
         "symbol_sectors": symbol_sectors,
         "executions": executions,
         "orders": orders,

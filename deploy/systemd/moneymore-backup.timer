@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up MoneyMore state every night
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

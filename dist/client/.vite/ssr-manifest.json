@@ -1,0 +1,24 @@
+{
+  "\u0000rolldown/runtime.js": [
+    "assets/rolldown-runtime-S-ySWqyJ.js"
+  ],
+  "\u0000virtual:vinext-client-entry": [],
+  "\u0000vite/preload-helper.js": [],
+  "apps/dashboard/node_modules/.pnpm/react@19.2.6/node_modules/react/cjs/react.production.js": [
+    "assets/framework-DynTZPNH.js"
+  ],
+  "apps/dashboard/node_modules/.pnpm/react@19.2.6/node_modules/react/index.js": [
+    "assets/framework-DynTZPNH.js"
+  ],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/client/empty-module.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/client/instrumentation-client-state.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/client/instrumentation-client.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/client/validate-module-path.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/client/window-next.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/shims/internal/router-context.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/shims/router.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/shims/url-utils.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/utils/base-path.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/utils/domain-locale.js": [],
+  "apps/dashboard/node_modules/.pnpm/vinext@0.0.50_@vitejs+plugi_6558342ba0b940cbd621b36b626ca262/node_modules/vinext/dist/utils/query.js": []
+}

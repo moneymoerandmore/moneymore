@@ -1,0 +1,27 @@
+{
+  "_framework-DynTZPNH.js": {
+    "file": "assets/framework-DynTZPNH.js",
+    "name": "framework",
+    "imports": [
+      "_rolldown-runtime-S-ySWqyJ.js"
+    ]
+  },
+  "_rolldown-runtime-S-ySWqyJ.js": {
+    "file": "assets/rolldown-runtime-S-ySWqyJ.js",
+    "name": "rolldown-runtime"
+  },
+  "virtual:vinext-client-entry": {
+    "file": "assets/index-CL4jwSpF.js",
+    "name": "index",
+    "src": "virtual:vinext-client-entry",
+    "isEntry": true,
+    "imports": [
+      "_rolldown-runtime-S-ySWqyJ.js",
+      "_framework-DynTZPNH.js"
+    ],
+    "dynamicImports": [
+      "_framework-DynTZPNH.js",
+      "virtual:vinext-client-entry"
+    ]
+  }
+}

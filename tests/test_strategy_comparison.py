@@ -29,6 +29,16 @@ def test_fair_comparison_uses_common_dates_and_normalizes_nav() -> None:
     assert by_account["qlib"]["total_return"] == pytest.approx(0.05)
     assert by_account["qlib"]["average_gross_exposure"] == pytest.approx(0.4)
     assert result["histories"]["factor"][0]["normalized_nav"] == 1.0
+    assert [row["trade_date"] for row in result["independent_histories"]["factor"]] == [
+        "20260728",
+        "20260729",
+        "20260730",
+    ]
+    assert [row["trade_date"] for row in result["independent_histories"]["qlib"]] == [
+        "20260729",
+        "20260730",
+    ]
+    assert result["independent_histories"]["qlib"][0]["normalized_nav"] == 1.0
 
 
 def test_fair_comparison_waits_without_common_evidence() -> None:

@@ -78,6 +78,61 @@ def build_sector_factor_panel(
     return processed
 
 
+def build_global_factor_panel(
+    store: ParquetStore,
+    symbols: list[str],
+    factor_weights: dict[str, float],
+    *,
+    latest_only: bool = False,
+) -> pd.DataFrame:
+    """Score the entire candidate pool in one cross-section without sector buckets."""
+    registry = build_default_registry()
+    names = list(factor_weights)
+    rows = []
+    for symbol in sorted(set(symbols)):
+        features = load_point_in_time_features(store, symbol)
+        computed = registry.compute(features, names)
+        if not computed.empty:
+            computed["date"] = pd.to_datetime(computed["date"])
+            computed["month"] = computed["date"].dt.to_period("M")
+            computed = (
+                computed.sort_values("date")
+                .groupby("month", as_index=False)
+                .tail(1)
+                .drop(columns="month")
+            )
+            rows.append(computed.tail(1) if latest_only else computed)
+    if not rows:
+        return pd.DataFrame(columns=["date", "symbol", "score", "active_weight"])
+    factors = pd.concat(rows, ignore_index=True)
+    for name in names:
+        if registry.get(name).direction.value == "low_is_better":
+            factors[name] = -factors[name]
+    processed = preprocess_cross_section(
+        factors,
+        names,
+        PreprocessConfig(industry_column=None, minimum_assets=5),
+    )
+    processed["score"] = 0.0
+    processed["active_weight"] = 0.0
+    for name, weight in factor_weights.items():
+        available = processed[name].notna()
+        processed.loc[available, "score"] += processed.loc[available, name] * weight
+        processed.loc[available, "active_weight"] += weight
+    processed["score"] /= processed["active_weight"].replace(0, pd.NA)
+    return processed
+
+
+def build_global_factor_snapshot(
+    store: ParquetStore,
+    symbols: list[str],
+    factor_weights: dict[str, float],
+) -> pd.DataFrame:
+    return build_global_factor_panel(
+        store, symbols, factor_weights, latest_only=True
+    )
+
+
 def research_sector(
     store: ParquetStore,
     definition: SectorDefinition,

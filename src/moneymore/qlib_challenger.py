@@ -12,6 +12,7 @@ import yaml
 
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
+from .portfolio_constructor import global_topk_portfolio, trailing_return_correlation
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,15 @@ def evaluate_predictions(
     round_trip_cost_rate: float = 0.00106,
     rebalance_interval: int = 1,
     exit_rank_per_sector: int | None = None,
+    max_replacements: int | None = None,
+    minimum_weight: float = 0.05,
+    maximum_weight: float = 0.15,
+    price_panel: pd.DataFrame | None = None,
+    correlation_lookback: int = 120,
+    correlation_penalty: float = 0.0,
+    cluster_correlation_threshold: float | None = None,
+    maximum_cluster_members: int | None = None,
+    correlations: dict[pd.Timestamp, pd.DataFrame] | None = None,
 ) -> ChallengerMetrics:
     aligned = pd.concat(
         [predictions.rename("score"), labels.rename("label")], axis=1
@@ -140,36 +150,43 @@ def evaluate_predictions(
     selections: list[set[str]] = []
     top_returns: list[float] = []
     held: set[str] = set()
-    for day_number, (_, day) in enumerate(aligned.groupby(level="datetime")):
+    held_weights: dict[str, float] = {}
+    for day_number, (date, day) in enumerate(aligned.groupby(level="datetime")):
         instruments = day.index.get_level_values("instrument").astype(str)
         working = day.assign(instrument=instruments)
         if day_number % rebalance_interval != 0 and held:
             selected = working.loc[working["instrument"].isin(held)]
-        elif symbol_sectors:
-            working["sector"] = working["instrument"].map(symbol_sectors)
-            sector_count = max(int(working["sector"].nunique()), 1)
-            per_sector = max(top_k // sector_count, 1)
-            selected_parts = []
-            for _, sector_frame in working.groupby("sector"):
-                ranking = sector_frame.sort_values("score", ascending=False).copy()
-                ranking["rank"] = range(1, len(ranking) + 1)
-                retained = ranking.loc[
-                    ranking["instrument"].isin(held)
-                    & (
-                        ranking["rank"]
-                        <= int(exit_rank_per_sector or per_sector)
-                    )
-                ].head(per_sector)
-                additions = ranking.loc[
-                    ~ranking["instrument"].isin(set(retained["instrument"]))
-                ].head(per_sector - len(retained))
-                selected_parts.append(pd.concat([retained, additions]))
-            selected = pd.concat(selected_parts)
         else:
-            selected = working.nlargest(top_k, "score")
+            chosen, held_weights, ranked = global_topk_portfolio(
+                working,
+                held,
+                symbol_column="instrument",
+                top_k=top_k,
+                exit_rank=int(exit_rank_per_sector or top_k),
+                max_replacements=int(max_replacements or top_k),
+                minimum_weight=min(minimum_weight, 1.0 / top_k),
+                maximum_weight=max(maximum_weight, 1.0 / top_k),
+                correlation=(
+                    correlations.get(pd.Timestamp(date))
+                    if correlations is not None
+                    else trailing_return_correlation(price_panel, date, correlation_lookback)
+                    if price_panel is not None else None
+                ),
+                correlation_penalty=correlation_penalty,
+                cluster_correlation_threshold=cluster_correlation_threshold,
+                maximum_cluster_members=maximum_cluster_members,
+            )
+            selected = ranked.loc[ranked["instrument"].astype(str).isin(chosen)]
         held = set(selected["instrument"])
         selections.append(held)
-        top_returns.append(float(selected["label"].mean()))
+        top_returns.append(
+            float(
+                sum(
+                    float(row["label"]) * held_weights[str(row["instrument"])]
+                    for row in selected.to_dict("records")
+                )
+            )
+        )
     turnovers = [
         len(current.symmetric_difference(previous))
         / max(len(current) + len(previous), 1)

@@ -8,6 +8,7 @@ from moneymore.multi_sector_daily import (
     _return_attribution,
     _risk_alerts,
     _weight_deviations,
+    executable_target_weights,
     expand_sleeve_targets,
 )
 
@@ -41,8 +42,52 @@ def test_expand_sleeve_targets_aggregates_overlap_and_caps_single_stock() -> Non
         ]
     )
     targets, sectors = expand_sleeve_targets(recommendation)
-    assert targets == {"A": 0.10, "B": 0.09, "C": 0.06}
+    assert targets == pytest.approx({"A": 0.10, "B": 0.10, "C": 0.10})
+    assert sum(targets.values()) == pytest.approx(0.30)
     assert sectors["A"] == "chip"
+
+
+def test_executable_targets_remove_moutai_and_reallocate_consumer_budget() -> None:
+    targets, adjustments = executable_target_weights(
+        {
+            "600519.SH": 0.0466,
+            "600887.SH": 0.0466,
+            "603288.SH": 0.0466,
+        },
+        {
+            "600519.SH": "consumer",
+            "600887.SH": "consumer",
+            "603288.SH": "consumer",
+        },
+        {
+            "600519.SH": 1346.50,
+            "600887.SH": 26.10,
+            "603288.SH": 36.17,
+        },
+        equity=1_000_000,
+        lot_size=100,
+        max_symbol_weight=0.10,
+    )
+
+    assert "600519.SH" not in targets
+    assert targets["600887.SH"] == pytest.approx(0.0699)
+    assert targets["603288.SH"] == pytest.approx(0.0699)
+    moutai = next(row for row in adjustments if row["symbol"] == "600519.SH")
+    assert moutai["reason"] == "INFEASIBLE_ONE_LOT"
+    assert moutai["executable_weight"] == 0.0
+
+
+def test_executable_targets_leave_cash_when_whole_sleeve_is_untradeable() -> None:
+    targets, adjustments = executable_target_weights(
+        {"A": 0.01, "B": 0.01},
+        {"A": "growth", "B": "growth"},
+        {"A": 2000.0, "B": 3000.0},
+        equity=1_000_000,
+        lot_size=100,
+        max_symbol_weight=0.10,
+    )
+    assert targets == {}
+    assert {row["reason"] for row in adjustments} == {"INFEASIBLE_ONE_LOT"}
 
 
 def test_weight_deviation_explains_below_one_lot() -> None:

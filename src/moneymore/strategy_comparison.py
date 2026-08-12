@@ -27,8 +27,18 @@ def build_fair_comparison(
         )
 
     aligned_histories: dict[str, list[dict[str, Any]]] = {}
+    independent_histories: dict[str, list[dict[str, Any]]] = {}
     metrics: list[dict[str, Any]] = []
     for account_id, history in prepared.items():
+        independent = history.sort_values("trade_date").reset_index(drop=True).copy()
+        if not independent.empty:
+            independent["normalized_nav"] = (
+                independent["equity"] / independent["equity"].iloc[0]
+            )
+            independent["daily_return"] = (
+                independent["normalized_nav"].pct_change().fillna(0.0)
+            )
+        independent_histories[account_id] = _records(independent)
         aligned = history[history["trade_date"].isin(common_dates)].copy()
         aligned = aligned.sort_values("trade_date").reset_index(drop=True)
         if not aligned.empty:
@@ -54,6 +64,7 @@ def build_fair_comparison(
         "status": "READY" if common_days >= minimum_observation_days else "COLLECTING_EVIDENCE",
         "metrics": metrics,
         "histories": aligned_histories,
+        "independent_histories": independent_histories,
     }
 
 

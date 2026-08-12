@@ -36,6 +36,11 @@ from .multi_sector_daily import (
     run_multi_sector_daily,
 )
 from .point_in_time import materialize_point_in_time_store
+from .qlib_candidate_observer import (
+    CANDIDATE_HISTORY_TABLE,
+    candidate_catalog,
+    run_candidate_queue_daily,
+)
 from .qlib_challenger_daily import (
     QLIB_CHALLENGER_ACCOUNT,
     run_qlib_challenger_daily,
@@ -55,6 +60,8 @@ from .research.governance import evaluate_bank_model_promotion
 from .research.single_stock import research_single_stock, robustness_single_stock
 from .signals import trend_decision
 from .strategy_comparison import build_fair_comparison
+from .trade_cycles import analyze_trade_cycles
+from .weekly_training import WeeklyTrainingService
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "state"
@@ -329,6 +336,7 @@ class TaskService:
             "sector_research",
             "multi_sector_execution",
             "qlib_challenger_execution",
+            "qlib_candidate_observation",
         ]
         with sqlite3.connect(self.database) as connection:
             completed = {
@@ -891,6 +899,18 @@ class TaskService:
                 self._run_step(
                     run_id,
                     trade_date,
+                    "qlib_candidate_observation",
+                    lambda: run_candidate_queue_daily(
+                        root=ROOT,
+                        store=store,
+                        broker=broker,
+                        config=config,
+                        trade_date=trade_date,
+                    ),
+                )
+                self._run_step(
+                    run_id,
+                    trade_date,
                     "qlib_drift_monitoring",
                     lambda: evaluate_qlib_drift(
                         ROOT,
@@ -984,12 +1004,15 @@ class TaskService:
 
 
 task_service = TaskService()
+weekly_training_service = WeeklyTrainingService(ROOT)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     task_service.start()
+    weekly_training_service.start()
     yield
+    weekly_training_service.stop()
     task_service.stop()
 
 
@@ -1009,8 +1032,17 @@ def health() -> dict[str, object]:
         "status": "ok",
         "mode": "PAPER_ONLY",
         "scheduler": bool(task_service._thread and task_service._thread.is_alive()),
+        "weekly_training_scheduler": bool(
+            weekly_training_service._thread
+            and weekly_training_service._thread.is_alive()
+        ),
         "server_time": datetime.now(SHANGHAI).isoformat(),
     }
+
+
+@app.get("/api/weekly-training")
+def weekly_training() -> dict[str, object]:
+    return weekly_training_service.status()
 
 
 @app.get("/api/factors")
@@ -1162,7 +1194,8 @@ def bank_timing() -> dict[str, object]:
 def sector_portfolio() -> dict[str, object]:
     store = ParquetStore(DATA)
     try:
-        recommendation = store.read("sector_portfolio_recommendation")
+        sector_diagnostics = store.read("sector_portfolio_recommendation")
+        global_recommendation = store.read("global_factor_recommendation")
         report = store.read("sector_model_report")
         scores = store.read("sector_model_scores")
         targets = store.read("sector_model_targets")
@@ -1180,6 +1213,27 @@ def sector_portfolio() -> dict[str, object]:
         on=["sector", "symbol"],
         how="left",
     ).sort_values(["sector", "rank", "score"], ascending=[True, True, False])
+    diagnostic_risk = dict(
+        zip(
+            sector_diagnostics["sector"].astype(str),
+            sector_diagnostics["risk_degree"].astype(float),
+            strict=True,
+        )
+    )
+    selected_global = global_recommendation.loc[
+        global_recommendation["selected"].astype(bool)
+    ].copy()
+    allocation = (
+        selected_global.groupby("sector", as_index=False)
+        .agg(
+            target_weight=("target_weight", "sum"),
+            selected=("symbol", lambda values: ",".join(map(str, values))),
+        )
+        .sort_values("target_weight", ascending=False)
+    )
+    allocation["budget_weight"] = allocation["target_weight"]
+    allocation["cash_weight"] = 0.0
+    allocation["risk_degree"] = allocation["sector"].map(diagnostic_risk)
 
     universes = []
     for sector, definition in config["universes"].items():
@@ -1203,8 +1257,8 @@ def sector_portfolio() -> dict[str, object]:
             "Tushare 当前权限不含历史 ETF 持仓。行业池来自 2026-06-30 "
             "披露快照，历史结果存在当前成分回看偏差，不属于无偏回测。"
         ),
-        "allocation_method": config["allocation"]["method"],
-        "allocation": _records(recommendation.sort_values("budget_weight", ascending=False)),
+        "allocation_method": "global_cross_section_topk",
+        "allocation": _records(allocation),
         "report": _records(report),
         "universes": universes,
         "symbol_names": _instrument_names(store),
@@ -1326,6 +1380,10 @@ def multi_sector_execution() -> dict[str, object]:
         ),
         "trade_date": latest.get("trade_date"),
         "target_weights": latest.get("target_weights", {}),
+        "theoretical_target_weights": latest.get(
+            "theoretical_target_weights", latest.get("target_weights", {})
+        ),
+        "target_adjustments": latest.get("target_adjustments", []),
         "symbol_sectors": latest.get("symbol_sectors", {}),
         "orders": orders,
         "fills": fills,
@@ -1529,6 +1587,200 @@ def qlib_challenger() -> dict[str, object]:
         minimum_observation_days=20,
         target_volatility=0.10,
     )
+    candidate_rows = candidate_catalog(ROOT)
+    observed_candidate = candidate_rows[0] if candidate_rows else None
+    candidate_history_all = pd.DataFrame()
+    try:
+        candidate_history_all = store.read(CANDIDATE_HISTORY_TABLE).sort_values(
+            "trade_date"
+        )
+    except FileNotFoundError:
+        pass
+    active_history = comparison_sources.get(QLIB_CHALLENGER_ACCOUNT, pd.DataFrame())
+    baseline_history = comparison_sources.get(MULTI_SECTOR_ACCOUNT, pd.DataFrame())
+    observation_policy = challenger_config.get("candidate_observation_policy", {})
+    preliminary_days = int(observation_policy.get("preliminary_review_days", 20))
+    formal_days = int(observation_policy.get("formal_review_days", 60))
+    candidate_details: list[dict[str, object]] = []
+    for row in candidate_rows:
+        account_id = str(row["account_id"])
+        history = (
+            candidate_history_all.loc[
+                candidate_history_all["account_id"].astype(str) == account_id
+            ].copy()
+            if not candidate_history_all.empty
+            else pd.DataFrame()
+        )
+        version_comparison = build_fair_comparison(
+            {
+                MULTI_SECTOR_ACCOUNT: baseline_history,
+                QLIB_CHALLENGER_ACCOUNT: active_history,
+                account_id: history,
+            },
+            minimum_observation_days=preliminary_days,
+            target_volatility=0.10,
+        )
+        common_days = int(version_comparison["common_observation_days"])
+        stage = (
+            "FORMAL_REVIEW_READY"
+            if common_days >= formal_days
+            else "PRELIMINARY_REVIEW"
+            if common_days >= preliminary_days
+            else "OBSERVING"
+        )
+        public_row = {
+            key: value
+            for key, value in row.items()
+            if key not in {"latest_report", "latest_portfolio", "model_dir", "research_path"}
+        }
+        public_row.update(
+            {
+                "common_observation_days": common_days,
+                "preliminary_review_days": preliminary_days,
+                "formal_review_days": formal_days,
+                "review_stage": stage,
+            }
+        )
+        broker.initialize_account(1_000_000, account_id)
+        candidate_details.append(
+            {
+                **public_row,
+                "latest": row.get("latest_report") or {},
+                "orders": [
+                    order
+                    for order in reversed(broker.orders())
+                    if order.get("account_id") == account_id
+                ][:100],
+                "fills": broker.fills(account_id),
+                "reconciliation": asdict(broker.reconcile(account_id)),
+                "comparison": version_comparison,
+            }
+        )
+    candidate_leaderboard = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"latest", "orders", "fills", "reconciliation", "comparison"}
+        }
+        for row in candidate_details
+    ]
+    all_strategy_histories = {
+        MULTI_SECTOR_ACCOUNT: baseline_history,
+        QLIB_CHALLENGER_ACCOUNT: active_history,
+        **{
+            str(row["account_id"]): (
+                candidate_history_all.loc[
+                    candidate_history_all["account_id"].astype(str)
+                    == str(row["account_id"])
+                ].copy()
+                if not candidate_history_all.empty
+                else pd.DataFrame()
+            )
+            for row in candidate_rows
+        },
+    }
+    global_strategy_view = build_fair_comparison(
+        all_strategy_histories,
+        minimum_observation_days=preliminary_days,
+        target_volatility=0.10,
+    )
+    # Global display metrics use each account's complete real operating span.
+    # Candidate promotion evidence remains version-specific in candidate_details.
+    global_strategy_view["metrics"] = [
+        _account_performance(account_id, history)
+        for account_id, history in all_strategy_histories.items()
+    ]
+    global_strategy_view["strategy_count"] = len(all_strategy_histories)
+    candidate_observation: dict[str, object] = {
+        "status": "AWAITING_CANDIDATE",
+        "leaderboard": candidate_leaderboard,
+        "latest": {},
+        "orders": [],
+        "fills": [],
+        "candidates": [],
+        "comparison": {"status": "AWAITING_COMMON_DATES", "metrics": []},
+    }
+    if observed_candidate is not None:
+        candidate_account = str(observed_candidate["account_id"])
+        broker.initialize_account(1_000_000, candidate_account)
+        try:
+            candidate_history = store.read(CANDIDATE_HISTORY_TABLE)
+            candidate_history = candidate_history.loc[
+                candidate_history["account_id"].astype(str) == candidate_account
+            ].sort_values("trade_date")
+        except FileNotFoundError:
+            candidate_history = pd.DataFrame()
+        comparison_sources[candidate_account] = candidate_history
+        fair_comparison = build_fair_comparison(
+            comparison_sources,
+            minimum_observation_days=20,
+            target_volatility=0.10,
+        )
+        candidate_comparison = build_fair_comparison(
+            {
+                MULTI_SECTOR_ACCOUNT: baseline_history,
+                QLIB_CHALLENGER_ACCOUNT: active_history,
+                candidate_account: candidate_history,
+            },
+            minimum_observation_days=20,
+            target_volatility=0.10,
+        )
+        candidate_orders = [
+            row
+            for row in reversed(broker.orders())
+            if row.get("account_id") == candidate_account
+        ][:100]
+        candidate_observation = {
+            "status": "OBSERVING",
+            "candidate_tag": observed_candidate["candidate_tag"],
+            "account_id": candidate_account,
+            "leaderboard": candidate_leaderboard,
+            "latest": observed_candidate.get("latest_report") or {},
+            "latest_trade_date": observed_candidate.get("latest_trade_date"),
+            "research_gate_passed": observed_candidate.get(
+                "research_gate_passed", False
+            ),
+            "orders": candidate_orders,
+            "fills": broker.fills(candidate_account),
+            "reconciliation": asdict(broker.reconcile(candidate_account)),
+            "comparison": candidate_comparison,
+            "candidates": candidate_details,
+            "preliminary_review_days": preliminary_days,
+            "formal_review_days": formal_days,
+            "global_strategy_view": global_strategy_view,
+        }
+    instrument_names = _instrument_names(store)
+    cycle_marks: dict[str, float] = {}
+    comparison_account_ids = [
+        MULTI_SECTOR_ACCOUNT,
+        QLIB_CHALLENGER_ACCOUNT,
+        *(str(row["account_id"]) for row in candidate_rows),
+    ]
+    cycle_symbols = {
+        str(row["symbol"])
+        for account_id in comparison_account_ids
+        for row in broker.fills(account_id)
+    }
+    if cycle_symbols:
+        daily = store.read(
+            "daily",
+            columns=["ts_code", "trade_date", "close"],
+            filters=[("ts_code", "in", sorted(cycle_symbols))],
+        )
+        latest_marks = daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1)
+        cycle_marks = {
+            str(row["ts_code"]): float(row["close"])
+            for row in latest_marks.to_dict("records")
+        }
+    trade_cycle_analysis = {
+        account_id: analyze_trade_cycles(
+            account_id,
+            broker.fills(account_id),
+            broker.corporate_actions(account_id),
+            cycle_marks,
+        )
+        for account_id in comparison_account_ids
+    }
     return {
         "account_id": QLIB_CHALLENGER_ACCOUNT,
         "research": research,
@@ -1541,15 +1793,24 @@ def qlib_challenger() -> dict[str, object]:
         "fills": broker.fills(QLIB_CHALLENGER_ACCOUNT),
         "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
         "comparison": fair_comparison,
+        "trade_cycle_analysis": trade_cycle_analysis,
         "historical_execution": historical_execution,
         "point_in_time": point_in_time,
         "governance": governance,
         "drift": drift,
         "long_term_review": long_term_review,
+        "candidate_observation": candidate_observation,
         "baseline": {
             "account_id": MULTI_SECTOR_ACCOUNT,
             "latest": _latest_multi_sector_shadow(),
+            "orders": [
+                row
+                for row in reversed(broker.orders())
+                if row.get("account_id") == MULTI_SECTOR_ACCOUNT
+            ][:100],
+            "fills": broker.fills(MULTI_SECTOR_ACCOUNT),
         },
+        "symbol_names": instrument_names,
     }
 
 
@@ -1570,6 +1831,8 @@ def _account_performance(account_id: str, history: pd.DataFrame) -> dict[str, ob
     return {
         "account_id": account_id,
         "observation_days": len(equity),
+        "start_date": str(history.sort_values("trade_date").iloc[0]["trade_date"]),
+        "end_date": str(history.sort_values("trade_date").iloc[-1]["trade_date"]),
         "total_return": float(equity.iloc[-1] / equity.iloc[0] - 1),
         "annualized_volatility": volatility,
         "sharpe": (

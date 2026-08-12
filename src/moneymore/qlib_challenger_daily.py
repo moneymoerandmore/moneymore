@@ -14,12 +14,17 @@ from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .execution.paper import ExecutionBar, PaperBroker
 from .execution.risk import PortfolioSnapshot, create_order_intent
+from .portfolio_constructor import (
+    adjusted_close_panel,
+    global_topk_portfolio,
+    trailing_return_correlation,
+)
 from .qlib_challenger import (
     QlibPanelDataset,
     build_challenger_dataset,
     challenger_universe,
-    evaluate_forward_observations,
 )
+from .qlib_exposure import dynamic_target_exposure, previous_report_exposure
 from .qlib_governance import bootstrap_qlib_release
 from .signals import SignalDecision, write_signal_artifact
 
@@ -50,21 +55,24 @@ def run_qlib_challenger_daily(
     trade_date: str,
     signal_dir: Path,
     report_dir: Path,
+    account_id: str = QLIB_CHALLENGER_ACCOUNT,
+    strategy_id: str | None = None,
+    model_dir: Path | None = None,
+    research_path: Path | None = None,
+    account_history_table: str = "qlib_challenger_account_daily",
 ) -> ChallengerDailyResult:
     challenger_config = yaml.safe_load(
         (root / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
     )
     model_id = str(challenger_config["model_id"])
-    model_path = root / "state" / "qlib-challenger" / "models" / f"{model_id}.pkl"
-    ensemble_path = (
-        root
-        / "state"
-        / "qlib-challenger"
-        / "models"
-        / f"{model_id}_ensemble.json"
+    strategy_id = strategy_id or model_id
+    model_dir = model_dir or root / "state" / "qlib-challenger" / "models"
+    model_path = model_dir / f"{model_id}.pkl"
+    ensemble_path = model_dir / f"{model_id}_ensemble.json"
+    research_path = research_path or (
+        root / "state" / "qlib-challenger" / "latest-research.json"
     )
-    research_path = root / "state" / "qlib-challenger" / "latest-research.json"
-    broker.initialize_account(config.initial_cash, QLIB_CHALLENGER_ACCOUNT)
+    broker.initialize_account(config.initial_cash, account_id)
     if not (model_path.exists() or ensemble_path.exists()) or not research_path.exists():
         return _finish(
             trade_date,
@@ -74,9 +82,10 @@ def run_qlib_challenger_daily(
             [],
             [],
             [],
-            broker.account_snapshot({}, QLIB_CHALLENGER_ACCOUNT),
+            broker.account_snapshot({}, account_id),
             broker,
             report_dir,
+            account_id=account_id,
         )
     research = json.loads(research_path.read_text(encoding="utf-8"))
     deployment = bootstrap_qlib_release(root)
@@ -136,17 +145,22 @@ def run_qlib_challenger_daily(
         "%Y%m%d"
     )
     score_frame["sector"] = score_frame["instrument"].map(universe)
-    top_k = int(challenger_config["top_k_per_sector"])
-    selected, selection_metadata = _scheduled_selection(
+    portfolio_policy = challenger_config["portfolio_policy"]
+    correlation = trailing_return_correlation(
+        adjusted_close_panel(store, list(universe)),
+        cutoff,
+        int(portfolio_policy["correlation_lookback"]),
+    )
+    selected, portfolio_weights, selection_metadata = _scheduled_portfolio(
         score_frame,
-        model_id,
+        strategy_id,
         trade_date,
         report_dir,
-        top_k,
-        int(challenger_config["exit_rank_per_sector"]),
+        portfolio_policy,
         int(challenger_config["rebalance_interval"]),
+        correlation,
     )
-    account_before = broker.account_snapshot({}, QLIB_CHALLENGER_ACCOUNT)
+    account_before = broker.account_snapshot({}, account_id)
     held = {
         str(row["symbol"])
         for row in account_before["positions"]  # type: ignore[index]
@@ -164,10 +178,12 @@ def run_qlib_challenger_daily(
         executions = []
         for symbol, bar in sorted(bars.items()):
             executions.extend(
-                broker.execute_pending(bar, config, QLIB_CHALLENGER_ACCOUNT)
+                broker.execute_pending(bar, config, account_id)
             )
-        portfolio = broker.account_snapshot(marks, QLIB_CHALLENGER_ACCOUNT)
-        _record_account_history(store, trade_date, portfolio)
+        portfolio = broker.account_snapshot(marks, account_id)
+        _record_account_history(
+            store, trade_date, portfolio, account_id, account_history_table
+        )
         return _finish(
             trade_date,
             "OBSERVATION_ONLY",
@@ -185,28 +201,38 @@ def run_qlib_challenger_daily(
                 "deployment_mode": deployment.get("execution_mode"),
                 "observation_reason": "EXPERIMENTAL_PAPER_DISABLED",
             },
+            account_id=account_id,
         )
 
     executions = []
     for symbol, bar in sorted(bars.items()):
         executions.extend(
-            broker.execute_pending(bar, config, QLIB_CHALLENGER_ACCOUNT)
+            broker.execute_pending(bar, config, account_id)
         )
-    account = broker.account_snapshot(marks, QLIB_CHALLENGER_ACCOUNT)
+    account = broker.account_snapshot(marks, account_id)
     positions = {
         str(row["symbol"]): row for row in account["positions"]  # type: ignore[index]
     }
-    target_weight = float(challenger_config["target_gross_exposure"]) / max(
-        len(selected), 1
+    exposure = dynamic_target_exposure(
+        store,
+        selected,
+        cutoff,
+        challenger_config["exposure_policy"],
+        previous_exposure=previous_report_exposure(report_dir, trade_date),
     )
+    target_gross_exposure = float(exposure["target_gross_exposure"])
+    portfolio_weights = {
+        symbol: weight * target_gross_exposure
+        for symbol, weight in portfolio_weights.items()
+    }
     orders = []
     for symbol in sorted(set(selected) | set(positions)):
         close = marks.get(symbol)
         if close is None:
             continue
-        target = target_weight if symbol in selected else 0.0
+        target = float(portfolio_weights.get(symbol, 0.0))
         decision = SignalDecision(
-            strategy_id=model_id,
+            strategy_id=strategy_id,
             symbol=symbol,
             as_of_date=trade_date,
             target_weight=target,
@@ -233,7 +259,7 @@ def run_qlib_challenger_daily(
         )
         if risk.rejection_code == "BELOW_MINIMUM_REBALANCE_NOTIONAL":
             broker.cancel_pending_symbol(
-                QLIB_CHALLENGER_ACCOUNT,
+                account_id,
                 symbol,
                 trade_date,
                 "BELOW_MINIMUM_REBALANCE_NOTIONAL",
@@ -241,7 +267,7 @@ def run_qlib_challenger_daily(
         write_signal_artifact(decision, signal_dir)
         decision_status = broker.record_decision(decision)
         submit_status = (
-            broker.submit(risk, QLIB_CHALLENGER_ACCOUNT)
+            broker.submit(risk, account_id)
             if decision_status in {"RECORDED", "DUPLICATE"}
             else "DUPLICATE_DECISION"
         )
@@ -254,9 +280,11 @@ def run_qlib_challenger_daily(
                 "rejection_code": risk.rejection_code,
             }
         )
-    portfolio = broker.account_snapshot(marks, QLIB_CHALLENGER_ACCOUNT)
-    _record_account_history(store, trade_date, portfolio)
-    reconciliation = asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT))
+    portfolio = broker.account_snapshot(marks, account_id)
+    _record_account_history(
+        store, trade_date, portfolio, account_id, account_history_table
+    )
+    reconciliation = asdict(broker.reconcile(account_id))
     status = (
         "EXPERIMENTAL_PAPER"
         if reconciliation["matched"]
@@ -279,7 +307,12 @@ def run_qlib_challenger_daily(
             "deployment_mode": deployment.get("execution_mode"),
             "promotion_eligible": research_gate_passed
             and deployment.get("execution_mode") == "PAPER_TRADING",
+            "target_gross_exposure": target_gross_exposure,
+            "target_weights": portfolio_weights,
+            "portfolio_policy": portfolio_policy,
+            "exposure_policy": exposure,
         },
+        account_id=account_id,
     )
 
 
@@ -310,15 +343,15 @@ def _latest_market_state(
     return marks, bars
 
 
-def _scheduled_selection(
+def _scheduled_portfolio(
     score_frame: pd.DataFrame,
     model_id: str,
     trade_date: str,
     report_dir: Path,
-    top_k: int,
-    exit_rank: int,
+    policy: dict[str, object],
     interval: int,
-) -> tuple[list[str], dict[str, object]]:
+    correlation: pd.DataFrame,
+) -> tuple[list[str], dict[str, float], dict[str, object]]:
     prior_reports = []
     if report_dir.exists():
         for path in sorted(report_dir.glob("*.json")):
@@ -334,25 +367,36 @@ def _scheduled_selection(
         int(previous.get("days_since_rebalance", 0)) + 1 if previous else interval
     )
     if previous and days_since_rebalance < interval:
-        return sorted(previous["selected"]), {
-            "rebalanced": False,
-            "days_since_rebalance": days_since_rebalance,
-            "days_until_rebalance": interval - days_since_rebalance,
-        }
+        prior_weights = previous.get("target_weights")
+        if isinstance(prior_weights, dict) and prior_weights:
+            return sorted(previous["selected"]), {
+                str(symbol): float(weight) for symbol, weight in prior_weights.items()
+            }, {
+                "rebalanced": False,
+                "days_since_rebalance": days_since_rebalance,
+                "days_until_rebalance": interval - days_since_rebalance,
+            }
     incumbents = set(previous.get("selected", [])) if previous else set()
-    selected = []
-    for _, sector_frame in score_frame.groupby("sector"):
-        ranking = sector_frame.sort_values("score", ascending=False).copy()
-        ranking["rank"] = range(1, len(ranking) + 1)
-        retained = ranking.loc[
-            ranking["instrument"].isin(incumbents)
-            & (ranking["rank"] <= exit_rank)
-        ].head(top_k)
-        additions = ranking.loc[
-            ~ranking["instrument"].isin(set(retained["instrument"]))
-        ].head(top_k - len(retained))
-        selected.extend(pd.concat([retained, additions])["instrument"].astype(str))
-    return sorted(selected), {
+    selected, weights, ranking = global_topk_portfolio(
+        score_frame,
+        incumbents,
+        symbol_column="instrument",
+        top_k=int(policy["top_k"]),
+        exit_rank=int(policy["exit_rank"]),
+        max_replacements=int(policy["max_replacements"]),
+        minimum_weight=float(policy["minimum_weight"]),
+        maximum_weight=float(policy["maximum_weight"]),
+        correlation=correlation,
+        correlation_penalty=float(policy["correlation_penalty"]),
+        cluster_correlation_threshold=float(policy["cluster_correlation_threshold"]),
+        maximum_cluster_members=int(policy["maximum_cluster_members"]),
+    )
+    return selected, weights, {
+        "selection_method": "global_rank_weighted_topk",
+        "selected_global_ranks": {
+            str(row["instrument"]): int(row["global_rank"])
+            for row in ranking.loc[ranking["selected"]].to_dict("records")
+        },
         "rebalanced": True,
         "days_since_rebalance": 0,
         "days_until_rebalance": interval,
@@ -363,12 +407,14 @@ def _record_account_history(
     store: ParquetStore,
     trade_date: str,
     portfolio: dict[str, object],
+    account_id: str = QLIB_CHALLENGER_ACCOUNT,
+    table: str = "qlib_challenger_account_daily",
 ) -> None:
     row = pd.DataFrame(
         [
             {
                 "trade_date": trade_date,
-                "account_id": QLIB_CHALLENGER_ACCOUNT,
+                "account_id": account_id,
                 "cash": float(portfolio["cash"]),
                 "market_value": float(portfolio["market_value"]),
                 "equity": float(portfolio["equity"]),
@@ -376,7 +422,7 @@ def _record_account_history(
         ]
     )
     store.merge_curated(
-        "qlib_challenger_account_daily",
+        table,
         [row],
         ["trade_date", "account_id"],
     )
@@ -394,6 +440,8 @@ def _finish(
     broker: PaperBroker,
     report_dir: Path,
     selection_metadata: dict[str, object] | None = None,
+    *,
+    account_id: str = QLIB_CHALLENGER_ACCOUNT,
 ) -> ChallengerDailyResult:
     report_dir.mkdir(parents=True, exist_ok=True)
     target = report_dir / f"{trade_date}.json"
@@ -406,7 +454,8 @@ def _finish(
         "executions": executions,
         "orders": orders,
         "portfolio": portfolio,
-        "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
+        "account_id": account_id,
+        "reconciliation": asdict(broker.reconcile(account_id)),
         "created_at": datetime.now(UTC).isoformat(),
         "report_path": str(target),
         **(selection_metadata or {}),

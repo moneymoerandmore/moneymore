@@ -3,10 +3,21 @@ model_id: qlib_gru_alpha360_v1
 feature_set: moneymore_alpha360_6x60
 sequence_length: 60
 label_horizon: 5
-top_k_per_sector: 2
-exit_rank_per_sector: 4
+portfolio_policy:
+  method: global_rank_weighted_topk
+  top_k: 10
+  exit_rank: 15
+  max_replacements: 3
+  minimum_weight: 0.05
+  maximum_weight: 0.15
+  correlation_lookback: 120
+  correlation_penalty: 0.00
+  cluster_correlation_threshold: 0.65
+  maximum_cluster_members: 3
 rebalance_interval: 5
-target_gross_exposure: 0.40
+exposure_policy:
+  method: fully_invested
+  target_exposure: 1.00
 research_gate:
   minimum_samples: 10000
   minimum_rank_ic: 0.01
@@ -42,9 +53,13 @@ model:
   learning_rate: 0.001
   seeds: [17, 23, 42, 71, 101]
 training_policy:
-  frequency: monthly
+  frequency: weekly
   automatic_promotion: false
-  candidate_only: false
+  candidate_only: true
+candidate_observation_policy:
+  preliminary_review_days: 20
+  formal_review_days: 60
+  new_candidate_resets_existing: false
 execution_policy:
   experimental_paper_enabled: true
   research_gate_blocks_promotion_only: true

@@ -12,8 +12,14 @@ from .config import BacktestConfig
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .execution_replay import ExecutionReplayResult, run_execution_replay
+from .portfolio_constructor import (
+    adjusted_close_panel,
+    global_topk_portfolio,
+    trailing_return_correlation,
+)
 from .qlib_challenger import QlibPanelDataset, build_challenger_dataset, challenger_universe
-from .research.sector_model import inverse_volatility_allocation
+from .qlib_exposure import dynamic_target_exposure
+from .research.sector_model import build_global_factor_panel
 
 
 def run_historical_pk(
@@ -169,80 +175,47 @@ def build_factor_targets(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    sector_targets = store.read("sector_model_targets").copy()
-    bank_targets = store.read("bank_model_targets").copy()
-    sector_targets["date"] = pd.to_datetime(sector_targets["date"])
-    bank_targets["date"] = pd.to_datetime(bank_targets["date"])
-    bank_targets["sector"] = "bank"
-    selections = pd.concat(
-        [
-            sector_targets[["date", "symbol", "sector", "selected"]],
-            bank_targets[["date", "symbol", "sector", "selected"]],
-        ],
-        ignore_index=True,
+    root = store.root.parent
+    config = yaml.safe_load(
+        (root / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
     )
-    dates = pd.date_range(start_date, end_date, freq="B")
-    selection_panel = (
-        selections.pivot_table(
-            index="date", columns=["sector", "symbol"], values="selected", aggfunc="last"
-        )
-        .reindex(dates)
-        .ffill()
-        .fillna(False)
-    )
-    equities = store.read("sector_model_equity").copy()
-    bank_equity = store.read("bank_timing_equity")
-    bank_equity = bank_equity.loc[bank_equity["strategy"] == "vol_target_12"].copy()
-    bank_degrees = store.read("bank_timing_degrees")
-    bank_degrees = bank_degrees.loc[
-        bank_degrees["strategy"] == "vol_target_12", ["date", "risk_degree"]
+    symbols = set(store.read("bank_model_scores")["symbol"].astype(str))
+    for definition in config["universes"].values():
+        symbols.update(map(str, definition["holdings"]))
+    selection = config["global_selection"]
+    scores = build_global_factor_panel(store, sorted(symbols), selection["factors"])
+    scores["date"] = pd.to_datetime(scores["date"])
+    scores = scores.loc[
+        scores["date"].between(pd.Timestamp(start_date), pd.Timestamp(end_date))
     ]
-    bank_equity = bank_equity.merge(bank_degrees, on="date", how="left")
-    bank_equity["sector"] = "bank"
-    sleeve = pd.concat(
-        [
-            equities[["date", "sector", "equity", "risk_degree"]],
-            bank_equity[["date", "sector", "equity", "risk_degree"]],
-        ],
-        ignore_index=True,
-    )
-    sleeve["date"] = pd.to_datetime(sleeve["date"])
-    equity_panel = sleeve.pivot_table(index="date", columns="sector", values="equity")
-    degree_panel = sleeve.pivot_table(
-        index="date", columns="sector", values="risk_degree"
-    )
-    equity_panel = equity_panel.reindex(dates).ffill()
-    degree_panel = degree_panel.reindex(dates).ffill()
-    returns = equity_panel.pct_change(fill_method=None)
+    held: set[str] = set()
     rows = []
-    for date in dates:
-        history = returns.loc[:date].tail(60)
-        if history.dropna(how="all").shape[0] < 20:
-            continue
-        allocation = inverse_volatility_allocation(history)
-        if date not in selection_panel.index:
-            continue
-        for sector, budget in allocation.items():
-            if sector not in degree_panel or pd.isna(degree_panel.loc[date, sector]):
-                continue
-            selected = [
-                symbol
-                for sleeve_id, symbol in selection_panel.columns
-                if sleeve_id == sector and bool(selection_panel.loc[date, (sleeve_id, symbol)])
-            ]
-            if not selected:
-                continue
-            weight = float(budget) * float(degree_panel.loc[date, sector]) / len(selected)
-            for sleeve_id, symbol in selection_panel.columns:
-                if sleeve_id == sector:
-                    rows.append(
-                        {
-                            "date": date,
-                            "symbol": symbol,
-                            "target_weight": weight if symbol in selected else 0.0,
-                        }
-                    )
-    return pd.DataFrame(rows).drop_duplicates(["date", "symbol"], keep="last")
+    universe = sorted(scores["symbol"].astype(str).unique())
+    price_panel = adjusted_close_panel(store, universe)
+    for date, day in scores.groupby("date", sort=True):
+        correlation = trailing_return_correlation(
+            price_panel, date, int(selection["correlation_lookback"])
+        )
+        selected, weights, _ = global_topk_portfolio(
+            day,
+            held,
+            symbol_column="symbol",
+            top_k=int(selection["top_k"]),
+            exit_rank=int(selection["exit_rank"]),
+            max_replacements=int(selection["max_replacements"]),
+            minimum_weight=float(selection["minimum_weight"]),
+            maximum_weight=float(selection["maximum_weight"]),
+            correlation=correlation,
+            correlation_penalty=float(selection["correlation_penalty"]),
+            cluster_correlation_threshold=float(selection["cluster_correlation_threshold"]),
+            maximum_cluster_members=int(selection["maximum_cluster_members"]),
+        )
+        held = set(selected)
+        rows.extend(
+            {"date": date, "symbol": symbol, "target_weight": weights.get(symbol, 0.0)}
+            for symbol in universe
+        )
+    return pd.DataFrame(rows)
 
 
 def build_qlib_targets(
@@ -275,42 +248,51 @@ def build_qlib_targets(
     scores = (sum(predictions) / len(predictions)).rename("score").reset_index()
     scores["sector"] = scores["instrument"].map(universe)
     dates = sorted(pd.to_datetime(scores["datetime"].unique()))
-    held: dict[str, set[str]] = {sector: set() for sector in set(universe.values())}
-    top_k = int(config["top_k_per_sector"])
-    exit_rank = int(config["exit_rank_per_sector"])
+    held: set[str] = set()
+    policy = config["portfolio_policy"]
     interval = int(config["rebalance_interval"])
-    gross = float(config["target_gross_exposure"])
+    previous_exposure: float | None = None
+    price_panel = adjusted_close_panel(store, list(universe))
     rows = []
     for index, date in enumerate(dates):
-        if index % interval:
+        is_rebalance = index % interval == 0
+        if is_rebalance:
+            day = scores.loc[pd.to_datetime(scores["datetime"]) == date]
+            selected, portfolio_weights, _ = global_topk_portfolio(
+                day, held, symbol_column="instrument",
+                top_k=int(policy["top_k"]), exit_rank=int(policy["exit_rank"]),
+                max_replacements=int(policy["max_replacements"]),
+                minimum_weight=float(policy["minimum_weight"]),
+                maximum_weight=float(policy["maximum_weight"]),
+                correlation=trailing_return_correlation(
+                    price_panel, date, int(policy["correlation_lookback"])
+                ),
+                correlation_penalty=float(policy["correlation_penalty"]),
+                cluster_correlation_threshold=float(policy["cluster_correlation_threshold"]),
+                maximum_cluster_members=int(policy["maximum_cluster_members"]),
+            )
+            held = set(selected)
+        if (
+            not is_rebalance
+            and config["exposure_policy"].get("method") == "fully_invested"
+        ):
             continue
-        day = scores.loc[pd.to_datetime(scores["datetime"]) == date]
-        selected_all: set[str] = set()
-        for sector, group in day.groupby("sector"):
-            ranking = group.sort_values("score", ascending=False).copy()
-            ranking["rank"] = range(1, len(ranking) + 1)
-            retained = [
-                symbol
-                for symbol in ranking.loc[
-                    ranking["instrument"].isin(held.get(str(sector), set()))
-                    & (ranking["rank"] <= exit_rank),
-                    "instrument",
-                ].astype(str)
-            ][:top_k]
-            additions = [
-                symbol
-                for symbol in ranking["instrument"].astype(str)
-                if symbol not in retained
-            ][: top_k - len(retained)]
-            held[str(sector)] = set(retained + additions)
-            selected_all |= held[str(sector)]
-        weight = gross / len(selected_all) if selected_all else 0.0
+        selected_all = held
+        exposure = dynamic_target_exposure(
+            store,
+            selected_all,
+            date,
+            config["exposure_policy"],
+            previous_exposure=previous_exposure,
+        )
+        gross = float(exposure["target_gross_exposure"])
+        previous_exposure = gross
         for symbol in universe:
             rows.append(
                 {
                     "date": date,
                     "symbol": symbol,
-                    "target_weight": weight if symbol in selected_all else 0.0,
+                    "target_weight": float(portfolio_weights.get(symbol, 0.0)) * gross,
                 }
             )
     return pd.DataFrame(rows)

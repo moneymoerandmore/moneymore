@@ -1,0 +1,23 @@
+[Unit]
+Description=MoneyMore API and single-instance daily scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moneymore
+Group=moneymore
+WorkingDirectory=/opt/moneymore/current
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/moneymore/venv/bin/python -m uvicorn moneymore.web:app --host 127.0.0.1 --port 8788 --workers 1
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/moneymore/current/data /opt/moneymore/current/state /opt/moneymore/current/logs
+
+[Install]
+WantedBy=multi-user.target

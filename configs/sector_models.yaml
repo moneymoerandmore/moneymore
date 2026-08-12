@@ -1,5 +1,25 @@
 disclosure_date: "2026-06-30"
 evidence_status: CURRENT_CONSTITUENT_BIASED
+global_selection:
+  top_k: 10
+  exit_rank: 15
+  max_replacements: 3
+  minimum_weight: 0.05
+  maximum_weight: 0.15
+  correlation_lookback: 120
+  correlation_penalty: 0.00
+  cluster_correlation_threshold: 0.65
+  maximum_cluster_members: 3
+  factors:
+    earnings_yield: 0.16
+    book_to_price: 0.10
+    dividend_yield_ttm: 0.10
+    roe: 0.16
+    quarterly_revenue_growth: 0.12
+    momentum_252_21: 0.14
+    return_120: 0.08
+    volatility_60: 0.08
+    drawdown_120: 0.06
 universes:
   growth:
     name: 创业板ETF易方达前十大
@@ -168,7 +188,7 @@ universes:
       605499.SH: 0.0318
 
 allocation:
-  method: inverse_volatility
+  method: equal_weight
   lookback: 60
-  max_sleeve_weight: 0.35
+  max_sleeve_weight: 0.25
   minimum_sleeve_weight: 0.10

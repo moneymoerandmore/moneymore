@@ -24,6 +24,7 @@ type Sectors = {
 type Execution = {
   account_id: string; status: string; trade_date?: string;
   target_weights: Record<string, number>; symbol_sectors: Record<string, string>;
+  theoretical_target_weights?: Record<string, number>; target_adjustments?: Row[];
   orders: Row[]; fills: Row[]; positions: Row[];
   portfolio: Bank["shadow"]["portfolio"] | null; reconciliation: Row;
   attribution: Row[]; symbol_names: Record<string, string>;
@@ -54,15 +55,25 @@ type Challenger = {
   account_id: string; research: Row & { metrics?: Row[] };
   next_trade_date?: string | null;
   forward: Row & { daily?: Row[] };
-  comparison: Row & { metrics?: Row[]; histories?: Record<string, Row[]> };
+  comparison: Row & { metrics?: Row[]; histories?: Record<string, Row[]>; independent_histories?: Record<string, Row[]> };
   latest: Row & { selected?: string[]; scores?: Row[]; portfolio?: Bank["shadow"]["portfolio"] };
   orders: Row[]; fills: Row[]; reconciliation: Row;
-  baseline: { account_id: string; latest: Row };
+  baseline: { account_id: string; latest: Row; orders?: Row[]; fills?: Row[] };
   historical_execution: Row & { strategies?: (Row & { summary?: Row })[] };
   point_in_time: Row & { historical_replay_gate?: Row };
   governance: Row & { releases?: Row[]; transitions?: Row[] };
   drift: Row & { breaches?: string[] };
   long_term_review: Row & { evaluation?: Row; criteria?: Record<string, boolean>; cost_ratios?: Row };
+  trade_cycle_analysis?: Record<string, Row & { summary?: Row; by_symbol?: Row[]; closed_cycles?: Row[]; open_cycles?: Row[] }>;
+  candidate_observation?: {
+    status: string; candidate_tag?: string; account_id?: string;
+    research_gate_passed?: boolean; latest_trade_date?: string;
+    leaderboard: Row[]; latest: Row & { selected?: string[]; portfolio?: Bank["shadow"]["portfolio"] };
+    orders: Row[]; fills: Row[]; reconciliation?: Row;
+    comparison: Row & { metrics?: Row[]; histories?: Record<string, Row[]> };
+    candidates?: (Row & { candidate_tag:string; account_id:string; latest:Row & { portfolio?:Bank["shadow"]["portfolio"] }; orders:Row[]; fills:Row[]; comparison:Challenger["comparison"] })[];
+    global_strategy_view?: Challenger["comparison"] & { strategy_count?:number };
+  };
 };
 
 const nav: { id: Page; label: string; note: string }[] = [
@@ -189,8 +200,11 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
 }
 
 function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
+  const candidateVersions = challenger.candidate_observation?.candidates??[];
+  const [selectedCandidateTag,setSelectedCandidateTag] = useState("");
+  const selectedCandidate = candidateVersions.find((row)=>row.candidate_tag===selectedCandidateTag)??candidateVersions[0];
   const metrics = challenger.research.metrics??[];
-  const researchGate = challenger.research.gate??{};
+  const researchGate = (challenger.research.gate??{}) as Row;
   const selected = new Set(challenger.latest.selected??[]);
   const sectorRanks: Record<string, number> = {};
   const rankedScores = (challenger.latest.scores??[]).map((row) => {
@@ -201,15 +215,58 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
   const challengerEquity = Number(challenger.latest.portfolio?.equity??1_000_000);
   const baselinePortfolio = challenger.baseline.latest.portfolio as Row|undefined;
   const baselineEquity = Number(baselinePortfolio?.equity??1_000_000);
+  const observation = challenger.candidate_observation;
+  const candidatePortfolio = selectedCandidate?.latest?.portfolio??observation?.latest?.portfolio;
+  const candidateEquity = Number(candidatePortfolio?.equity??1_000_000);
+  const globalView = observation?.global_strategy_view??challenger.comparison;
   return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
-    <section className="kpis"><Kpi label="挑战者状态" value={text(challenger.latest.status)} note={challenger.account_id} accent={text(challenger.latest.status)!=="COMPLETED"}/><Kpi label="GPU训练" value={Boolean(challenger.research.cuda_available)?"CUDA":"未启用"} note={text(challenger.research.cuda_device)}/><Kpi label="挑战者权益" value={money(challengerEquity)} note={`累计 ${pct(challengerEquity/1_000_000-1)}`}/><Kpi label="因子基线权益" value={money(baselineEquity)} note={`累计 ${pct(baselineEquity/1_000_000-1)}`}/></section>
-    <PerformanceComparisonCharts comparison={challenger.comparison}/>
+    <CandidateSwitcher observation={observation} selectedTag={text(selectedCandidate?.candidate_tag)} onSelect={setSelectedCandidateTag}/>
+    <div className="three-col account-columns">
+      <AccountColumn title="基线" badge="FACTOR BASELINE" accountId={challenger.baseline.account_id} status={text(challenger.baseline.latest.status)} equity={baselineEquity} portfolio={baselinePortfolio} orders={challenger.baseline.orders??[]} fills={challenger.baseline.fills??[]} names={names}/>
+      <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challenger.latest.portfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challenger.orders} fills={challenger.fills} names={names}/>
+      <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={text(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={selectedCandidate?.orders??observation?.orders??[]} fills={selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
+    </div>
+    <PerformanceComparisonCharts comparison={globalView}/>
+    <CandidateObservation challenger={challenger} selectedTag={text(selectedCandidate?.candidate_tag)}/>
+    <TradeCycleComparison challenger={challenger} names={names} candidateAccountId={selectedCandidate?.account_id}/>
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
-    <div className="two-col"><Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel><Panel title="挑战者当前持仓" subtitle="与正式因子影子账户完全隔离"><Table rows={challenger.latest.portfolio?.positions??[]} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel></div>
-    <div className="two-col"><Panel title="挑战者委托" subtitle="信号日产生；等待下一交易日开盘撮合"><Table rows={challenger.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel><Panel title="挑战者成交" subtitle="按真实成交日展示，包含费用与滑点后的成交价"><Table rows={challenger.fills.slice(0,30)} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
+    <Panel title="GRU最新排名" subtitle="预测分保留6位小数；每行业Top-2进入独立挑战者账户"><Table rows={rankedScores.slice(0,30)} columns={[["instrument","证券"],["sector","行业"],["sector_rank","行业排名"],["score","预测分数"],["selected","入选"]]} format={{instrument:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),score:modelScore,selected:(v)=>v?"Top-2":"—"}}/></Panel>
     <Panel title="下一交易日委托计划" subtitle="信号在收盘后生成，计划在下一交易日开盘撮合；两个日期必须分开理解"><Table rows={[{signal_date:challenger.latest.trade_date,planned_trade_date:challenger.next_trade_date,status:challenger.latest.status,gate:Boolean(researchGate.passed)?"PASSED（可申请晋级）":"BLOCKED（不可晋级）",selected:(challenger.latest.selected??[]).map((symbol:string)=>security(symbol,names)).join("、"),order_action:"实验模拟盘持续生成 T+1 委托"}]} columns={[["signal_date","信号生成日"],["planned_trade_date","计划成交日"],["status","运行状态"],["gate","研究门禁"],["selected","模型入选"],["order_action","下一步"]]}/></Panel>
     <div className="evidence"><b>隔离边界</b><p>挑战者结果不进入M4.14正式影子验收；只有完成独立样本外、随机种子稳定性和前瞻模拟后，才允许提出模型晋级。</p><span>CHALLENGER_ONLY</span></div>
   </>;
+}
+
+function AccountColumn({ title, badge, accountId, status, equity, portfolio, targetExposure, exposurePolicy, orders, fills, names, accent=false }: { title:string; badge:string; accountId:string; status:string; equity:number; portfolio?:Row; targetExposure?:number; exposurePolicy?:Row; orders:Row[]; fills:Row[]; names:Record<string,string>; accent?:boolean }) {
+  const positions = (portfolio?.positions??[]) as Row[];
+  const marketValue = Number(portfolio?.market_value??0);
+  return <article className={`account-column${accent?" account-column-accent":""}`}><header><span>{badge}</span><h3>{title}</h3><small>{accountId}</small></header><div className="account-equity"><b>{money(equity)}</b><span>累计 {pct(equity/1_000_000-1)} · 仓位 {pct(equity?marketValue/equity:0)}{Number.isFinite(targetExposure)?` / 目标 ${pct(targetExposure)}`:""}</span>{exposurePolicy?.realized_volatility!=null&&<small>组合波动 {pct(exposurePolicy.realized_volatility)} · 风险目标 {pct(exposurePolicy.annual_target)}</small>}<i>{status}</i></div><h4>当前持仓 · {positions.length}</h4><Table rows={positions.slice(0,12)} columns={[["symbol","证券"],["quantity","数量"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/><h4>最近委托</h4><Table rows={orders.slice(0,8)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["status","状态"]]} format={{symbol:(v)=>security(v,names)}}/><h4>最近成交</h4><Table rows={fills.slice(-8).reverse()} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"]]} format={{symbol:(v)=>security(v,names)}}/></article>;
+}
+
+function CandidateSwitcher({ observation, selectedTag, onSelect }: { observation:Challenger["candidate_observation"]; selectedTag:string; onSelect:(tag:string)=>void }) {
+  if (!observation) return null;
+  return <div className="candidate-switcher"><b>第三列候选策略</b><select value={selectedTag} onChange={(event)=>onSelect(event.target.value)}>{(observation.candidates??[]).map((row)=><option key={row.candidate_tag} value={row.candidate_tag}>{row.candidate_tag} · {text(row.review_stage)} · {text(row.common_observation_days)}日</option>)}</select><span>下拉框只切换第三列详情；全局图表和策略表始终展示所有策略</span></div>;
+}
+
+function CandidateObservation({ challenger, selectedTag }: { challenger: Challenger; selectedTag:string }) {
+  const observation = challenger.candidate_observation;
+  if (!observation) return null;
+  const selected = observation.candidates?.find((row)=>row.candidate_tag===selectedTag);
+  const commonDays = Number(selected?.common_observation_days??observation.comparison?.common_observation_days??0);
+  return <>
+    <section className="kpis"><Kpi label="候选队列" value={String(observation.candidates?.length??0)} note="各版本独立账户持续运行"/><Kpi label="初评门槛" value="20共同日" note="候选与两个对照均有快照"/><Kpi label="正式评审" value="60共同日" note="达到后冻结证据等待人工评审"/><Kpi label="当前选择" value={selectedTag} note={`${commonDays} 个共同日`}/></section>
+    <Panel title="每周候选模型排行榜" subtitle="离线测试按训练版本永久留档；BLOCKED 候选仍可进入隔离观察，但绝不会自动替换当前模型"><Table rows={observation.leaderboard} columns={[["candidate_tag","候选版本"],["data_cutoff","数据截止"],["rank_ic","Rank IC"],["rank_ic_ir","ICIR"],["cost_adjusted_top_k_excess_return","成本后Top-K超额"],["positive_seed_ratio","正种子率"],["average_turnover","换手率"],["research_gate_passed","研究门禁"],["observation_days","观察日"],["latest_status","观察状态"]]} format={{rank_ic:num,rank_ic_ir:num,cost_adjusted_top_k_excess_return:pct,positive_seed_ratio:pct,average_turnover:pct,research_gate_passed:(v)=>v?"PASS":"BLOCKED"}}/></Panel>
+  </>;
+}
+
+function TradeCycleComparison({ challenger, names, candidateAccountId }: { challenger: Challenger; names: Record<string, string>; candidateAccountId?:string }) {
+  const analysis = challenger.trade_cycle_analysis??{};
+  const accounts = [
+    { id:"multi_sector_shadow", label:"因子基线" },
+    { id:"qlib_gru_shadow", label:"Qlib GRU 挑战者" },
+    ...(candidateAccountId?[{id:candidateAccountId,label:"Qlib 候选者"}]:[]),
+  ];
+  const summaryRows = accounts.map(({id,label})=>({strategy:label,...(analysis[id]?.summary??{})}));
+  return <><Panel title="完整持仓周期胜率与赔率" subtitle="从首次建仓到仓位归零算一个闭合周期；分批买卖合并，费用、滑点和分红计入；未清仓周期不进入胜率"><Table rows={summaryRows} columns={[["strategy","策略"],["closed_cycles","闭合周期"],["wins","盈利"],["losses","亏损"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","累计已实现盈亏"],["average_return","平均周期收益"]]} format={{win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,average_return:pct}}/></Panel><div className="three-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 个股持仓周期`} subtitle="每只股票所有已闭合周期聚合；当前开放周期单独标记"><Table rows={analysis[id]?.by_symbol??[]} columns={[["symbol","证券"],["closed_cycles","闭合"],["wins","赢"],["losses","亏"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","已实现盈亏"],["open_cycle","持仓中"],["open_estimated_pnl","浮动盈亏"]]} format={{symbol:(v)=>security(v,names),win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,open_cycle:(v)=>v?"是":"否",open_estimated_pnl:money}}/></Panel>)}</div><div className="three-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 已闭合周期明细`} subtitle="用于核验每次从建仓到清仓的真实结果"><Table rows={(analysis[id]?.closed_cycles??[]).slice(0,100)} columns={[["entry_date","建仓日"],["exit_date","清仓日"],["symbol","证券"],["pnl","净盈亏"],["return_rate","周期收益"],["dividend_income","分红"],["fees","费用"],["fill_count","成交笔数"],["result","结果"]]} format={{symbol:(v)=>security(v,names),pnl:money,return_rate:pct,dividend_income:money,fees:money}}/></Panel>)}</div></>;
 }
 
 function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
@@ -217,7 +274,9 @@ function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
   const commonStart = text(challenger.comparison.common_start_date);
   const commonEnd = text(challenger.comparison.common_end_date);
   const replayRows = (challenger.historical_execution.strategies??[]).map((row)=>({strategy_id:row.strategy_id,...(row.summary??{})}));
-  return <><section className="kpis"><Kpi label="公平 PK 状态" value={text(challenger.comparison.status)} note={Boolean(challenger.comparison.ready)?"已达到最低观察期":"暂不判定胜负"} accent={!Boolean(challenger.comparison.ready)}/><Kpi label="共同观察日" value={String(commonDays)} note="仅使用两个账户均有快照的交易日"/><Kpi label="共同区间" value={commonStart==="—"?"等待重叠数据":`${commonStart} → ${commonEnd}`} note="共同首日净值统一归一为 1"/><Kpi label="风险比较口径" value="10% 年化波动" note="仓位不同不能只比较原始收益"/></section><Panel title="M5.3 完整历史执行重放" subtitle={`${text(challenger.historical_execution.start_date)} → ${text(challenger.historical_execution.end_date)} · ${text(challenger.historical_execution.evidence_status)} · 与模拟盘共用 PaperBroker`}><Table rows={replayRows} columns={[["strategy_id","策略"],["observation_days","交易日"],["total_return","累计收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"],["order_count","订单"],["fill_count","成交"],["transaction_cost","交易成本"],["reconciled","对账"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct,transaction_cost:money}}/></Panel><div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title="双策略公平 PK 基线" subtitle="共同日期、净值归一、账户净收益；至少20个共同交易日后才形成结论"><Table rows={challenger.comparison.metrics??[]} columns={[["account_id","账户"],["observation_days","共同日"],["total_return","共同区间收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["risk_normalized_return","风险归一收益"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,risk_normalized_return:pct,sharpe:num,max_drawdown:pct}}/></Panel></div></>;
+  const globalView=challenger.candidate_observation?.global_strategy_view??challenger.comparison;
+  const strategyCount=Number(globalView.strategy_count??globalView.metrics?.length??0);
+  return <><section className="kpis"><Kpi label="候选评审口径" value="版本独立" note="每个候选分别与两个固定对照计算"/><Kpi label="当前候选共同日" value={String(commonDays)} note="不受其他候选加入影响"/><Kpi label="当前共同区间" value={commonStart==="—"?"等待重叠数据":`${commonStart} → ${commonEnd}`} note="用于候选20/60日门禁"/><Kpi label="全局策略数量" value={String(strategyCount)} note="图表与全局表不隐藏历史策略"/></section><Panel title="M5.3 完整历史执行重放" subtitle={`${text(challenger.historical_execution.start_date)} → ${text(challenger.historical_execution.end_date)} · ${text(challenger.historical_execution.evidence_status)} · 与模拟盘共用 PaperBroker`}><Table rows={replayRows} columns={[["strategy_id","策略"],["observation_days","交易日"],["total_return","累计收益"],["average_gross_exposure","平均仓位"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"],["order_count","订单"],["fill_count","成交"],["transaction_cost","交易成本"],["reconciled","对账"]]} format={{total_return:pct,average_gross_exposure:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct,transaction_cost:money}}/></Panel><div className="two-col"><Panel title="前瞻观察证据" subtitle="预测生成5个交易日后自动成熟标签"><Table rows={challenger.forward.daily??[]} columns={[["observation_date","观察日"],["maturity_date","成熟日"],["rank_ic","Rank IC"],["selected_excess_return","Top-K超额"],["sample_count","样本"]]} format={{rank_ic:num,selected_excess_return:pct}}/></Panel><Panel title={`${strategyCount}策略公平 PK`} subtitle="全局表展示每个策略自身完整运行区间；候选晋级仍使用各版本独立共同日"><Table rows={globalView.metrics??[]} columns={[["account_id","账户"],["start_date","开始日"],["end_date","结束日"],["observation_days","运行日"],["total_return","累计收益"],["annualized_volatility","年化波动"],["sharpe","夏普"],["max_drawdown","最大回撤"]]} format={{total_return:pct,annualized_volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel></div></>;
 }
 
 const chartPalette: Record<string, { label: string; color: string }> = {
@@ -226,32 +285,33 @@ const chartPalette: Record<string, { label: string; color: string }> = {
 };
 
 function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["comparison"] }) {
-  const histories = comparison.histories??{};
+  const histories = comparison.independent_histories??comparison.histories??{};
   const series = Object.entries(histories).map(([accountId, rows]) => ({
     accountId,
-    label: chartPalette[accountId]?.label??accountId,
+    label: chartPalette[accountId]?.label??(accountId.startsWith("qlib_candidate_")?"Qlib 候选者":accountId),
     color: chartPalette[accountId]?.color??"#7e91e8",
     rows: rows as Row[],
   })).filter((series)=>series.rows.length > 0);
-  return <div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="共同首日统一为 100；用于观察累计相对表现" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`}/><LineComparisonChart title="每日收益率波动" subtitle="按账户净权益逐日计算；虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine/></div>;
+  return <div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine/></div>;
 }
 
 function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean }) {
   const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
-  const points = series.flatMap((item)=>item.rows.map((row, index)=>({ index, value: Number(row[valueKey]) })).filter((point)=>Number.isFinite(point.value)));
-  if (!points.length) return <Panel title={title} subtitle={subtitle}><p className="empty">等待两个账户产生共同日度权益快照</p></Panel>;
-  const count = Math.max(...series.map((item)=>item.rows.length), 1);
+  const dates = [...new Set(series.flatMap((item)=>item.rows.map((row)=>text(row.trade_date))))].sort();
+  const dateIndex = new Map(dates.map((date,index)=>[date,index]));
+  const points = series.flatMap((item)=>item.rows.map((row)=>({ date:text(row.trade_date), value:Number(row[valueKey]) })).filter((point)=>Number.isFinite(point.value)));
+  if (!points.length) return <Panel title={title} subtitle={subtitle}><p className="empty">等待账户产生实际运行日权益快照</p></Panel>;
+  const count = Math.max(dates.length, 1);
   const rawMin = Math.min(...points.map((point)=>point.value), zeroLine ? 0 : Infinity);
   const rawMax = Math.max(...points.map((point)=>point.value), zeroLine ? 0 : -Infinity);
   const padding = Math.max((rawMax - rawMin) * 0.12, zeroLine ? 0.001 : 0.005);
   const min = rawMin - padding, max = rawMax + padding, span = Math.max(max - min, 0.000001);
-  const x = (index: number) => left + (count <= 1 ? 0 : index / (count - 1)) * (width - left - right);
+  const x = (date: string) => left + (count <= 1 ? 0 : Number(dateIndex.get(date)??0) / (count - 1)) * (width - left - right);
   const y = (value: number) => top + (max - value) / span * (height - top - bottom);
-  const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(index).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
-  const labels = series[0]?.rows??[];
+  const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(text(row.trade_date)).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
   const last = series.map((item)=>({ ...item, value: Number(item.rows.at(-1)?.[valueKey]??0) }));
   const ticks = [0, 0.5, 1];
-  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=><span key={item.accountId}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></span>)}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{series.map((item)=><path key={item.accountId} d={path(item.rows)} fill="none" stroke={item.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>)}<text x={left} y={height-8}>{text(labels[0]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(labels.at(-1)?.trade_date)}</text></svg></Panel>;
+  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=><span key={item.accountId}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></span>)}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{series.map((item)=><path key={item.accountId} d={path(item.rows)} fill="none" stroke={item.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>)}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
 }
 
 function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {
@@ -287,7 +347,8 @@ function Operations({ bank, execution, operations, acceptance, names, onRefresh 
   const [preview, setPreview] = useState(operations.preview);
   const inspect = async () => setPreview(await json(`/api/tasks/daily-run/preview?trade_date=${previewDate}`));
   return <><section className="ops-banner"><div><i/><small>SERVER SCHEDULER</small><h2>每日 {bank.scheduler.time}</h2><p>服务端持续运行 · Asia/Shanghai · 非 Codex 自动任务</p></div><span>{bank.scheduler.enabled?"已启用":"已暂停"}</span></section>
-    <section className="kpis"><Kpi label="综合账户权益" value={money(execution.portfolio?.equity)} note={execution.account_id}/><Kpi label="实际 / 目标仓位" value={`${pct(execution.metrics.gross_exposure)} / ${pct(execution.metrics.target_exposure)}`} note="收盘实际与模型目标"/><Kpi label="累计收益 / 回撤" value={`${pct((Number(execution.portfolio?.equity??1_000_000)/1_000_000)-1)} / ${pct(execution.metrics.drawdown)}`} note={`${execution.history.length}个日度快照`}/><Kpi label="账户风险状态" value={text(execution.risk_state.effective_state)} note={text(execution.risk_state.reason_code)} accent={text(execution.risk_state.effective_state)!=="NORMAL"}/></section>
+    <section className="kpis"><Kpi label="综合账户权益" value={money(execution.portfolio?.equity)} note={execution.account_id}/><Kpi label="实际 / 可执行目标" value={`${pct(execution.metrics.gross_exposure)} / ${pct(execution.metrics.target_exposure)}`} note={`理论目标 ${pct(execution.metrics.theoretical_target_exposure??execution.metrics.target_exposure)} · 已考虑一手约束`}/><Kpi label="累计收益 / 回撤" value={`${pct((Number(execution.portfolio?.equity??1_000_000)/1_000_000)-1)} / ${pct(execution.metrics.drawdown)}`} note={`${execution.history.length}个日度快照`}/><Kpi label="账户风险状态" value={text(execution.risk_state.effective_state)} note={text(execution.risk_state.reason_code)} accent={text(execution.risk_state.effective_state)!=="NORMAL"}/></section>
+    <Panel title="理论目标到可执行目标" subtitle="一手金额超过可分配预算的股票被剔除；释放预算优先在同一行业内重新分配"><Table rows={execution.target_adjustments??[]} columns={[["symbol","证券"],["sector","行业"],["theoretical_weight","理论权重"],["executable_weight","可执行权重"],["minimum_lot_weight","一手占账户"],["reason","调整原因"]]} format={{symbol:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),theoretical_weight:pct,executable_weight:pct,minimum_lot_weight:pct}}/></Panel>
     <section className="kpis"><Kpi label="下次自动运行" value={duration(operations.scheduler.seconds_to_next_run)} note={text(operations.scheduler.next_run)}/><Kpi label="待执行订单" value={String(operations.pending_orders.length)} note={`${text(preview.eligible_for_execution_count)}笔在所选交易日可撮合`} accent={operations.pending_orders.length>0}/><Kpi label="延期执行记录" value={String(operations.deferred_attempts.length)} note="涨跌停、T+1、现金不足"/><Kpi label="补跑预览" value={text(preview.market_session)} note={`${text(preview.trade_date)} · 只读检查`}/></section>
     <Panel title="运行保障状态" subtitle="正式交易日历、服务端调度和后台线程必须在流水线启动前可恢复"><div className="acceptance-head"><b>{text(operations.readiness.status)}</b><span><strong>{text(operations.readiness.market_session)}</strong><small>{text(operations.readiness.trade_date)} · {text(operations.readiness.repair_count)}项待自动修复</small></span><em>{Number(operations.readiness.blocking_count)>0?"存在阻断":"允许启动预检"}</em></div><div className="quality-grid">{(operations.readiness.checks??[]).map((row)=><article key={text(row.code)} className={text(row.status)==="PASS"?"pass":"warn"}><header><b>{text(row.status)}</b><span>{text(row.code)}</span></header><p>{text(row.message)}</p></article>)}</div></Panel>
     <Panel title="完整月度换仓验收" subtitle={`${acceptance.cycle_id} · 最早完成估算 ${acceptance.expected_earliest_completion}`}><div className="acceptance-head"><b>{pct(acceptance.progress)}</b><span><strong>{acceptance.status}</strong><small>观察期 {acceptance.start_date} → {acceptance.observation_date}</small></span><em>{acceptance.report_path?"验收报告已冻结":"证据积累中"}</em></div><div className="quality-grid">{acceptance.checks.map((row)=><article key={text(row.code)} className={Boolean(row.passed)?"pass":"warn"}><header><b>{Boolean(row.passed)?"PASS":"WAIT"}</b><span>{text(row.code)}</span></header><h3>{text(row.observed)} / {text(row.required)}</h3><p>{text(row.explanation)}</p></article>)}</div></Panel>
@@ -306,8 +367,8 @@ function Operations({ bank, execution, operations, acceptance, names, onRefresh 
     <Panel title="最近委托与成交" subtitle="五行业目标统一进入影子账户，真实委托保持隔离"><Table rows={execution.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel></>;
 }
 
-function Allocation({rows}:{rows:Row[]}){return <div className="allocation">{rows.map((row)=>{const m=meta[text(row.sector)];return <div key={text(row.sector)}><div className="allocation-name"><i style={{background:m.color}}/><span><b>{m.label}</b><small>{m.thesis}</small></span></div><div className="bars"><span><i style={{width:`${Number(row.budget_weight)*100}%`,background:`${m.color}55`}}/></span><span><i style={{width:`${Number(row.target_weight)*100}%`,background:m.color}}/></span></div><div className="values"><b>{pct(row.target_weight)}</b><small>预算 {pct(row.budget_weight)} · risk {pct(row.risk_degree)}</small></div></div>})}</div>}
-function SectorCards({rows,names}:{rows:Row[];names:Record<string,string>}){return <div className="sector-cards">{rows.map((row)=>{const m=meta[text(row.sector)];return <article key={text(row.sector)} style={{"--sector":m.color} as React.CSSProperties}><header><span>{m.label}</span><b>{pct(row.target_weight)}</b></header><p>{m.thesis}</p><div>{text(row.selected).split(",").map((s)=><small key={s}><b>{names[s]??"未知证券"}</b><span>{s}</span></small>)}</div><footer><span>预算 {pct(row.budget_weight)}</span><span>现金 {pct(row.cash_weight)}</span></footer></article>})}</div>}
+function Allocation({rows}:{rows:Row[]}){return <div className="allocation">{rows.map((row)=>{const m=meta[text(row.sector)];return <div key={text(row.sector)}><div className="allocation-name"><i style={{background:m.color}}/><span><b>{m.label}</b><small>{m.thesis}</small></span></div><div className="bars"><span><i style={{width:`${Number(row.target_weight)*100}%`,background:`${m.color}55`}}/></span><span><i style={{width:`${Number(row.target_weight)*100}%`,background:m.color}}/></span></div><div className="values"><b>{pct(row.target_weight)}</b><small>全局选股后的行业暴露 · 非预算约束</small></div></div>})}</div>}
+function SectorCards({rows,names}:{rows:Row[];names:Record<string,string>}){return <div className="sector-cards">{rows.map((row)=>{const m=meta[text(row.sector)];return <article key={text(row.sector)} style={{"--sector":m.color} as React.CSSProperties}><header><span>{m.label}</span><b>{pct(row.target_weight)}</b></header><p>{m.thesis}</p><div>{text(row.selected).split(",").map((s)=><small key={s}><b>{names[s]??"未知证券"}</b><span>{s}</span></small>)}</div><footer><span>实际目标暴露 {pct(row.target_weight)}</span><span>仅展示汇总</span></footer></article>})}</div>}
 function UniverseCard({universe,names}:{universe:Universe;names:Record<string,string>}){const m=meta[universe.sector];const selectedCount=universe.ranking.filter((row)=>Boolean(row.selected)).length;return <article className="universe-card" style={{"--sector":m.color} as React.CSSProperties}><header><div><span>{m.label}</span><h3>{universe.name}</h3><small>{universe.fund_code} · {universe.style}</small></div><b>{selectedCount}<small>目标持仓</small></b></header><div className="factor-chips">{Object.entries(universe.factor_weights).map(([f,w])=><span key={f}>{factorLabels[f]??f}<b>{pct(w)}</b></span>)}</div><Table rows={universe.ranking.slice(0,universe.sector==="bank"?12:10)} columns={[["rank","排名"],["symbol","证券"],["score","模型分"],["selected","目标"]]} format={{symbol:(v)=>security(v,names),score:num,selected:(v)=>v?"持有":"—"}}/></article>}
 function Evidence({sectors}:{sectors:Sectors}){return <div className="evidence"><b>证据边界</b><p>{sectors.warning}</p><span>{sectors.evidence_status}</span></div>}
 function Intro({tag,title,children}:{tag:string;title:string;children:ReactNode}){return <section className="intro"><span>{tag}</span><h2>{title}</h2><p>{children}</p></section>}

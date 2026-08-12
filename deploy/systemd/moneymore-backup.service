@@ -1,0 +1,9 @@
+[Unit]
+Description=MoneyMore local persistent-state backup
+
+[Service]
+Type=oneshot
+User=moneymore
+Group=moneymore
+WorkingDirectory=/opt/moneymore/current
+ExecStart=/opt/moneymore/current/deploy/backup.sh

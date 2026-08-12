@@ -6,8 +6,14 @@ import yaml
 
 from moneymore.config import BacktestConfig
 from moneymore.data.store import ParquetStore
+from moneymore.portfolio_constructor import (
+    adjusted_close_panel,
+    global_topk_portfolio,
+    trailing_return_correlation,
+)
 from moneymore.research.sector_model import (
     SectorDefinition,
+    build_global_factor_snapshot,
     inverse_volatility_allocation,
     research_sector,
 )
@@ -69,11 +75,18 @@ return_panel = (
     .pct_change(fill_method=None)
     .tail(60)
 )
-allocation = inverse_volatility_allocation(
-    return_panel,
-    CONFIG["allocation"]["max_sleeve_weight"],
-    CONFIG["allocation"]["minimum_sleeve_weight"],
-)
+allocation_method = str(CONFIG["allocation"]["method"])
+if allocation_method == "equal_weight":
+    sleeve_weight = 1.0 / len(return_panel.columns)
+    allocation = {str(sector): sleeve_weight for sector in return_panel.columns}
+elif allocation_method == "inverse_volatility":
+    allocation = inverse_volatility_allocation(
+        return_panel,
+        CONFIG["allocation"]["max_sleeve_weight"],
+        CONFIG["allocation"]["minimum_sleeve_weight"],
+    )
+else:
+    raise ValueError(f"unsupported allocation method: {allocation_method}")
 latest_degrees = (
     equity_frame.sort_values("date").groupby("sector", as_index=False).tail(1)
 )
@@ -102,12 +115,58 @@ for sector, budget in allocation.items():
             "sector": sector,
             "budget_weight": budget,
             "risk_degree": float(row["risk_degree"]),
-            "target_weight": budget * float(row["risk_degree"]),
-            "cash_weight": budget * (1 - float(row["risk_degree"])),
+            "target_weight": budget,
+            "cash_weight": 0.0,
             "selected": ",".join(selected),
             "evidence_status": "CURRENT_CONSTITUENT_BIASED",
         }
     )
+
+symbol_sectors = {
+    symbol: sector
+    for sector, item in CONFIG["universes"].items()
+    for symbol in item["holdings"]
+}
+bank_scores = STORE.read("bank_model_scores")
+for symbol in bank_scores["symbol"].astype(str).unique():
+    symbol_sectors.setdefault(symbol, "bank")
+global_config = CONFIG["global_selection"]
+global_scores = build_global_factor_snapshot(
+    STORE,
+    list(symbol_sectors),
+    global_config["factors"],
+)
+global_correlation = trailing_return_correlation(
+    adjusted_close_panel(STORE, list(symbol_sectors)),
+    global_scores["date"].max(),
+    int(global_config["correlation_lookback"]),
+)
+try:
+    previous_global = STORE.read("global_factor_recommendation")
+    previous_holdings = set(
+        previous_global.loc[previous_global["selected"].astype(bool), "symbol"].astype(str)
+    )
+except FileNotFoundError:
+    previous_holdings = set()
+holdings, portfolio_weights, ranked = global_topk_portfolio(
+    global_scores[["date", "symbol", "score"]],
+    previous_holdings,
+    symbol_column="symbol",
+    top_k=int(global_config["top_k"]),
+    exit_rank=int(global_config["exit_rank"]),
+    max_replacements=int(global_config["max_replacements"]),
+    minimum_weight=float(global_config["minimum_weight"]),
+    maximum_weight=float(global_config["maximum_weight"]),
+    correlation=global_correlation,
+    correlation_penalty=float(global_config["correlation_penalty"]),
+    cluster_correlation_threshold=float(global_config["cluster_correlation_threshold"]),
+    maximum_cluster_members=int(global_config["maximum_cluster_members"]),
+)
+ranked["selected"] = ranked["symbol"].astype(str).isin(holdings)
+ranked["target_weight"] = ranked["symbol"].astype(str).map(portfolio_weights).fillna(0.0)
+ranked["rank"] = ranked["global_rank"]
+ranked["sector"] = ranked["symbol"].map(symbol_sectors).fillna("unmapped")
+ranked["model_id"] = "global_multifactor_v1"
 
 STORE.merge_curated("sector_model_report", [report_frame], ["sector", "period"])
 STORE.merge_curated("sector_model_scores", [score_frame], ["sector", "date", "symbol"])
@@ -117,6 +176,11 @@ STORE.merge_curated(
     "sector_portfolio_recommendation",
     [pd.DataFrame(recommendations)],
     ["sector"],
+)
+STORE.merge_curated(
+    "global_factor_recommendation",
+    [ranked],
+    ["symbol"],
 )
 print(report_frame.to_string(index=False))
 print()
