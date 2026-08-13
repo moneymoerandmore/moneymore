@@ -61,3 +61,28 @@ def test_recent_failure_is_throttled(tmp_path: Path, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()),
     )
     assert service.check_and_launch(now + timedelta(hours=1), "TEST") is None
+
+
+def test_failed_cycle_stops_after_maximum_attempts(tmp_path: Path, monkeypatch):
+    service = WeeklyTrainingService(
+        tmp_path, tmp_path / "training.sqlite3", maximum_attempts=3
+    )
+    now = datetime(2026, 8, 13, 12, tzinfo=TZ)
+    due = latest_due_slot(now)
+    with __import__("sqlite3").connect(service.database) as connection:
+        for attempt in range(3):
+            connection.execute(
+                "INSERT INTO weekly_training_runs(schedule_key,due_at,status,source,finished_at) "
+                "VALUES (?,?,'FAILED','TEST',?)",
+                (
+                    due.strftime("%Y-%m-%d"),
+                    due.isoformat(),
+                    (now - timedelta(hours=12 - attempt)).isoformat(),
+                ),
+            )
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()),
+    )
+    assert service.check_and_launch(now, "TEST") is None
+    assert service.status()["attempts_exhausted"] is True

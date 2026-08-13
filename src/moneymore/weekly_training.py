@@ -33,6 +33,7 @@ class WeeklyTrainingService:
         hour: int = 9,
         poll_seconds: int = 60,
         retry_interval: timedelta = timedelta(hours=6),
+        maximum_attempts: int = 3,
     ) -> None:
         self.root = root
         self.database = database or root / "state" / "qlib-training.sqlite3"
@@ -40,6 +41,7 @@ class WeeklyTrainingService:
         self.hour = hour
         self.poll_seconds = poll_seconds
         self.retry_interval = retry_interval
+        self.maximum_attempts = maximum_attempts
         self.log_dir = root / "logs" / "training"
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +137,16 @@ class WeeklyTrainingService:
         schedule_key = due.strftime("%Y-%m-%d")
         if self._completed(schedule_key):
             return None
+        with sqlite3.connect(self.database) as connection:
+            attempts = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM weekly_training_runs "
+                    "WHERE schedule_key = ? AND status NOT IN ('DUPLICATE_CANCELLED')",
+                    (schedule_key,),
+                ).fetchone()[0]
+            )
+        if attempts >= self.maximum_attempts:
+            return None
         latest = self._latest(schedule_key)
         if latest and latest["status"] in {"FAILED", "INTERRUPTED"}:
             finished_at = latest.get("finished_at")
@@ -215,5 +227,13 @@ class WeeklyTrainingService:
             "latest_due_key": due.strftime("%Y-%m-%d"),
             "catch_up": True,
             "automatic_promotion": False,
+            "maximum_attempts_per_cycle": self.maximum_attempts,
+            "attempts_exhausted": sum(
+                1
+                for row in rows
+                if row.get("schedule_key") == due.strftime("%Y-%m-%d")
+                and row.get("status") != "DUPLICATE_CANCELLED"
+            )
+            >= self.maximum_attempts,
             "runs": rows,
         }

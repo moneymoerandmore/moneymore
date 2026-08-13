@@ -19,6 +19,7 @@ type Universe = {
 type Sectors = {
   latest_date: string; disclosure_date: string; evidence_status: string; warning: string;
   allocation_method: string; allocation: Row[]; report: Row[]; universes: Universe[];
+  portfolio_policy?: Row; risk_metrics?: Row;
   symbol_names: Record<string, string>;
 };
 type Execution = {
@@ -153,7 +154,7 @@ export default function Dashboard() {
   return <div className="app-shell">
     <aside>
       <div className="brand"><span>M</span><div><b>MoneyMore</b><small>MULTI-SECTOR QUANT</small></div></div>
-      <div className="system-card"><i/><small>ACTIVE SYSTEM</small><b>多行业动态组合</b><span>5 行业袖套 · 79 只研究标的</span></div>
+      <div className="system-card"><i/><small>ACTIVE SYSTEM</small><b>全局横截面组合</b><span>统一候选池 · 行业仅作归因</span></div>
       <nav>{nav.map((item, index) => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}><em>0{index + 1}</em><span>{item.label}<small>{item.note}</small></span></button>)}</nav>
       <div className="aside-foot"><i/> PAPER ONLY<br/><small>{bank.scheduler.time} · {bank.scheduler.timezone}</small></div>
     </aside>
@@ -174,9 +175,9 @@ function Overview({ sectors, execution }: { sectors: Sectors; execution: Executi
   const invested = sectors.allocation.reduce((sum, row) => sum + Number(row.target_weight), 0);
   const selected = sectors.allocation.reduce((sum, row) => sum + text(row.selected).split(",").filter(Boolean).length, 0);
   return <>
-    <section className="portfolio-hero"><div><span>COMBINED ALLOCATION</span><h2>一个账户，五套行业逻辑</h2><p>先在行业内部选股与择时，再跨行业分配风险。银行是综合组合中的防御袖套，不再是页面主体。</p><div className="hero-tags"><b>动态仓位</b><b>行业差异化</b><b>月度换仓</b><b>T+1 影子执行</b></div></div><div className="exposure"><small>当前股票总仓位</small><b>{pct(invested)}</b><div><i style={{width:`${invested*100}%`}}/></div><span>现金 {pct(1-invested)} · 候选 {selected} 只</span></div></section>
-    <section className="kpis"><Kpi label="行业袖套" value="5" note="银行 / 红利 / 有色 / 芯片 / 成长"/><Kpi label="股票目标仓位" value={pct(invested)} note="择时后实际风险暴露" accent/><Kpi label="现金缓冲" value={pct(1-invested)} note="未使用风险预算"/><Kpi label="综合影子账户" value={money(execution.portfolio?.equity)} note={`${execution.positions.length} 个已成交持仓 · ${execution.status}`}/></section>
-    <div className="two-col wide"><Panel title="整体配置全貌" subtitle="淡色为风险预算，实色为择时后的账户目标仓位"><Allocation rows={sectors.allocation}/></Panel><Panel title="今日组合决策" subtitle="从风险预算到可执行目标"><div className="decision"><strong>保持防御，分批建立风险仓位</strong><p>银行与红利承担主要配置；芯片和成长维持观察仓，有色保留周期暴露。</p>{sectors.allocation.map((row)=><div key={text(row.sector)}><i style={{background:meta[text(row.sector)].color}}/><span>{meta[text(row.sector)].label}</span><b>{pct(row.target_weight)}</b><small>{text(row.selected).split(",").length}只</small></div>)}</div></Panel></div>
+    <section className="portfolio-hero"><div><span>GLOBAL CROSS-SECTION</span><h2>一个候选池，一套全局排名</h2><p>行业不参与名额和预算。模型全局选股，组合层依据历史价格相关性限制重复风险，行业只在此处汇总展示。</p><div className="hero-tags"><b>全局Top-10</b><b>排名递减权重</b><b>相关风险簇</b><b>T+1 影子执行</b></div></div><div className="exposure"><small>当前股票总仓位</small><b>{pct(invested)}</b><div><i style={{width:`${invested*100}%`}}/></div><span>现金 {pct(1-invested)} · 候选 {selected} 只</span></div></section>
+    <section className="kpis"><Kpi label="全局持仓" value={String(selected)} note="无行业名额与预算"/><Kpi label="股票目标仓位" value={pct(invested)} note="统一账户风险预算" accent/><Kpi label="平均两两相关" value={pct(sectors.risk_metrics?.average_pair_correlation)} note="120日价格相关矩阵"/><Kpi label="有效独立下注" value={num(sectors.risk_metrics?.effective_independent_bets)} note="名义持仓经相关性折算"/></section>
+    <div className="two-col wide"><Panel title="整体配置全貌" subtitle="全局选股结果按行业标签汇总，行业不参与策略"><Allocation rows={sectors.allocation}/></Panel><Panel title="当前风险结构" subtitle="相关风险约束优先于普通换手缓冲"><div className="decision"><strong>全局排名 + 动态相关簇约束</strong><p>120日相关系数达到 {num(sectors.portfolio_policy?.cluster_correlation_threshold)} 的股票归入同一风险簇，每簇最多 {text(sectors.portfolio_policy?.maximum_cluster_members)} 只。</p>{sectors.allocation.map((row)=><div key={text(row.sector)}><i style={{background:meta[text(row.sector)].color}}/><span>{meta[text(row.sector)].label}</span><b>{pct(row.target_weight)}</b><small>{text(row.selected).split(",").length}只</small></div>)}</div></Panel></div>
     <Panel title="行业目标与候选股票" subtitle={`ETF 持仓来源披露日 ${sectors.disclosure_date}`}><SectorCards rows={sectors.allocation} names={sectors.symbol_names}/></Panel>
     <Evidence sectors={sectors}/>
   </>;
@@ -186,7 +187,7 @@ function SectorPage({ bank, sectors }: { bank: Bank; sectors: Sectors }) {
   const bankAllocation = sectors.allocation.find((row) => row.sector === "bank");
   const bankSelected = new Set(text(bankAllocation?.selected).split(",").filter(Boolean));
   const bankUniverse: Universe = { sector:"bank", name:"A股银行多因子池", fund_code:"BANK_CN", style:"value_defensive_momentum", factor_weights:{value:.471,defensive:.294,momentum:.235}, ranking:bank.latest_scores.map((row,index)=>({...row,rank:index+1,selected:bankSelected.has(text(row.symbol))})) };
-  return <><Intro tag="SECTOR PLAYBOOKS" title="不同产业，使用不同的胜率来源">不再用同一套均线评价所有股票。每个行业拥有独立因子权重、Top-K 缓冲和风险目标。</Intro><div className="sector-grid">{[bankUniverse,...sectors.universes].map((u)=><UniverseCard key={u.sector} universe={u} names={sectors.symbol_names}/>)}</div></>;
+  return <><Intro tag="DISPLAY ATTRIBUTION" title="行业页面只解释暴露，不约束交易">以下行业研究卡用于理解因子特征与风险来源；正式基线、挑战者和候选者均在全股票池统一排名，行业不拥有预算、名额或独立Top-K。</Intro><div className="sector-grid">{[bankUniverse,...sectors.universes].map((u)=><UniverseCard key={u.sector} universe={u} names={sectors.symbol_names}/>)}</div></>;
 }
 
 function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry }) {
@@ -202,7 +203,7 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
 function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
   const candidateVersions = challenger.candidate_observation?.candidates??[];
   const [selectedCandidateTag,setSelectedCandidateTag] = useState("");
-  const selectedCandidate = candidateVersions.find((row)=>row.candidate_tag===selectedCandidateTag)??candidateVersions[0];
+  const selectedCandidate = candidateVersions.find((row)=>row.candidate_tag===selectedCandidateTag)??candidateVersions.find((row)=>Boolean(row.latest_trade_date))??candidateVersions[0];
   const metrics = challenger.research.metrics??[];
   const researchGate = (challenger.research.gate??{}) as Row;
   const selected = new Set(challenger.latest.selected??[]);
@@ -244,7 +245,7 @@ function AccountColumn({ title, badge, accountId, status, equity, portfolio, tar
 
 function CandidateSwitcher({ observation, selectedTag, onSelect }: { observation:Challenger["candidate_observation"]; selectedTag:string; onSelect:(tag:string)=>void }) {
   if (!observation) return null;
-  return <div className="candidate-switcher"><b>第三列候选策略</b><select value={selectedTag} onChange={(event)=>onSelect(event.target.value)}>{(observation.candidates??[]).map((row)=><option key={row.candidate_tag} value={row.candidate_tag}>{row.candidate_tag} · {text(row.review_stage)} · {text(row.common_observation_days)}日</option>)}</select><span>下拉框只切换第三列详情；全局图表和策略表始终展示所有策略</span></div>;
+  return <div className="candidate-switcher"><b>第三列候选策略</b><select value={selectedTag} onChange={(event)=>onSelect(event.target.value)}>{(observation.candidates??[]).map((row)=><option key={row.candidate_tag} value={row.candidate_tag}>{row.candidate_tag} · {row.latest_trade_date?`${text(row.review_stage)} · ${text(row.common_observation_days)}日`:"等待首次收盘观察"}</option>)}</select><span>默认展示最近已有真实委托的候选；新模型在训练完成后的首个收盘流水线开始观察</span></div>;
 }
 
 function CandidateObservation({ challenger, selectedTag }: { challenger: Challenger; selectedTag:string }) {

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ from .multi_sector_daily import (
     run_multi_sector_daily,
 )
 from .point_in_time import materialize_point_in_time_store
+from .portfolio_constructor import adjusted_close_panel, trailing_return_correlation
 from .qlib_candidate_observer import (
     CANDIDATE_HISTORY_TABLE,
     candidate_catalog,
@@ -1234,6 +1236,19 @@ def sector_portfolio() -> dict[str, object]:
     allocation["budget_weight"] = allocation["target_weight"]
     allocation["cash_weight"] = 0.0
     allocation["risk_degree"] = allocation["sector"].map(diagnostic_risk)
+    selected_symbols = selected_global["symbol"].astype(str).tolist()
+    correlation = trailing_return_correlation(
+        adjusted_close_panel(store, selected_symbols),
+        global_recommendation["date"].max(),
+        int(config["global_selection"]["correlation_lookback"]),
+    )
+    correlation_values = correlation.values[
+        np.triu_indices(len(correlation), 1)
+    ]
+    average_correlation = float(np.nanmean(correlation_values))
+    effective_bets = len(selected_symbols) / (
+        1 + (len(selected_symbols) - 1) * average_correlation
+    )
 
     universes = []
     for sector, definition in config["universes"].items():
@@ -1258,6 +1273,12 @@ def sector_portfolio() -> dict[str, object]:
             "披露快照，历史结果存在当前成分回看偏差，不属于无偏回测。"
         ),
         "allocation_method": "global_cross_section_topk",
+        "portfolio_policy": config["global_selection"],
+        "risk_metrics": {
+            "average_pair_correlation": average_correlation,
+            "effective_independent_bets": effective_bets,
+            "selected_count": len(selected_symbols),
+        },
         "allocation": _records(allocation),
         "report": _records(report),
         "universes": universes,

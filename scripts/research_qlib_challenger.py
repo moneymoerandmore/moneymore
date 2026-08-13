@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -246,4 +247,18 @@ research_path.write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
+if CANDIDATE_TAG:
+    (research_path.parent / "_RESEARCH_COMPLETE").write_text(
+        f"completed_at={datetime.now(UTC).isoformat()}\n",
+        encoding="utf-8",
+    )
 print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+# On the Windows CUDA runtime used by the local service, Python's native-library
+# teardown can abort in ucrtbase.dll with 0xc0000409 after every artifact has
+# already been durably written.  Candidate research runs are isolated child
+# processes, so flush their output and avoid that unsafe native teardown path.
+if CANDIDATE_TAG and os.name == "nt":
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

@@ -48,6 +48,7 @@ def _write_candidate(root: Path, tag: str, rank_ic: float) -> None:
         "stability": {"seed_count": 5, "positive_seed_ratio": 0.8},
     }
     (target / "research.json").write_text(json.dumps(payload), encoding="utf-8")
+    (target / "_TRAINING_COMPLETE").write_text("test=true\n", encoding="utf-8")
 
 
 def test_candidate_catalog_ranks_versions_and_evaluates_gate(tmp_path: Path) -> None:

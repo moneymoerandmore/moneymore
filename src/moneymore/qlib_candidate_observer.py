@@ -29,6 +29,8 @@ def candidate_catalog(root: Path) -> list[dict[str, Any]]:
     if not base.exists():
         return rows
     for path in sorted(base.glob("*/research.json"), reverse=True):
+        if not (path.parent / "_TRAINING_COMPLETE").exists():
+            continue
         payload = json.loads(path.read_text(encoding="utf-8"))
         tag = str(payload.get("candidate_tag") or path.parent.name)
         metric = next(
