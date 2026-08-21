@@ -63,9 +63,15 @@ function Assert-Runtime {
     }
 }
 
+function Repair-VinextWindowsStaticPaths {
+    & $Node (Join-Path $ProjectRoot "apps\dashboard\scripts\patch-vinext-windows.mjs")
+    if ($LASTEXITCODE -ne 0) { throw "Could not prepare the dashboard production server." }
+}
+
 switch ($Action) {
     "Start" {
         Assert-Runtime
+        Repair-VinextWindowsStaticPaths
         $Existing = Get-RecordedProcess $SupervisorPidFile
         if ($Existing) { Write-Output "MoneyMore local service already running (PID=$($Existing.Id))."; break }
         Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
@@ -96,6 +102,7 @@ switch ($Action) {
     }
     "Run" {
         Assert-Runtime
+        Repair-VinextWindowsStaticPaths
         Set-Content -LiteralPath $SupervisorPidFile -Value $PID
         Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
         $Api = $null
@@ -110,7 +117,7 @@ switch ($Action) {
                 }
                 if (-not $Web -or $Web.HasExited) {
                     $Web = Start-ChildProcess "web" $Node @(
-                        $Vinext, "dev", "--hostname", "127.0.0.1", "--port", "$WebPort"
+                        $Vinext, "start", "--hostname", "127.0.0.1", "--port", "$WebPort"
                     ) (Join-Path $ProjectRoot "apps\dashboard")
                 }
                 Start-Sleep -Seconds 10

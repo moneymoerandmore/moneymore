@@ -6,6 +6,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "postinstall": "node scripts/patch-vinext-windows.mjs",
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
