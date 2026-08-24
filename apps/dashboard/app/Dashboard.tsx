@@ -22,6 +22,7 @@ type Sectors = {
   portfolio_policy?: Row; risk_metrics?: Row;
   symbol_names: Record<string, string>;
   strategy_universe?: Row; industry_catalog?: Row[]; board_catalog?: Row[];
+  strategy_constituents?: Row[];
 };
 type Execution = {
   account_id: string; status: string; trade_date?: string;
@@ -170,7 +171,7 @@ export default function Dashboard() {
       <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> 数据日 {sectors.latest_date}</span><button onClick={() => void refresh()}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "恢复中…" : "恢复并重算"}</button></div></header>
       {error && <div className="error">{error}</div>}
       {page === "overview" && <Overview sectors={sectors} execution={execution}/>}
-      {page === "sectors" && <SectorPage bank={bank} sectors={sectors}/>}
+      {page === "sectors" && <SectorPage sectors={sectors}/>}
       {page === "research" && <Research sectors={sectors} models={models}/>}
       {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></>}
       {page === "data" && <DataHealth quality={quality}/>}
@@ -192,21 +193,31 @@ function Overview({ sectors, execution }: { sectors: Sectors; execution: Executi
   </>;
 }
 
-function SectorPage({ bank, sectors }: { bank: Bank; sectors: Sectors }) {
-  const bankAllocation = sectors.allocation.find((row) => row.sector === "bank");
-  const bankSelected = new Set(text(bankAllocation?.selected).split(",").filter(Boolean));
-  const bankUniverse: Universe = { sector:"bank", name:"A股银行多因子池", fund_code:"BANK_CN", style:"value_defensive_momentum", factor_weights:{value:.471,defensive:.294,momentum:.235}, ranking:bank.latest_scores.map((row,index)=>({...row,rank:index+1,selected:bankSelected.has(text(row.symbol))})) };
-  return <><Intro tag="DISPLAY ATTRIBUTION" title="行业页面只解释暴露，不约束交易">以下行业研究卡用于理解因子特征与风险来源；正式基线、挑战者和候选者均在全股票池统一排名，行业不拥有预算、名额或独立Top-K。</Intro><div className="sector-grid">{[bankUniverse,...sectors.universes].map((u)=><UniverseCard key={u.sector} universe={u} names={sectors.symbol_names}/>)}</div></>;
+function SectorPage({ sectors }: { sectors: Sectors }) {
+  const [industry,setIndustry]=useState("全部行业");
+  const constituents=sectors.strategy_constituents??[];
+  const visible=industry==="全部行业"?constituents:constituents.filter((row)=>text(row.industry)===industry);
+  const selectedCount=constituents.filter((row)=>Boolean(row.selected)).length;
+  return <><Intro tag="CURRENT UNIVERSE" title="行业与个股已切换到当前Top1000候选集">沪深主板、创业板和科创板按最新总市值统一入池，再按证券主数据反向归类行业。行业只用于浏览和归因，不拥有预算、名额或独立Top-K。</Intro>
+    <section className="kpis"><Kpi label="候选股票" value={String(constituents.length)} note={text(sectors.strategy_universe?.universe_version)}/><Kpi label="反向行业" value={String(sectors.industry_catalog?.length??0)} note="当前证券行业标签"/><Kpi label="全局目标" value={String(selectedCount)} note="基线策略当前入选" accent/><Kpi label="当前筛选" value={String(visible.length)} note={industry}/></section>
+    <div className="two-col"><Panel title="行业候选分布" subtitle="按行业总市值排序；目标数来自当前基线全局排名"><Table rows={sectors.industry_catalog??[]} columns={[["industry","行业"],["stock_count","候选数"],["selected_count","当前目标"],["market_value","总市值（万元）"]]} format={{market_value:money}}/></Panel><Panel title="上市板块覆盖" subtitle="四个板块共同参与全局排名"><Table rows={sectors.board_catalog??[]} columns={[["board","板块"],["stock_count","候选数"],["market_value","总市值（万元）"]]} format={{market_value:money}}/></Panel></div>
+    <Panel title="当前候选集个股明细" subtitle={`显示 ${visible.length} / ${constituents.length} 只；市值排名为当前候选池排名，因子排名为基线策略全局排名`}><div className="preview-controls"><select value={industry} onChange={(event)=>setIndustry(event.target.value)}><option>全部行业</option>{(sectors.industry_catalog??[]).map((row)=><option key={text(row.industry)}>{text(row.industry)}</option>)}</select><b>{industry}</b></div><Table rows={visible} columns={[["market_cap_rank","市值排名"],["symbol","证券"],["industry","行业"],["board","板块"],["total_mv","总市值（万元）"],["global_rank","因子排名"],["factor_score","因子分"],["selected","当前目标"]]} format={{symbol:(v)=>security(v,sectors.symbol_names),total_mv:money,factor_score:num,selected:(v)=>v?"入选":"—"}}/></Panel>
+  </>;
 }
 
 function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry }) {
   const reports=sectors.report.filter((row)=>row.period==="sample_out");
-  return <><Intro tag="RESEARCH GOVERNANCE" title="回测是诊断，不是收益承诺">每个行业模型独立评估，跨行业只负责风险预算；ETF 历史持仓缺失，因此行业回看统一降级标记。</Intro>
-    <section className="kpis"><Kpi label="研究标的" value="79" note="39 银行 + 40 ETF权重股"/><Kpi label="行业模型" value="5" note="独立因子权重与择时"/><Kpi label="ETF证据状态" value="有偏诊断" note="不可视作纯样本外" accent/><Kpi label="前瞻起点" value="2026-07-27" note="此后才是新证据"/></section>
-    <Panel title="分行业历史诊断" subtitle="只用于比较风险特征，不作为建仓理由"><Table rows={reports} columns={[["sector","行业"],["cagr","年化"],["volatility","波动率"],["sharpe","夏普"],["max_drawdown","最大回撤"],["fills","成交数"]]} format={{sector:(v)=>meta[text(v)]?.label??text(v),cagr:pct,volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel>
-    <Panel title="整体配置架构" subtitle="系统当前采用的分层决策结构"><div className="architecture">{[["01","数据层","行情、估值、财务、分红、ETF披露"],["02","行业模型","五套因子模型，行业内排序"],["03","组合模型","Top-K、缓冲退出、替换约束"],["04","择时模型","波动率目标决定风险度"],["05","总账户","逆波动预算与行业边界"],["06","执行层","T+1撮合、成本与对账"]].map(([n,t,d])=><div key={n}><b>{n}</b><span><strong>{t}</strong><small>{d}</small></span></div>)}</div></Panel>
+  const constituents=sectors.strategy_constituents??[];
+  const factorRanking=[...constituents].sort((a,b)=>Number(a.global_rank??99999)-Number(b.global_rank??99999));
+  const selectedCount=constituents.filter((row)=>Boolean(row.selected)).length;
+  return <><Intro tag="RESEARCH GOVERNANCE" title="Top1000统一横截面研究体系">因子基线和Qlib模型在同一候选池全局评分，行业不参与排名和预算。组合构建只处理Top-K、换手缓冲、整手约束与相关风险簇。</Intro>
+    <section className="kpis"><Kpi label="统一研究池" value={String(constituents.length)} note="沪深主板 + 创业板 + 科创板"/><Kpi label="模型路线" value="2" note="因子基线 + Qlib GRU"/><Kpi label="当前基线目标" value={String(selectedCount)} note="全局Top-K与风险簇约束" accent/><Kpi label="新口径前瞻起点" value={text(sectors.strategy_universe?.effective_date)} note="此前历史冻结，不回刷"/></section>
+    <Panel title="当前因子基线全局排名" subtitle="所有股票使用同一截面口径；行业列仅用于解释暴露"><Table rows={factorRanking.slice(0,30)} columns={[["global_rank","全局排名"],["symbol","证券"],["industry","行业"],["board","板块"],["factor_score","因子分"],["selected","当前目标"],["target_weight","目标权重"]]} format={{symbol:(v)=>security(v,sectors.symbol_names),factor_score:num,selected:(v)=>v?"入选":"—",target_weight:pct}}/></Panel>
+    <Panel title="当前策略架构" subtitle="展示正在运行的研究与组合链路"><div className="architecture">{[["01","版本化候选池","市值Top1000，按月刷新，历史成分不回写"],["02","统一特征层","行情、估值、财务、分红和可交易性按时点对齐"],["03","并行模型层","因子模型与Qlib GRU独立评分、独立账户公平PK"],["04","全局组合层","全局Top-K、退出缓冲、单期替换限制和排名递减权重"],["05","相关风险层","120日收益相关聚类，限制同类风险重复下注"],["06","模拟执行层","T+1撮合、整手、成本、公司行为、对账与收益归因"]].map(([n,t,d])=><div key={n}><b>{n}</b><span><strong>{t}</strong><small>{d}</small></span></div>)}</div></Panel>
+    <div className="two-col"><Panel title="候选池行业分布" subtitle="反向分类只用于研究诊断，不形成行业袖套"><Table rows={(sectors.industry_catalog??[]).slice(0,30)} columns={[["industry","行业"],["stock_count","候选数"],["selected_count","当前目标"],["market_value","总市值（万元）"]]} format={{market_value:money}}/></Panel><Panel title="当前组合规则" subtitle="规则来自正在运行的全局组合构建器"><Table rows={Object.entries(sectors.portfolio_policy??{}).map(([rule,value])=>({rule,value:Array.isArray(value)?value.join(", "):value}))} columns={[["rule","规则"],["value","当前值"]]}/></Panel></div>
     <Panel title="模型版本注册表" subtitle="模型版本绑定代码、配置、股票池和数据截止日；任一内容改变都会产生新版本"><Table rows={models.versions} columns={[["version_id","版本"],["lifecycle","生命周期"],["evidence_stage","证据阶段"],["data_cutoff","数据截止"],["universe_hash","股票池指纹"],["code_hash","代码指纹"]]}/></Panel>
-    <div className="two-col"><Panel title="证据隔离" subtitle="历史诊断不能自动升级为前瞻证据"><Table rows={models.artifacts.slice(0,20)} columns={[["artifact_type","产物"],["evidence_stage","证据阶段"],["artifact_key","定位"]]}/></Panel><Panel title="信号与订单绑定" subtitle="每个信号和订单都可反查具体模型版本"><Table rows={models.bindings.slice(0,20)} columns={[["trade_date","交易日"],["binding_type","类型"],["symbol","证券"],["version_id","模型版本"]]}/></Panel></div><Evidence sectors={sectors}/></>;
+    <div className="two-col"><Panel title="证据隔离" subtitle="历史诊断不能自动升级为前瞻证据"><Table rows={models.artifacts.slice(0,20)} columns={[["artifact_type","产物"],["evidence_stage","证据阶段"],["artifact_key","定位"]]}/></Panel><Panel title="信号与订单绑定" subtitle="每个信号和订单都可反查具体模型版本"><Table rows={models.bindings.slice(0,20)} columns={[["trade_date","交易日"],["binding_type","类型"],["symbol","证券"],["version_id","模型版本"]]}/></Panel></div>
+    <Panel title="迁移前分行业历史诊断（归档）" subtitle="旧人工候选池研究结果，仅保留审计，不代表当前Top1000策略"><Table rows={reports} columns={[["sector","旧分类"],["cagr","年化"],["volatility","波动率"],["sharpe","夏普"],["max_drawdown","最大回撤"],["fills","成交数"]]} format={{sector:(v)=>meta[text(v)]?.label??text(v),cagr:pct,volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel><Evidence sectors={sectors}/></>;
 }
 
 function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {

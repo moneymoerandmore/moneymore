@@ -1228,9 +1228,32 @@ def sector_portfolio() -> dict[str, object]:
     try:
         strategy_universe = active_strategy_universe(store)
         strategy_universe_info = universe_summary(strategy_universe)
+        strategy_constituents = strategy_universe.merge(
+            global_recommendation[
+                [
+                    "symbol",
+                    "score",
+                    "global_rank",
+                    "selected",
+                    "target_weight",
+                ]
+            ],
+            on="symbol",
+            how="left",
+        ).rename(columns={"rank": "market_cap_rank", "score": "factor_score"})
+        strategy_constituents["selected"] = (
+            strategy_constituents["selected"].fillna(False).astype(bool)
+        )
+        strategy_constituents["target_weight"] = (
+            strategy_constituents["target_weight"].fillna(0.0)
+        )
         industry_catalog = _records(
-            strategy_universe.groupby("industry", as_index=False)
-            .agg(stock_count=("symbol", "count"), market_value=("total_mv", "sum"))
+            strategy_constituents.groupby("industry", as_index=False)
+            .agg(
+                stock_count=("symbol", "count"),
+                selected_count=("selected", "sum"),
+                market_value=("total_mv", "sum"),
+            )
             .sort_values("market_value", ascending=False)
         )
         board_catalog = _records(
@@ -1240,6 +1263,7 @@ def sector_portfolio() -> dict[str, object]:
         )
     except (FileNotFoundError, ValueError):
         strategy_universe_info = {}
+        strategy_constituents = pd.DataFrame()
         industry_catalog = []
         board_catalog = []
     latest_date = scores["date"].max()
@@ -1312,6 +1336,7 @@ def sector_portfolio() -> dict[str, object]:
         "strategy_universe": strategy_universe_info,
         "industry_catalog": industry_catalog,
         "board_catalog": board_catalog,
+        "strategy_constituents": _records(strategy_constituents),
         "portfolio_policy": config["global_selection"],
         "risk_metrics": {
             "average_pair_correlation": average_correlation,
