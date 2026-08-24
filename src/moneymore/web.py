@@ -62,6 +62,11 @@ from .research.governance import evaluate_bank_model_promotion
 from .research.single_stock import research_single_stock, robustness_single_stock
 from .signals import trend_decision
 from .strategy_comparison import build_fair_comparison
+from .strategy_universe import (
+    active_strategy_universe,
+    refresh_market_cap_universe,
+    universe_summary,
+)
 from .trade_cycles import analyze_trade_cycles
 from .weekly_training import WeeklyTrainingService
 
@@ -76,6 +81,10 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _composite_universe_symbols(store: ParquetStore) -> list[str]:
+    try:
+        return active_strategy_universe(store)["symbol"].astype(str).tolist()
+    except (FileNotFoundError, ValueError):
+        pass
     sector_config = yaml.safe_load(
         (ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
     )
@@ -334,6 +343,7 @@ class TaskService:
     def preview(self, trade_date: str) -> dict[str, object]:
         step_names = [
             "bank_pipeline",
+            "strategy_universe_refresh",
             "composite_daily_basic",
             "sector_research",
             "multi_sector_execution",
@@ -796,6 +806,14 @@ class TaskService:
             self._run_step(
                 run_id,
                 trade_date,
+                "strategy_universe_refresh",
+                lambda: refresh_market_cap_universe(
+                    provider, store, trade_date
+                ),
+            )
+            self._run_step(
+                run_id,
+                trade_date,
                 "composite_daily_basic",
                 lambda: sync_daily_basic_universe(
                     provider,
@@ -827,7 +845,7 @@ class TaskService:
                     check=True,
                     capture_output=True,
                     text=True,
-                    timeout=300,
+                    timeout=900,
                 )
             )
             def execute_multi_sector() -> Any:
@@ -1207,6 +1225,23 @@ def sector_portfolio() -> dict[str, object]:
     config = yaml.safe_load(
         (ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
     )
+    try:
+        strategy_universe = active_strategy_universe(store)
+        strategy_universe_info = universe_summary(strategy_universe)
+        industry_catalog = _records(
+            strategy_universe.groupby("industry", as_index=False)
+            .agg(stock_count=("symbol", "count"), market_value=("total_mv", "sum"))
+            .sort_values("market_value", ascending=False)
+        )
+        board_catalog = _records(
+            strategy_universe.groupby("board", as_index=False)
+            .agg(stock_count=("symbol", "count"), market_value=("total_mv", "sum"))
+            .sort_values("market_value", ascending=False)
+        )
+    except (FileNotFoundError, ValueError):
+        strategy_universe_info = {}
+        industry_catalog = []
+        board_catalog = []
     latest_date = scores["date"].max()
     latest_scores = scores.loc[scores["date"] == latest_date].copy()
     latest_targets = targets.loc[targets["date"] == targets["date"].max()].copy()
@@ -1267,12 +1302,16 @@ def sector_portfolio() -> dict[str, object]:
         "status": "PAPER_RESEARCH_ONLY",
         "latest_date": str(latest_date)[:10],
         "disclosure_date": str(config["disclosure_date"]),
-        "evidence_status": config["evidence_status"],
+        "evidence_status": "FORWARD_MARKET_CAP_SNAPSHOT",
         "warning": (
-            "Tushare 当前权限不含历史 ETF 持仓。行业池来自 2026-06-30 "
-            "披露快照，历史结果存在当前成分回看偏差，不属于无偏回测。"
+            "统一候选池按当前总市值选取沪深主板、创业板和科创板前1000只。"
+            "行业采用Tushare当前分类，仅用于选股后的展示和风险归因；"
+            "候选池迁移前的历史收益保持冻结，迁移后证据从生效日继续累计。"
         ),
         "allocation_method": "global_cross_section_topk",
+        "strategy_universe": strategy_universe_info,
+        "industry_catalog": industry_catalog,
+        "board_catalog": board_catalog,
         "portfolio_policy": config["global_selection"],
         "risk_metrics": {
             "average_pair_correlation": average_correlation,

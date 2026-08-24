@@ -27,6 +27,7 @@ from .qlib_challenger import (
 from .qlib_exposure import dynamic_target_exposure, previous_report_exposure
 from .qlib_governance import bootstrap_qlib_release
 from .signals import SignalDecision, write_signal_artifact
+from .strategy_universe import execution_strategy_id
 
 QLIB_CHALLENGER_ACCOUNT = "qlib_gru_shadow"
 QLIB_CHALLENGER_STRATEGY = "qlib_gru_alpha360_v1"
@@ -65,7 +66,7 @@ def run_qlib_challenger_daily(
         (root / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
     )
     model_id = str(challenger_config["model_id"])
-    strategy_id = strategy_id or model_id
+    strategy_id = execution_strategy_id(strategy_id or model_id, store)
     model_dir = model_dir or root / "state" / "qlib-challenger" / "models"
     model_path = model_dir / f"{model_id}.pkl"
     ensemble_path = model_dir / f"{model_id}_ensemble.json"
@@ -118,6 +119,7 @@ def run_qlib_challenger_daily(
         label_horizon=int(challenger_config["label_horizon"]),
         require_label=False,
         feature_count=int(challenger_config["model"]["d_feat"]),
+        live_as_of=trade_date,
     )
     cutoff = pd.Timestamp(trade_date)
     frame = frame.loc[
@@ -197,6 +199,7 @@ def run_qlib_challenger_daily(
             report_dir,
             {
                 **selection_metadata,
+                "execution_strategy_id": strategy_id,
                 "research_gate_passed": research_gate_passed,
                 "deployment_mode": deployment.get("execution_mode"),
                 "observation_reason": "EXPERIMENTAL_PAPER_DISABLED",
@@ -303,6 +306,7 @@ def run_qlib_challenger_daily(
         report_dir,
         {
             **selection_metadata,
+            "execution_strategy_id": strategy_id,
             "research_gate_passed": research_gate_passed,
             "deployment_mode": deployment.get("execution_mode"),
             "promotion_eligible": research_gate_passed
@@ -357,7 +361,7 @@ def _scheduled_portfolio(
         for path in sorted(report_dir.glob("*.json")):
             report = json.loads(path.read_text(encoding="utf-8"))
             if (
-                report.get("model_id") == model_id
+                report.get("execution_strategy_id", report.get("model_id")) == model_id
                 and str(report.get("trade_date", "")) < trade_date
                 and report.get("selected")
             ):

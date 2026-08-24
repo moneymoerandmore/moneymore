@@ -17,6 +17,7 @@ from moneymore.research.sector_model import (
     inverse_volatility_allocation,
     research_sector,
 )
+from moneymore.strategy_universe import active_strategy_universe
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ParquetStore(ROOT / "data")
@@ -122,14 +123,13 @@ for sector, budget in allocation.items():
         }
     )
 
-symbol_sectors = {
-    symbol: sector
-    for sector, item in CONFIG["universes"].items()
-    for symbol in item["holdings"]
-}
-bank_scores = STORE.read("bank_model_scores")
-for symbol in bank_scores["symbol"].astype(str).unique():
-    symbol_sectors.setdefault(symbol, "bank")
+active_universe = active_strategy_universe(STORE)
+symbol_sectors = dict(
+    zip(
+        active_universe["symbol"].astype(str),
+        active_universe["industry"].fillna("未分类").astype(str),
+    )
+)
 global_config = CONFIG["global_selection"]
 global_scores = build_global_factor_snapshot(
     STORE,

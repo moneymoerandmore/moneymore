@@ -21,6 +21,7 @@ from .execution.risk_state import (
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle, freeze_passed_report
 from .signals import SignalDecision, write_signal_artifact
+from .strategy_universe import active_strategy_universe, execution_strategy_id, universe_summary
 
 ROOT = Path(__file__).resolve().parents[2]
 MULTI_SECTOR_ACCOUNT = "multi_sector_shadow"
@@ -187,6 +188,7 @@ def run_multi_sector_daily(
     signal_dir: str | Path,
     report_dir: str | Path,
 ) -> MultiSectorDailyResult:
+    execution_model_id = execution_strategy_id(MULTI_SECTOR_STRATEGY, store)
     broker.initialize_account(config.initial_cash, MULTI_SECTOR_ACCOUNT)
     recommendation = store.read("global_factor_recommendation")
     selected_recommendation = recommendation.loc[
@@ -370,7 +372,7 @@ def run_multi_sector_daily(
             continue
         target = constrained
         decision = SignalDecision(
-            strategy_id=MULTI_SECTOR_STRATEGY,
+            strategy_id=execution_model_id,
             symbol=symbol,
             as_of_date=trade_date,
             target_weight=target,
@@ -523,10 +525,22 @@ def run_multi_sector_daily(
         },
         "reconciliation": reconciliation,
         "model_version": asdict(version),
+        "strategy_universe": universe_summary(active_strategy_universe(store)),
         "created_at": datetime.now(UTC).isoformat(),
         "report_path": str(target),
     }
-    if not target.exists():
+    should_replace = False
+    if target.exists():
+        existing = json.loads(target.read_text(encoding="utf-8"))
+        should_replace = (
+            existing.get("strategy_universe", {}).get("universe_version")
+            != payload["strategy_universe"]["universe_version"]
+            or (
+                existing.get("status") in {"BLOCKED_DATA_QUALITY", "SUSPENDED_RISK"}
+                and payload["status"] != existing.get("status")
+            )
+        )
+    if not target.exists() or should_replace:
         temporary = target.with_suffix(".json.tmp")
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -534,7 +548,6 @@ def run_multi_sector_daily(
         )
         temporary.replace(target)
     else:
-        existing = json.loads(target.read_text(encoding="utf-8"))
         payload["created_at"] = existing["created_at"]
     _persist_daily_analytics(
         store,

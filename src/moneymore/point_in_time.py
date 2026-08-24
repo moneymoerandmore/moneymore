@@ -81,6 +81,29 @@ def build_constituent_snapshots(
     disclosure = pd.Timestamp(str(config["disclosure_date"]))
     available_from = max(disclosure + pd.Timedelta(days=1), captured_at)
     rows: list[dict[str, object]] = []
+    try:
+        from .strategy_universe import active_strategy_universe
+
+        active = active_strategy_universe(store, captured_at.strftime("%Y%m%d"))
+        for row in active.to_dict("records"):
+            rows.append(
+                {
+                    "universe": str(row["universe"]),
+                    "symbol": str(row["symbol"]),
+                    "source": "MARKET_CAP_TOP1000",
+                    "source_fund": None,
+                    "source_weight": None,
+                    "disclosure_date": str(row["market_data_date"]),
+                    "captured_at": captured_at.strftime("%Y%m%d"),
+                    "available_from": captured_at.strftime("%Y%m%d"),
+                    "valid_to": None,
+                    "point_in_time": True,
+                    "evidence_status": "FORWARD_VALID_FROM_CAPTURE",
+                }
+            )
+        return pd.DataFrame(rows)
+    except (FileNotFoundError, ValueError):
+        pass
     for universe, item in config["universes"].items():
         for symbol, weight in item["holdings"].items():
             rows.append(

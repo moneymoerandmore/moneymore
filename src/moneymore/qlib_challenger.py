@@ -63,10 +63,17 @@ def build_challenger_dataset(
     label_horizon: int = 5,
     require_label: bool = True,
     feature_count: int = 6,
+    live_as_of: str | None = None,
 ) -> pd.DataFrame:
     panels = []
     for symbol, sector in sorted(symbol_sectors.items()):
         bars = load_total_return_stock_bars(store, symbol).sort_values("date").copy()
+        if live_as_of is not None:
+            bars = bars.loc[pd.to_datetime(bars["date"]) <= pd.Timestamp(live_as_of)]
+            # Price features need at most a 60-day rolling window and the GRU
+            # needs sequence_length observations.  Keep a small safety margin
+            # instead of expanding the full history for every live symbol.
+            bars = bars.tail(sequence_length + 65).copy()
         close = bars["raw_close"].astype(float)
         previous = close.shift(1)
         feature_frame = pd.DataFrame(
@@ -213,6 +220,13 @@ def evaluate_predictions(
 
 
 def challenger_universe(root: Path, store: ParquetStore) -> dict[str, str]:
+    try:
+        from .strategy_universe import active_strategy_universe
+
+        active = active_strategy_universe(store)
+        return dict(zip(active["symbol"].astype(str), active["industry"].astype(str)))
+    except (FileNotFoundError, ValueError):
+        pass
     config = yaml.safe_load(
         (root / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
     )
