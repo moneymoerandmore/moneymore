@@ -23,7 +23,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .bank_daily import BANK_ACCOUNT, run_bank_daily_pipeline
 from .config import BacktestConfig
-from .data.fundamental_sync import sync_daily_basic_universe
+from .data.fundamental_sync import (
+    sync_daily_basic_universe,
+    sync_missing_target_fundamentals,
+)
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .data.tushare_provider import TushareProvider
@@ -104,6 +107,15 @@ def _composite_universe_symbols(store: ParquetStore) -> list[str]:
         membership.loc[membership["date"] == latest_date, "ts_code"].astype(str)
     )
     return sorted(symbols)
+
+
+def _selected_factor_symbols(store: ParquetStore) -> list[str]:
+    recommendation = store.read("global_factor_recommendation")
+    return sorted(
+        recommendation.loc[
+            recommendation["selected"].astype(bool), "symbol"
+        ].astype(str)
+    )
 
 
 def _next_open_trade_date(store: ParquetStore, trade_date: str) -> str | None:
@@ -346,6 +358,7 @@ class TaskService:
             "strategy_universe_refresh",
             "composite_daily_basic",
             "sector_research",
+            "selected_fundamental_backfill",
             "multi_sector_execution",
             "qlib_challenger_execution",
             "qlib_candidate_observation",
@@ -848,6 +861,33 @@ class TaskService:
                     timeout=900,
                 )
             )
+            strategy_failures: list[str] = []
+            try:
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "selected_fundamental_backfill",
+                    lambda: sync_missing_target_fundamentals(
+                        provider,
+                        store,
+                        _selected_factor_symbols(store),
+                        trade_date,
+                    ),
+                )
+            except Exception as fundamental_error:  # noqa: BLE001
+                strategy_failures.append(
+                    "selected_fundamental_backfill: "
+                    f"{type(fundamental_error).__name__}: {fundamental_error}"
+                )
+                self._notify(
+                    "ERROR",
+                    "TARGET_FUNDAMENTAL_BACKFILL_FAILED",
+                    "新目标股基本面补齐失败",
+                    str(fundamental_error),
+                    trade_date=trade_date,
+                    run_id=run_id,
+                )
+
             def execute_multi_sector() -> Any:
                 value = run_multi_sector_daily(
                     store=store,
@@ -876,12 +916,19 @@ class TaskService:
                     )
                 return value
 
-            _, multi_result = self._run_step(
-                run_id,
-                trade_date,
-                "multi_sector_execution",
-                execute_multi_sector,
-            )
+            multi_result = None
+            try:
+                _, multi_result = self._run_step(
+                    run_id,
+                    trade_date,
+                    "multi_sector_execution",
+                    execute_multi_sector,
+                )
+            except Exception as multi_error:  # noqa: BLE001
+                strategy_failures.append(
+                    "multi_sector_execution: "
+                    f"{type(multi_error).__name__}: {multi_error}"
+                )
             deferred = (
                 []
                 if multi_result is None
@@ -901,10 +948,8 @@ class TaskService:
                     trade_date=trade_date,
                     run_id=run_id,
                 )
-            try:
-                self._run_step(
-                    run_id,
-                    trade_date,
+            independent_steps = [
+                (
                     "qlib_challenger_execution",
                     lambda: run_qlib_challenger_daily(
                         root=ROOT,
@@ -915,10 +960,8 @@ class TaskService:
                         signal_dir=STATE / "qlib-challenger-signals",
                         report_dir=STATE / "qlib-challenger-shadow",
                     ),
-                )
-                self._run_step(
-                    run_id,
-                    trade_date,
+                ),
+                (
                     "qlib_candidate_observation",
                     lambda: run_candidate_queue_daily(
                         root=ROOT,
@@ -927,40 +970,34 @@ class TaskService:
                         config=config,
                         trade_date=trade_date,
                     ),
-                )
-                self._run_step(
-                    run_id,
-                    trade_date,
+                ),
+                (
                     "qlib_drift_monitoring",
-                    lambda: evaluate_qlib_drift(
-                        ROOT,
-                        store,
-                        broker,
-                        trade_date,
-                    ),
-                )
-                self._run_step(
-                    run_id,
-                    trade_date,
+                    lambda: evaluate_qlib_drift(ROOT, store, broker, trade_date),
+                ),
+                (
                     "qlib_long_term_review",
-                    lambda: evaluate_long_term_review(
-                        ROOT,
-                        store,
-                        broker,
-                        trade_date,
-                    ),
-                )
-            except Exception as challenger_error:  # noqa: BLE001
-                self._notify(
-                    "WARN",
-                    "QLIB_CHALLENGER_FAILED",
-                    "Qlib挑战账户运行失败",
-                    (
-                        f"{type(challenger_error).__name__}: "
-                        f"{challenger_error}; 原因子账户不受影响"
-                    ),
-                    trade_date=trade_date,
-                    run_id=run_id,
+                    lambda: evaluate_long_term_review(ROOT, store, broker, trade_date),
+                ),
+            ]
+            for step_name, operation in independent_steps:
+                try:
+                    self._run_step(run_id, trade_date, step_name, operation)
+                except Exception as strategy_error:  # noqa: BLE001
+                    detail = f"{type(strategy_error).__name__}: {strategy_error}"
+                    strategy_failures.append(f"{step_name}: {detail}")
+                    self._notify(
+                        "WARN",
+                        "INDEPENDENT_STRATEGY_STEP_FAILED",
+                        f"独立策略步骤失败：{step_name}",
+                        f"{detail}; 其他策略继续运行",
+                        trade_date=trade_date,
+                        run_id=run_id,
+                        dedupe_key=f"{trade_date}:{step_name}:failed",
+                    )
+            if strategy_failures:
+                raise RuntimeError(
+                    "independent strategy failures: " + " | ".join(strategy_failures)
                 )
             prior_failure = any(
                 row["id"] != run_id

@@ -11,6 +11,69 @@ from .quality import (
 from .store import ParquetStore
 
 
+def sync_missing_target_fundamentals(
+    provider: MarketDataProvider,
+    store: ParquetStore,
+    symbols: list[str],
+    end_date: str,
+    start_date: str = "20100101",
+) -> dict[str, object]:
+    """Backfill financial/dividend coverage for newly selected portfolio names."""
+    requested = sorted(set(symbols))
+    try:
+        financial = store.read("fina_indicator", columns=["ts_code"])
+        financial_covered = set(financial["ts_code"].astype(str))
+    except FileNotFoundError:
+        financial_covered = set()
+    try:
+        dividends = store.read("dividend", columns=["ts_code"])
+        dividend_covered = set(dividends["ts_code"].astype(str))
+    except FileNotFoundError:
+        dividend_covered = set()
+    missing = sorted(
+        symbol
+        for symbol in requested
+        if symbol not in financial_covered or symbol not in dividend_covered
+    )
+    captured = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    results: list[dict[str, object]] = []
+    for symbol in missing:
+        key = symbol.replace(".", "_")
+        saved_financial = 0
+        saved_dividend = 0
+        if symbol not in financial_covered:
+            indicators = provider.financial_indicators(symbol, start_date, end_date)
+            validate_financial_indicators(indicators)
+            store.save_snapshot(
+                "fina_indicator",
+                indicators,
+                provider.name,
+                ["ts_code", "ann_date", "end_date"],
+                f"{key}_{start_date}_{end_date}_{captured}",
+            )
+            saved_financial = len(indicators)
+        if symbol not in dividend_covered:
+            dividend = provider.dividends(symbol)
+            if not dividend.empty:
+                validate_dividends(dividend)
+                store.save_snapshot(
+                    "dividend",
+                    dividend,
+                    provider.name,
+                    ["ts_code", "end_date", "ann_date", "div_proc"],
+                    f"{key}_{captured}",
+                )
+                saved_dividend = len(dividend)
+        results.append(
+            {
+                "symbol": symbol,
+                "fina_indicator": saved_financial,
+                "dividend": saved_dividend,
+            }
+        )
+    return {"requested": len(requested), "backfilled": len(missing), "rows": results}
+
+
 def sync_daily_basic_universe(
     provider: MarketDataProvider,
     store: ParquetStore,

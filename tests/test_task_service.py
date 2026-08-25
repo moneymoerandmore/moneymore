@@ -91,8 +91,10 @@ def test_daily_run_preview_is_read_only_and_marks_resume_steps(tmp_path: Path):
     assert preview["prior_run_count"] == 0
     assert preview["steps"] == [
         {"step_name": "bank_pipeline", "action": "SKIP_COMPLETED"},
+        {"step_name": "strategy_universe_refresh", "action": "RUN"},
         {"step_name": "composite_daily_basic", "action": "RUN"},
         {"step_name": "sector_research", "action": "RUN"},
+        {"step_name": "selected_fundamental_backfill", "action": "RUN"},
         {"step_name": "multi_sector_execution", "action": "RUN"},
         {"step_name": "qlib_challenger_execution", "action": "RUN"},
         {"step_name": "qlib_candidate_observation", "action": "RUN"},
