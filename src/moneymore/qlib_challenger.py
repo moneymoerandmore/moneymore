@@ -14,6 +14,8 @@ from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .portfolio_constructor import global_topk_portfolio, trailing_return_correlation
 
+_LIVE_DATASET_CACHE: dict[tuple[object, ...], pd.DataFrame] = {}
+
 
 @dataclass(frozen=True)
 class ChallengerMetrics:
@@ -65,15 +67,58 @@ def build_challenger_dataset(
     feature_count: int = 6,
     live_as_of: str | None = None,
 ) -> pd.DataFrame:
+    cache_key: tuple[object, ...] | None = None
+    if live_as_of is not None:
+        cache_key = (
+            str(store.root.resolve()),
+            live_as_of,
+            tuple(sorted(symbol_sectors)),
+            sequence_length,
+            label_horizon,
+            require_label,
+            feature_count,
+        )
+        cached = _LIVE_DATASET_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
     panels = []
+    live_bars: dict[str, pd.DataFrame] = {}
+    if live_as_of is not None:
+        requested = sorted(symbol_sectors)
+        market = store.read(
+            "daily",
+            columns=[
+                "ts_code", "trade_date", "open", "high", "low", "close",
+                "vol", "amount",
+            ],
+            filters=[("ts_code", "in", requested)],
+        )
+        market = market.loc[market["trade_date"].astype(str) <= live_as_of].copy()
+        market = (
+            market.sort_values(["ts_code", "trade_date"])
+            .groupby("ts_code", as_index=False, group_keys=False)
+            .tail(sequence_length + 65)
+            .rename(
+                columns={
+                    "trade_date": "date",
+                    "open": "raw_open",
+                    "high": "raw_high",
+                    "low": "raw_low",
+                    "close": "raw_close",
+                }
+            )
+        )
+        live_bars = {
+            str(symbol): frame.copy()
+            for symbol, frame in market.groupby("ts_code", sort=False)
+        }
     for symbol, sector in sorted(symbol_sectors.items()):
-        bars = load_total_return_stock_bars(store, symbol).sort_values("date").copy()
-        if live_as_of is not None:
-            bars = bars.loc[pd.to_datetime(bars["date"]) <= pd.Timestamp(live_as_of)]
-            # Price features need at most a 60-day rolling window and the GRU
-            # needs sequence_length observations.  Keep a small safety margin
-            # instead of expanding the full history for every live symbol.
-            bars = bars.tail(sequence_length + 65).copy()
+        if live_as_of is None:
+            bars = load_total_return_stock_bars(store, symbol).sort_values("date").copy()
+        else:
+            bars = live_bars.get(symbol, pd.DataFrame()).sort_values("date").copy()
+            if bars.empty:
+                continue
         close = bars["raw_close"].astype(float)
         previous = close.shift(1)
         feature_frame = pd.DataFrame(
@@ -119,12 +164,22 @@ def build_challenger_dataset(
     ]
     required = [*feature_names, *(["label"] if require_label else [])]
     combined = combined.dropna(subset=required)
+    # Live inference only scores the latest available cross-section.  Keeping
+    # the preceding feature-building window here made every ensemble member
+    # repeatedly index and carry tens of thousands of rows it could never use.
+    if live_as_of is not None and not combined.empty:
+        latest_live_date = combined["datetime"].max()
+        combined = combined.loc[combined["datetime"] == latest_live_date].copy()
     combined = combined.set_index(["datetime", "instrument"]).sort_index()
     features = combined[feature_names].astype("float32")
     labels = combined[["label"]].astype("float32")
     features.columns = pd.MultiIndex.from_product([["feature"], feature_names])
     labels.columns = pd.MultiIndex.from_product([["label"], ["LABEL0"]])
-    return pd.concat([features, labels], axis=1)
+    result = pd.concat([features, labels], axis=1)
+    if cache_key is not None:
+        _LIVE_DATASET_CACHE.clear()
+        _LIVE_DATASET_CACHE[cache_key] = result.copy()
+    return result
 
 
 def evaluate_predictions(

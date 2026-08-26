@@ -128,9 +128,109 @@ def build_global_factor_snapshot(
     symbols: list[str],
     factor_weights: dict[str, float],
 ) -> pd.DataFrame:
-    return build_global_factor_panel(
-        store, symbols, factor_weights, latest_only=True
+    """Build the live cross-section with bulk parquet reads.
+
+    The former implementation opened five parquet tables once per symbol. At a
+    1000-stock universe that meant thousands of full-file scans every evening.
+    This path reads each source once and retains only the rolling history needed
+    by the longest live factor.
+    """
+    requested = sorted(set(symbols))
+    daily = store.read(
+        "daily",
+        columns=["ts_code", "trade_date", "close"],
+        filters=[("ts_code", "in", requested)],
     )
+    adjustment = store.read(
+        "adj_factor",
+        columns=["ts_code", "trade_date", "adj_factor"],
+        filters=[("ts_code", "in", requested)],
+    )
+    panel = daily.merge(
+        adjustment,
+        on=["ts_code", "trade_date"],
+        how="inner",
+        validate="one_to_one",
+    ).sort_values(["ts_code", "trade_date"])
+    panel = panel.groupby("ts_code", as_index=False, group_keys=False).tail(270)
+    latest_factor = panel.groupby("ts_code")["adj_factor"].transform("last")
+    panel["signal_close"] = (
+        pd.to_numeric(panel["close"], errors="coerce")
+        * pd.to_numeric(panel["adj_factor"], errors="coerce")
+        / latest_factor
+    )
+    panel = panel.rename(columns={"ts_code": "symbol", "trade_date": "date"})
+    panel["date"] = pd.to_datetime(panel["date"], format="%Y%m%d")
+    latest_dates = panel.groupby("symbol")["date"].transform("max")
+    latest_mask = panel["date"] == latest_dates
+
+    market_columns = ["dv_ttm", "pb", "pe_ttm"]
+    basic = store.read(
+        "daily_basic",
+        columns=["ts_code", "trade_date", *market_columns],
+        filters=[("ts_code", "in", requested)],
+    ).rename(columns={"ts_code": "symbol"})
+    basic["date"] = pd.to_datetime(basic["trade_date"], format="%Y%m%d")
+    latest_by_symbol = panel.loc[latest_mask, ["symbol", "date"]].rename(
+        columns={"date": "latest_date"}
+    )
+    basic = basic.merge(latest_by_symbol, on="symbol", how="inner")
+    basic = (
+        basic.loc[basic["date"] < basic["latest_date"]]
+        .sort_values(["symbol", "date"])
+        .groupby("symbol", as_index=False)
+        .tail(1)
+        .set_index("symbol")
+    )
+    for column in market_columns:
+        panel[column] = np.nan
+        panel.loc[latest_mask, column] = panel.loc[latest_mask, "symbol"].map(
+            basic[column]
+        )
+
+    financial_columns = ["roe", "q_sales_yoy"]
+    financial = store.read(
+        "fina_indicator",
+        columns=["ts_code", "ann_date", "end_date", *financial_columns],
+        filters=[("ts_code", "in", requested)],
+    ).rename(columns={"ts_code": "symbol"})
+    financial["available_date"] = pd.to_datetime(
+        financial["ann_date"], format="%Y%m%d"
+    ) + pd.offsets.Day(1)
+    financial = financial.merge(latest_by_symbol, on="symbol", how="inner")
+    financial = (
+        financial.loc[financial["available_date"] <= financial["latest_date"]]
+        .sort_values(["symbol", "available_date", "end_date"])
+        .groupby("symbol", as_index=False)
+        .tail(1)
+        .set_index("symbol")
+    )
+    for column in financial_columns:
+        panel[column] = np.nan
+        panel.loc[latest_mask, column] = panel.loc[latest_mask, "symbol"].map(
+            financial[column]
+        )
+
+    registry = build_default_registry()
+    names = list(factor_weights)
+    computed = registry.compute(panel, names)
+    factors = computed.loc[computed["date"] == computed["date"].max()].copy()
+    for name in names:
+        if registry.get(name).direction.value == "low_is_better":
+            factors[name] = -factors[name]
+    processed = preprocess_cross_section(
+        factors,
+        names,
+        PreprocessConfig(industry_column=None, minimum_assets=5),
+    )
+    processed["score"] = 0.0
+    processed["active_weight"] = 0.0
+    for name, weight in factor_weights.items():
+        available = processed[name].notna()
+        processed.loc[available, "score"] += processed.loc[available, name] * weight
+        processed.loc[available, "active_weight"] += weight
+    processed["score"] /= processed["active_weight"].replace(0, pd.NA)
+    return processed
 
 
 def research_sector(

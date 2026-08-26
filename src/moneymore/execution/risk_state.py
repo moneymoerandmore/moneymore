@@ -37,14 +37,10 @@ def evaluate_account_risk_state(
         return RiskStateDecision(
             "SELL_ONLY", "GROSS_EXPOSURE_LIMIT", "总仓位超过上限，只允许卖出"
         )
-    cash_fraction = cash / equity if equity else 0.0
+    del cash  # Fully-invested strategies intentionally carry little idle cash.
     if drawdown <= -config.max_drawdown * 2 / 3:
         return RiskStateDecision(
             "REDUCE_ONLY", "DRAWDOWN_WARNING", "回撤进入预警区，禁止增加风险"
-        )
-    if cash_fraction < 0.10:
-        return RiskStateDecision(
-            "REDUCE_ONLY", "CASH_BUFFER_LOW", "现金低于10%，禁止增加风险"
         )
     return RiskStateDecision("NORMAL", "RISK_CHECKS_PASS", "账户风险检查通过")
 

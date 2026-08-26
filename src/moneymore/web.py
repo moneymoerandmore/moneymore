@@ -39,10 +39,12 @@ from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
 )
+from .open_execution import execute_accounts_at_open
 from .point_in_time import materialize_point_in_time_store
 from .portfolio_constructor import adjusted_close_panel, trailing_return_correlation
 from .qlib_candidate_observer import (
     CANDIDATE_HISTORY_TABLE,
+    candidate_account_id,
     candidate_catalog,
     run_candidate_queue_daily,
 )
@@ -249,6 +251,7 @@ class TaskService:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._recover_interrupted_runs()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._scheduler_loop,
@@ -256,6 +259,28 @@ class TaskService:
             daemon=True,
         )
         self._thread.start()
+
+    def _recover_interrupted_runs(self) -> None:
+        now = datetime.now(SHANGHAI).isoformat()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                """
+                UPDATE task_step_runs
+                SET status = 'FAILED', finished_at = ?,
+                    error = 'SERVICE_RESTART_INTERRUPTED'
+                WHERE status = 'RUNNING'
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                UPDATE task_runs
+                SET status = 'FAILED', finished_at = ?,
+                    error = 'SERVICE_RESTART_INTERRUPTED'
+                WHERE status IN ('QUEUED', 'RUNNING')
+                """,
+                (now,),
+            )
 
     def stop(self) -> None:
         self._stop.set()
@@ -355,6 +380,7 @@ class TaskService:
     def preview(self, trade_date: str) -> dict[str, object]:
         step_names = [
             "bank_pipeline",
+            "open_order_execution",
             "strategy_universe_refresh",
             "composite_daily_basic",
             "sector_research",
@@ -432,6 +458,7 @@ class TaskService:
         step_name: str,
         operation: Any,
         max_attempts: int = 2,
+        skip_if_completed: bool = True,
     ) -> tuple[str, Any]:
         with sqlite3.connect(self.database) as connection:
             completed = connection.execute(
@@ -443,7 +470,7 @@ class TaskService:
                 """,
                 (trade_date, step_name),
             ).fetchone()
-            if completed:
+            if completed and skip_if_completed:
                 now = datetime.now(SHANGHAI).isoformat()
                 connection.execute(
                     """
@@ -819,6 +846,27 @@ class TaskService:
             self._run_step(
                 run_id,
                 trade_date,
+                "open_order_execution",
+                lambda: execute_accounts_at_open(
+                    store=store,
+                    broker=broker,
+                    config=config,
+                    trade_date=trade_date,
+                    account_ids=[
+                        MULTI_SECTOR_ACCOUNT,
+                        QLIB_CHALLENGER_ACCOUNT,
+                        *[
+                            candidate_account_id(str(row["candidate_tag"]))
+                            for row in candidate_catalog(ROOT)
+                        ],
+                    ],
+                    audit_dir=STATE / "open-execution",
+                ),
+            )
+
+            self._run_step(
+                run_id,
+                trade_date,
                 "strategy_universe_refresh",
                 lambda: refresh_market_cap_universe(
                     provider, store, trade_date
@@ -873,6 +921,7 @@ class TaskService:
                         _selected_factor_symbols(store),
                         trade_date,
                     ),
+                    skip_if_completed=False,
                 )
             except Exception as fundamental_error:  # noqa: BLE001
                 strategy_failures.append(

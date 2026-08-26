@@ -153,6 +153,26 @@ def run_candidate_queue_daily(
                 "CANDIDATE_FORMAL_REVIEW_EVIDENCE_FROZEN",
             )
             continue
+        existing_report = (
+            root / "state" / "qlib-candidate-shadow" / tag / f"{trade_date}.json"
+        )
+        if existing_report.exists():
+            payload = json.loads(existing_report.read_text(encoding="utf-8"))
+            results.append(
+                ChallengerDailyResult(
+                    trade_date=str(payload["trade_date"]),
+                    status=str(payload["status"]),
+                    model_id=str(payload["model_id"]),
+                    selected=[str(item) for item in payload.get("selected", [])],
+                    scores=list(payload.get("scores", [])),
+                    executions=list(payload.get("executions", [])),
+                    orders=list(payload.get("orders", [])),
+                    portfolio=dict(payload.get("portfolio", {})),
+                    reconciliation=dict(payload.get("reconciliation", {})),
+                    report_path=str(existing_report),
+                )
+            )
+            continue
         results.append(
             run_candidate_daily(
                 candidate=candidate,

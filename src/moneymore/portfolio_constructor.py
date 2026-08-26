@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 
 
@@ -78,12 +77,37 @@ def trailing_return_correlation(
 
 
 def adjusted_close_panel(store: ParquetStore, symbols: list[str]) -> pd.DataFrame:
-    series = []
-    for symbol in sorted(set(symbols)):
-        bars = load_total_return_stock_bars(store, symbol).copy()
-        bars["date"] = pd.to_datetime(bars["date"])
-        series.append(bars.set_index("date")["close"].astype(float).rename(symbol))
-    return pd.concat(series, axis=1).sort_index() if series else pd.DataFrame()
+    requested = sorted(set(symbols))
+    if not requested:
+        return pd.DataFrame()
+    daily = store.read(
+        "daily",
+        columns=["ts_code", "trade_date", "close"],
+        filters=[("ts_code", "in", requested)],
+    )
+    adjustment = store.read(
+        "adj_factor",
+        columns=["ts_code", "trade_date", "adj_factor"],
+        filters=[("ts_code", "in", requested)],
+    )
+    bars = daily.merge(
+        adjustment,
+        on=["ts_code", "trade_date"],
+        how="inner",
+        validate="one_to_one",
+    ).sort_values(["ts_code", "trade_date"])
+    latest_factor = bars.groupby("ts_code")["adj_factor"].transform("last")
+    bars["adjusted_close"] = (
+        pd.to_numeric(bars["close"], errors="coerce")
+        * pd.to_numeric(bars["adj_factor"], errors="coerce")
+        / latest_factor
+    )
+    bars["date"] = pd.to_datetime(bars["trade_date"], format="%Y%m%d")
+    return (
+        bars.pivot(index="date", columns="ts_code", values="adjusted_close")
+        .sort_index()
+        .rename_axis(columns=None)
+    )
 
 
 def _diversification_adjusted_order(

@@ -304,19 +304,21 @@ const chartPalette: Record<string, { label: string; color: string }> = {
   "multi_sector_shadow": { label: "因子基线", color: "#102c24" },
   "qlib_gru_shadow": { label: "Qlib GRU 挑战者", color: "#ef7655" },
 };
+const candidateChartColors=["#3568c0","#8b5fbf","#168a83","#c14974","#a56a00","#537188","#8b6f47"];
 
 function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["comparison"] }) {
   const histories = comparison.independent_histories??comparison.histories??{};
-  const series = Object.entries(histories).map(([accountId, rows]) => ({
+  const series = Object.entries(histories).map(([accountId, rows],index) => ({
     accountId,
-    label: chartPalette[accountId]?.label??(accountId.startsWith("qlib_candidate_")?"Qlib 候选者":accountId),
-    color: chartPalette[accountId]?.color??"#7e91e8",
+    label: chartPalette[accountId]?.label??(accountId.startsWith("qlib_candidate_")?`Qlib 候选者 ${accountId.replace("qlib_candidate_","")}`:accountId),
+    color: chartPalette[accountId]?.color??candidateChartColors[index%candidateChartColors.length],
     rows: rows as Row[],
   })).filter((series)=>series.rows.length > 0);
-  return <div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine/></div>;
+  const [activeAccountId,setActiveAccountId]=useState("all");
+  return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略</span><button className={activeAccountId==="all"?"active":""} onClick={()=>setActiveAccountId("all")}>全部</button>{series.map((item)=><button key={item.accountId} className={activeAccountId===item.accountId?"active":""} onClick={()=>setActiveAccountId(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} activeAccountId={activeAccountId} onSelect={setActiveAccountId}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine activeAccountId={activeAccountId} onSelect={setActiveAccountId}/></div></>;
 }
 
-function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean }) {
+function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, activeAccountId, onSelect }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; activeAccountId:string; onSelect:(accountId:string)=>void }) {
   const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
   const dates = [...new Set(series.flatMap((item)=>item.rows.map((row)=>text(row.trade_date))))].sort();
   const dateIndex = new Map(dates.map((date,index)=>[date,index]));
@@ -332,7 +334,8 @@ function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, z
   const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(text(row.trade_date)).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
   const last = series.map((item)=>({ ...item, value: Number(item.rows.at(-1)?.[valueKey]??0) }));
   const ticks = [0, 0.5, 1];
-  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=><span key={item.accountId}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></span>)}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{series.map((item)=><path key={item.accountId} d={path(item.rows)} fill="none" stroke={item.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>)}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
+  const ordered=[...series].sort((a,b)=>Number(a.accountId===activeAccountId)-Number(b.accountId===activeAccountId));
+  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=>{const focused=activeAccountId==="all"||activeAccountId===item.accountId;return <button key={item.accountId} className={focused?"active":"muted"} onClick={()=>onSelect(activeAccountId===item.accountId?"all":item.accountId)}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></button>})}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{ordered.map((item)=>{const focused=activeAccountId==="all"||activeAccountId===item.accountId;return <g key={item.accountId} opacity={focused?1:.12}><path d={path(item.rows)} fill="none" stroke={item.color} strokeWidth={activeAccountId===item.accountId?"4":"2.5"} strokeLinecap="round" strokeLinejoin="round"/>{activeAccountId===item.accountId&&item.rows.map((row)=><circle key={text(row.trade_date)} cx={x(text(row.trade_date))} cy={y(Number(row[valueKey]))} r="3.2" fill={item.color} stroke="#fff" strokeWidth="1.5"><title>{`${item.label} · ${text(row.trade_date)} · ${formatValue(Number(row[valueKey]))}`}</title></circle>)}</g>})}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
 }
 
 function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {

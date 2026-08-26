@@ -27,7 +27,7 @@ def test_risk_state_rules_and_target_permissions() -> None:
     )
 
     assert normal.proposed_state == "NORMAL"
-    assert warning.proposed_state == "REDUCE_ONLY"
+    assert warning.proposed_state == "NORMAL"
     assert sell_only.proposed_state == "SELL_ONLY"
     assert suspended.proposed_state == "SUSPENDED"
     assert constrained_target_weight("NORMAL", 0.08, 0.03) == 0.08

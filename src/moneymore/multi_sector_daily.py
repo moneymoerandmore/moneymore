@@ -213,7 +213,11 @@ def run_multi_sector_daily(
     position_symbols = {
         str(row["symbol"]) for row in account_before["positions"]  # type: ignore[index]
     }
-    symbols = sorted(set(target_weights) | position_symbols)
+    execution_symbols = {
+        str(row["symbol"])
+        for row in broker.fills(MULTI_SECTOR_ACCOUNT, trade_date)
+    }
+    symbols = sorted(set(target_weights) | position_symbols | execution_symbols)
     bars: dict[str, ExecutionBar] = {}
     marks: dict[str, float] = {}
     previous_marks: dict[str, float] = {}

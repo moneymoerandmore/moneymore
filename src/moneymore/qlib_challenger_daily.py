@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
+import torch
 import yaml
 
 from .config import BacktestConfig
@@ -31,6 +32,7 @@ from .strategy_universe import execution_strategy_id
 
 QLIB_CHALLENGER_ACCOUNT = "qlib_gru_shadow"
 QLIB_CHALLENGER_STRATEGY = "qlib_gru_alpha360_v1"
+_LIVE_CORRELATION_CACHE: dict[tuple[object, ...], pd.DataFrame] = {}
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,36 @@ class ChallengerDailyResult:
     portfolio: dict[str, object]
     reconciliation: dict[str, object]
     report_path: str
+
+
+def _prepare_model_for_inference(model: object) -> None:
+    network = getattr(model, "gru_model", None)
+    if network is not None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        network.to(device)
+        model.device = device
+    recurrent = getattr(network, "rnn", None)
+    flatten = getattr(recurrent, "flatten_parameters", None)
+    if callable(flatten):
+        flatten()
+
+
+def _live_correlation(
+    store: ParquetStore,
+    universe: dict[str, str],
+    cutoff: pd.Timestamp,
+    lookback: int,
+) -> pd.DataFrame:
+    key = (str(store.root.resolve()), str(cutoff.date()), tuple(sorted(universe)), lookback)
+    cached = _LIVE_CORRELATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = trailing_return_correlation(
+        adjusted_close_panel(store, list(universe)), cutoff, lookback
+    )
+    _LIVE_CORRELATION_CACHE.clear()
+    _LIVE_CORRELATION_CACHE[key] = result
+    return result
 
 
 def run_qlib_challenger_daily(
@@ -136,11 +168,13 @@ def run_qlib_challenger_daily(
         for filename in manifest["models"]:
             with (ensemble_path.parent / filename).open("rb") as handle:
                 model = pickle.load(handle)
+            _prepare_model_for_inference(model)
             ensemble_predictions.append(model.predict(live_dataset, "live"))
         predictions = sum(ensemble_predictions) / len(ensemble_predictions)
     else:
         with model_path.open("rb") as handle:
             model = pickle.load(handle)
+        _prepare_model_for_inference(model)
         predictions = model.predict(live_dataset, "live")
     score_frame = predictions.rename("score").reset_index()
     score_frame["datetime"] = pd.to_datetime(score_frame["datetime"]).dt.strftime(
@@ -148,8 +182,9 @@ def run_qlib_challenger_daily(
     )
     score_frame["sector"] = score_frame["instrument"].map(universe)
     portfolio_policy = challenger_config["portfolio_policy"]
-    correlation = trailing_return_correlation(
-        adjusted_close_panel(store, list(universe)),
+    correlation = _live_correlation(
+        store,
+        universe,
         cutoff,
         int(portfolio_policy["correlation_lookback"]),
     )
