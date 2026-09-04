@@ -33,6 +33,7 @@ def materialize_point_in_time_store(
         store,
         sorted(snapshots["symbol"].unique()),
         feature_start,
+        capture.strftime("%Y-%m-%d"),
     )
     store.merge_curated(
         "point_in_time_features",
@@ -150,6 +151,7 @@ def build_feature_store(
     store: ParquetStore,
     symbols: list[str],
     start_date: str,
+    end_date: str | None = None,
 ) -> pd.DataFrame:
     columns = [
         "date",
@@ -167,12 +169,34 @@ def build_feature_store(
         "debt_to_assets",
         "netprofit_yoy",
         "q_sales_yoy",
+        "qmt_ocfps",
+        "qmt_bps",
+        "qmt_eps",
+        "qmt_roe",
+        "qmt_gross_margin",
+        "qmt_revenue_growth",
+        "qmt_net_profit_growth",
+        "qmt_sales_cash_flow",
+        "qmt_gear_ratio",
+        "qmt_inventory_turnover",
+        "shareholder_count",
+        "shareholder_count_change",
+        "top10_float_ratio",
     ]
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date) if end_date is not None else None
+    if end is not None and start == end:
+        return _build_feature_snapshot(store, symbols, start, columns)
     panels = []
     for symbol in symbols:
         features = load_point_in_time_features(store, symbol)
         selected = features.loc[
-            pd.to_datetime(features["date"]) >= pd.Timestamp(start_date),
+            (pd.to_datetime(features["date"]) >= start)
+            & (
+                True
+                if end is None
+                else pd.to_datetime(features["date"]) <= end
+            ),
             [column for column in columns if column in features],
         ].copy()
         selected["as_of_date"] = pd.to_datetime(selected.pop("date")).dt.strftime(
@@ -182,6 +206,126 @@ def build_feature_store(
         selected["financial_available_rule"] = "ANNOUNCEMENT_T_PLUS_ONE"
         panels.append(selected)
     return pd.concat(panels, ignore_index=True).sort_values(["as_of_date", "symbol"])
+
+
+def _build_feature_snapshot(
+    store: ParquetStore,
+    symbols: list[str],
+    as_of: pd.Timestamp,
+    columns: list[str],
+) -> pd.DataFrame:
+    """Materialize one live cross-section with one read per source table."""
+    requested = sorted(set(symbols))
+    date_key = as_of.strftime("%Y%m%d")
+    daily = store.read(
+        "daily",
+        columns=["ts_code", "trade_date", "close"],
+        filters=[("ts_code", "in", requested), ("trade_date", "=", date_key)],
+    ).rename(
+        columns={"ts_code": "symbol", "trade_date": "as_of_date", "close": "signal_close"}
+    )
+    if daily.empty:
+        return pd.DataFrame(columns=["as_of_date", *columns[1:]])
+
+    basic_columns = [
+        "dv_ttm", "pb", "pe_ttm", "turnover_rate", "volume_ratio", "total_mv", "circ_mv"
+    ]
+    basic = store.read(
+        "daily_basic",
+        columns=["ts_code", "trade_date", *basic_columns],
+        filters=[("ts_code", "in", requested)],
+    ).rename(columns={"ts_code": "symbol"})
+    basic = (
+        basic.loc[basic["trade_date"].astype(str) < date_key]
+        .sort_values(["symbol", "trade_date"])
+        .groupby("symbol", as_index=False)
+        .tail(1)
+    )
+    result = daily.merge(basic[["symbol", *basic_columns]], on="symbol", how="left")
+
+    financial_columns = ["roe", "ocfps", "debt_to_assets", "netprofit_yoy", "q_sales_yoy"]
+    financial = store.read(
+        "fina_indicator",
+        columns=["ts_code", "ann_date", "end_date", *financial_columns],
+        filters=[("ts_code", "in", requested)],
+    ).rename(columns={"ts_code": "symbol"})
+    financial["available_date"] = pd.to_datetime(
+        financial["ann_date"], format="%Y%m%d"
+    ) + pd.offsets.Day(1)
+    financial = (
+        financial.loc[financial["available_date"] <= as_of]
+        .sort_values(["symbol", "available_date", "end_date"])
+        .groupby("symbol", as_index=False)
+        .tail(1)
+    )
+    result = result.merge(
+        financial[["symbol", *financial_columns]], on="symbol", how="left"
+    )
+    result = _merge_latest_qmt_features(store, result, requested, as_of)
+    result["market_available_rule"] = "T_PLUS_ONE"
+    result["financial_available_rule"] = "ANNOUNCEMENT_T_PLUS_ONE"
+    return result.sort_values(["as_of_date", "symbol"]).reset_index(drop=True)
+
+
+def _merge_latest_qmt_features(
+    store: ParquetStore,
+    frame: pd.DataFrame,
+    symbols: list[str],
+    as_of: pd.Timestamp,
+) -> pd.DataFrame:
+    result = frame
+    specifications = (
+        (
+            "qmt_financial_indicator",
+            [
+                "qmt_ocfps", "qmt_bps", "qmt_eps", "qmt_roe",
+                "qmt_gross_margin", "qmt_revenue_growth", "qmt_net_profit_growth",
+                "qmt_sales_cash_flow", "qmt_gear_ratio", "qmt_inventory_turnover",
+            ],
+        ),
+        ("qmt_holder_count", ["shareholder_count"]),
+        ("qmt_top10_concentration", ["top10_ratio"]),
+    )
+    for table, value_columns in specifications:
+        try:
+            source = store.read(table, filters=[("ts_code", "in", symbols)]).copy()
+        except FileNotFoundError:
+            continue
+        if table == "qmt_top10_concentration":
+            source = source.loc[source["holder_type"].astype(str) == "float"].copy()
+            source = source.rename(columns={"top10_ratio": "top10_float_ratio"})
+            value_columns = ["top10_float_ratio"]
+        source["available_date"] = pd.to_datetime(
+            source["ann_date"], format="%Y%m%d"
+        ) + pd.offsets.Day(1)
+        source = source.loc[source["available_date"] <= as_of]
+        source = (
+            source.sort_values(["ts_code", "available_date", "end_date"])
+            .groupby("ts_code", as_index=False)
+            .tail(1)
+            .rename(columns={"ts_code": "symbol"})
+        )
+        if table == "qmt_holder_count":
+            history = store.read(table, filters=[("ts_code", "in", symbols)]).copy()
+            history["available_date"] = pd.to_datetime(
+                history["ann_date"], format="%Y%m%d"
+            ) + pd.offsets.Day(1)
+            history = history.loc[history["available_date"] <= as_of].sort_values(
+                ["ts_code", "available_date", "end_date"]
+            )
+            history["shareholder_count_change"] = history.groupby("ts_code")[
+                "shareholder_count"
+            ].pct_change(fill_method=None)
+            source = (
+                history.groupby("ts_code", as_index=False)
+                .tail(1)
+                .rename(columns={"ts_code": "symbol"})
+            )
+            value_columns = ["shareholder_count", "shareholder_count_change"]
+        result = result.merge(
+            source[["symbol", *value_columns]], on="symbol", how="left"
+        )
+    return result
 
 
 def audit_target_membership(

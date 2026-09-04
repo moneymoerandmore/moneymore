@@ -13,6 +13,7 @@ from .backtest import run_daily_backtest
 from .config import BacktestConfig
 from .daily import run_daily_pipeline
 from .data.fundamental_sync import sync_stock_fundamentals
+from .data.qmt_provider import create_market_data_provider
 from .data.research import load_adjusted_stock_bars, load_total_return_stock_bars
 from .data.research_sync import sync_research_reference
 from .data.store import ParquetStore
@@ -359,7 +360,7 @@ def main() -> None:
         load_dotenv()
         root = Path(__file__).resolve().parents[2]
         result = run_daily_pipeline(
-            provider=TushareProvider(),
+            provider=create_market_data_provider(),
             store=ParquetStore(args.data_dir),
             broker=PaperBroker(args.database),
             config=BacktestConfig.from_yaml(root / "configs" / "default.yaml"),

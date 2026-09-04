@@ -27,11 +27,11 @@ from .data.fundamental_sync import (
     sync_daily_basic_universe,
     sync_missing_target_fundamentals,
 )
+from .data.qmt_provider import create_market_data_provider
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
-from .data.tushare_provider import TushareProvider
 from .execution.paper import PaperBroker
-from .factors import build_default_registry
+from .factors import build_default_registry, build_qmt_candidate_registry
 from .long_term_review import evaluate_long_term_review
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle
@@ -659,6 +659,16 @@ class TaskService:
     ) -> bool:
         """Avoid duplicate recovery storms while retaining delayed-data retries."""
         with sqlite3.connect(self.database) as connection:
+            active = connection.execute(
+                """
+                SELECT 1 FROM task_runs
+                WHERE status IN ('QUEUED', 'RUNNING')
+                  AND task_name IN ('recovery_pipeline', 'daily_pipeline')
+                LIMIT 1
+                """
+            ).fetchone()
+            if active:
+                return False
             completed = connection.execute(
                 """
                 SELECT 1 FROM task_runs
@@ -743,7 +753,7 @@ class TaskService:
             dates = self._recovery_dates(store, as_of_date, force_current_session)
             if force_current_session and as_of_date in dates:
                 load_dotenv(ROOT / ".env")
-                probe = TushareProvider().daily_bars(as_of_date)
+                probe = create_market_data_provider().daily_bars(as_of_date)
                 if probe.empty:
                     dates = [item for item in dates if item != as_of_date]
             if not dates:
@@ -819,7 +829,7 @@ class TaskService:
         try:
             self._set_running(run_id)
             load_dotenv(ROOT / ".env")
-            provider = TushareProvider()
+            provider = create_market_data_provider()
             store = ParquetStore(DATA)
             broker = PaperBroker(PAPER_DATABASE)
             config = BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml")
@@ -872,7 +882,7 @@ class TaskService:
                     provider, store, trade_date
                 ),
             )
-            self._run_step(
+            _, daily_basic_result = self._run_step(
                 run_id,
                 trade_date,
                 "composite_daily_basic",
@@ -883,6 +893,19 @@ class TaskService:
                     trade_date,
                 ),
             )
+            if daily_basic_result and int(daily_basic_result.get("missing", 0)):
+                missing_symbols = ",".join(
+                    str(item) for item in daily_basic_result.get("missing_symbols", [])
+                )
+                self._notify(
+                    "WARNING",
+                    "DAILY_BASIC_SUSPENDED_SYMBOLS",
+                    "停牌股票缺少当日估值快照",
+                    f"已沿用最近估值，其余股票继续运行：{missing_symbols}",
+                    trade_date=trade_date,
+                    run_id=run_id,
+                    dedupe_key=f"{trade_date}:daily-basic-suspended",
+                )
             self._run_step(
                 run_id,
                 trade_date,
@@ -1155,10 +1178,19 @@ def weekly_training() -> dict[str, object]:
 def factors() -> dict[str, object]:
     registry = build_default_registry()
     catalog = registry.catalog()
+    candidate_catalog = build_qmt_candidate_registry().catalog()
+    active_names = {str(item["name"]) for item in catalog}
+    qmt_candidates = [
+        {**item, "lifecycle": "RESEARCH_CANDIDATE", "active": False}
+        for item in candidate_catalog
+        if str(item["name"]) not in active_names
+    ]
     return {
         "count": len(catalog),
         "categories": sorted({str(item["category"]) for item in catalog}),
         "items": catalog,
+        "qmt_candidate_count": len(qmt_candidates),
+        "qmt_candidates": qmt_candidates,
     }
 
 

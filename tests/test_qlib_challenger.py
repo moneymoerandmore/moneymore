@@ -52,9 +52,7 @@ def test_challenger_metrics_use_daily_cross_section_rank() -> None:
     assert result.top_k_excess_return == 2.0
 
 
-def test_latest_market_state_marks_held_positions_before_observation_snapshot(
-    monkeypatch,
-) -> None:
+def test_latest_market_state_marks_held_positions_before_observation_snapshot() -> None:
     histories = {
         "HELD": pd.DataFrame(
             [
@@ -75,13 +73,24 @@ def test_latest_market_state_marks_held_positions_before_observation_snapshot(
             ]
         )
     }
-    monkeypatch.setattr(
-        "moneymore.qlib_challenger_daily.load_total_return_stock_bars",
-        lambda _store, symbol: histories[symbol],
-    )
+    class Store:
+        def read(self, table, **_kwargs):
+            if table == "stock_limits":
+                raise FileNotFoundError
+            return pd.DataFrame(
+                [
+                    {
+                        "ts_code": "HELD",
+                        "trade_date": row["date"].replace("-", ""),
+                        "open": row["raw_open"],
+                        "close": row["raw_close"],
+                    }
+                    for row in histories["HELD"].to_dict("records")
+                ]
+            )
 
     marks, bars = _latest_market_state(
-        object(), {"HELD"}, pd.Timestamp("2026-07-31"), "20260731"
+        Store(), {"HELD"}, pd.Timestamp("2026-07-31"), "20260731"
     )
 
     assert marks == {"HELD": 10.5}

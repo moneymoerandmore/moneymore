@@ -12,7 +12,7 @@ from .base import (
     FactorDirection,
     FactorRegistry,
 )
-from .builtin import build_default_registry
+from .builtin import build_default_registry, build_qmt_candidate_registry
 from .pipeline import compute_universe_factor_panel
 from .preprocess import PreprocessConfig, preprocess_cross_section
 from .universe import (
@@ -32,6 +32,7 @@ __all__ = [
     "attach_forward_returns",
     "build_default_registry",
     "build_historical_membership",
+    "build_qmt_candidate_registry",
     "compute_universe_factor_panel",
     "factor_correlation",
     "factor_ic_period_report",

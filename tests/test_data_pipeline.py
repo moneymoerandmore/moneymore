@@ -130,6 +130,26 @@ def test_daily_basic_universe_rejects_incomplete_snapshot(tmp_path: Path):
         )
 
 
+def test_daily_basic_universe_allows_suspended_symbol(tmp_path: Path):
+    store = ParquetStore(tmp_path)
+    store.save_snapshot(
+        "daily",
+        pd.DataFrame(
+            [{"ts_code": "AAA.SH", "trade_date": "20250102", "close": 1.0}]
+        ),
+        "fake",
+        ["ts_code", "trade_date"],
+        "20250102",
+    )
+
+    result = sync_daily_basic_universe(
+        FakeProvider(), store, ["AAA.SH", "MISSING.SH"], "20250102"
+    )
+
+    assert result["saved"] == 1
+    assert result["missing_symbols"] == ["MISSING.SH"]
+
+
 def test_immutable_snapshot_rejects_changed_vendor_history(tmp_path: Path):
     store = ParquetStore(tmp_path)
     original = pd.DataFrame([{"ts_code": "AAA", "trade_date": "20250102", "close": 1.0}])

@@ -9,6 +9,7 @@ from moneymore.factors import (
     FactorDirection,
     FactorRegistry,
     build_default_registry,
+    build_qmt_candidate_registry,
 )
 
 
@@ -24,6 +25,14 @@ def test_default_registry_has_versioned_cross_style_catalog():
     }
     assert registry.get("roe").availability == Availability.ANNOUNCEMENT_T_PLUS_1
     assert registry.get("return_20").identity == "return_20@v1"
+
+
+def test_qmt_candidates_are_registered_but_not_in_active_default():
+    active = build_default_registry()
+    candidates = build_qmt_candidate_registry()
+    assert "qmt_holder_count_change" not in active.names()
+    assert "qmt_holder_count_change" in candidates.names()
+    assert candidates.get("qmt_low_leverage").direction == FactorDirection.LOW
 
 
 def test_factor_engine_sorts_and_never_leaks_between_symbols():

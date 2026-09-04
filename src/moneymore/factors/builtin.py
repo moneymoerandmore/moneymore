@@ -14,6 +14,7 @@ from .base import (
 )
 
 QLIB = "Qlib Alpha158 design pattern; MoneyMore native implementation"
+QMT = "XtQuant point-in-time supplemental fundamentals; candidate research only"
 
 
 def build_default_registry() -> FactorRegistry:
@@ -180,6 +181,39 @@ def build_default_registry() -> FactorRegistry:
             "q_sales_yoy",
         )
     )
+    return registry
+
+
+def build_qmt_candidate_registry() -> FactorRegistry:
+    """Default factors plus unpromoted QMT-only research candidates."""
+    registry = build_default_registry()
+    candidates = (
+        ("qmt_gross_margin", FactorDirection.HIGH, "qmt_gross_margin"),
+        ("qmt_sales_cash_flow", FactorDirection.HIGH, "qmt_sales_cash_flow"),
+        ("qmt_low_leverage", FactorDirection.LOW, "qmt_gear_ratio"),
+        ("qmt_inventory_turnover", FactorDirection.HIGH, "qmt_inventory_turnover"),
+        ("qmt_holder_count_change", FactorDirection.LOW, "shareholder_count_change"),
+        ("qmt_top10_float_concentration", FactorDirection.HIGH, "top10_float_ratio"),
+    )
+    for name, direction, column in candidates:
+        registry.register(
+            FactorDefinition(
+                name=name,
+                version=1,
+                category=FactorCategory.QUALITY,
+                direction=direction,
+                description=f"QMT supplemental candidate based on {column}.",
+                inputs=(column,),
+                lookback=1,
+                availability=Availability.ANNOUNCEMENT_T_PLUS_1,
+                calculate=(
+                    (lambda frame, source=column: frame[source] / 100.0)
+                    if column == "top10_float_ratio"
+                    else (lambda frame, source=column: frame[source])
+                ),
+                reference=QMT,
+            )
+        )
     return registry
 
 

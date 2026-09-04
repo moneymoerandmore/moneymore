@@ -79,7 +79,7 @@ def sync_daily_basic_universe(
     store: ParquetStore,
     symbols: list[str],
     trade_date: str,
-) -> dict[str, int]:
+) -> dict[str, object]:
     """Fetch one market-wide valuation snapshot and persist the requested universe."""
     requested = sorted(set(symbols))
     frame = provider.daily_basic("", trade_date, trade_date)
@@ -88,9 +88,28 @@ def sync_daily_basic_universe(
     received = set(frame["ts_code"].astype(str))
     missing = sorted(set(requested) - received)
     if missing:
-        raise ValueError(
-            "daily_basic universe snapshot is incomplete: " + ",".join(missing)
-        )
+        # Tushare legitimately omits daily_basic for suspended names.  Those
+        # names also have no daily bar and should retain their last known
+        # valuation instead of stopping the other 999 instruments.  A name
+        # that traded today but has no valuation remains a hard inconsistency.
+        try:
+            daily = store.read(
+                "daily",
+                columns=["ts_code", "trade_date"],
+                filters=[("trade_date", "=", trade_date)],
+            )
+        except FileNotFoundError:
+            daily = None
+        if daily is None or daily.empty:
+            missing_with_bar = missing
+        else:
+            traded = set(daily["ts_code"].astype(str))
+            missing_with_bar = sorted(set(missing) & traded)
+        if missing_with_bar:
+            raise ValueError(
+                "daily_basic universe snapshot is incomplete for traded symbols: "
+                + ",".join(missing_with_bar)
+            )
     store.save_snapshot(
         "daily_basic",
         frame,
@@ -98,7 +117,15 @@ def sync_daily_basic_universe(
         ["ts_code", "trade_date"],
         f"composite_universe_{trade_date}",
     )
-    return {"requested": len(requested), "saved": len(frame), "missing": 0}
+    result: dict[str, object] = {
+        "requested": len(requested),
+        "saved": len(frame),
+        "missing": len(missing),
+    }
+    if missing:
+        result["missing_symbols"] = missing
+        result["missing_reason"] = "NO_DAILY_BAR_ASSUMED_SUSPENDED"
+    return result
 
 
 def sync_stock_fundamentals(

@@ -11,7 +11,6 @@ import torch
 import yaml
 
 from .config import BacktestConfig
-from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .execution.paper import ExecutionBar, PaperBroker
 from .execution.risk import PortfolioSnapshot, create_order_intent
@@ -363,22 +362,45 @@ def _latest_market_state(
 ) -> tuple[dict[str, float], dict[str, ExecutionBar]]:
     marks: dict[str, float] = {}
     bars: dict[str, ExecutionBar] = {}
-    for symbol in sorted(symbols):
-        history = load_total_return_stock_bars(store, symbol)
-        eligible = history.loc[pd.to_datetime(history["date"]) <= cutoff]
-        if eligible.empty:
+    requested = sorted(symbols)
+    if not requested:
+        return marks, bars
+    market = store.read(
+        "daily",
+        columns=["ts_code", "trade_date", "open", "close"],
+        filters=[("ts_code", "in", requested)],
+    )
+    market = market.loc[market["trade_date"].astype(str) <= trade_date]
+    latest = (
+        market.sort_values(["ts_code", "trade_date"])
+        .groupby("ts_code", as_index=False)
+        .tail(1)
+    )
+    try:
+        limits = store.read(
+            "stock_limits",
+            columns=["ts_code", "trade_date", "up_limit", "down_limit"],
+            filters=[("ts_code", "in", requested), ("trade_date", "=", trade_date)],
+        ).set_index("ts_code")
+    except FileNotFoundError:
+        limits = pd.DataFrame()
+    tolerance = 1e-8
+    for row in latest.itertuples(index=False):
+        symbol = str(row.ts_code)
+        marks[symbol] = float(row.close)
+        if str(row.trade_date) != trade_date:
             continue
-        row = eligible.iloc[-1]
-        marks[symbol] = float(row["raw_close"])
-        if pd.Timestamp(row["date"]).strftime("%Y%m%d") == trade_date:
-            bars[symbol] = ExecutionBar(
-                symbol=symbol,
-                trade_date=trade_date,
-                open=float(row["raw_open"]),
-                close=float(row["raw_close"]),
-                can_buy=bool(row.get("can_buy", True)),
-                can_sell=bool(row.get("can_sell", True)),
-            )
+        limit = limits.loc[symbol] if symbol in limits.index else None
+        up_limit = float(limit["up_limit"]) if limit is not None else None
+        down_limit = float(limit["down_limit"]) if limit is not None else None
+        bars[symbol] = ExecutionBar(
+            symbol=symbol,
+            trade_date=trade_date,
+            open=float(row.open),
+            close=float(row.close),
+            can_buy=up_limit is None or float(row.open) < up_limit - tolerance,
+            can_sell=down_limit is None or float(row.open) > down_limit + tolerance,
+        )
     return marks, bars
 
 
