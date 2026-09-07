@@ -8,6 +8,34 @@ import pandas as pd
 TRADING_DAYS = 252
 
 
+def build_branch_history(
+    parent: pd.DataFrame,
+    branch: pd.DataFrame,
+    *,
+    branch_account_id: str,
+    activation_date: str,
+) -> pd.DataFrame:
+    """Join the parent's pre-fork lineage to the branch's independent results."""
+    parent_history = _prepare_history(parent)
+    branch_history = _prepare_history(branch)
+    lineage = parent_history.loc[parent_history["trade_date"].astype(str) < activation_date].copy()
+    independent = branch_history.loc[
+        branch_history["trade_date"].astype(str) >= activation_date
+    ].copy()
+    if not lineage.empty:
+        lineage["account_id"] = branch_account_id
+        lineage["history_source"] = "PARENT_BASELINE"
+    if not independent.empty:
+        independent["account_id"] = branch_account_id
+        independent["history_source"] = "INTRADAY_BRANCH"
+    return (
+        pd.concat([lineage, independent], ignore_index=True, sort=False)
+        .drop_duplicates("trade_date", keep="last")
+        .sort_values("trade_date")
+        .reset_index(drop=True)
+    )
+
+
 def build_fair_comparison(
     histories: dict[str, pd.DataFrame],
     *,
@@ -15,10 +43,7 @@ def build_fair_comparison(
     target_volatility: float = 0.10,
 ) -> dict[str, Any]:
     """Compare accounts only on dates observed by every account."""
-    prepared = {
-        account_id: _prepare_history(history)
-        for account_id, history in histories.items()
-    }
+    prepared = {account_id: _prepare_history(history) for account_id, history in histories.items()}
     if not prepared or any(history.empty for history in prepared.values()):
         common_dates: list[str] = []
     else:
@@ -32,12 +57,8 @@ def build_fair_comparison(
     for account_id, history in prepared.items():
         independent = history.sort_values("trade_date").reset_index(drop=True).copy()
         if not independent.empty:
-            independent["normalized_nav"] = (
-                independent["equity"] / independent["equity"].iloc[0]
-            )
-            independent["daily_return"] = (
-                independent["normalized_nav"].pct_change().fillna(0.0)
-            )
+            independent["normalized_nav"] = independent["equity"] / independent["equity"].iloc[0]
+            independent["daily_return"] = independent["normalized_nav"].pct_change().fillna(0.0)
         independent_histories[account_id] = _records(independent)
         aligned = history[history["trade_date"].isin(common_dates)].copy()
         aligned = aligned.sort_values("trade_date").reset_index(drop=True)
@@ -108,11 +129,7 @@ def _performance(
     nav = pd.to_numeric(history["normalized_nav"], errors="coerce").dropna()
     returns = nav.pct_change().dropna()
     drawdown = nav / nav.cummax() - 1
-    volatility = (
-        float(returns.std(ddof=1) * np.sqrt(TRADING_DAYS))
-        if len(returns) > 1
-        else None
-    )
+    volatility = float(returns.std(ddof=1) * np.sqrt(TRADING_DAYS)) if len(returns) > 1 else None
     sharpe = (
         float(returns.mean() / returns.std(ddof=1) * np.sqrt(TRADING_DAYS))
         if len(returns) > 1 and returns.std(ddof=1) > 0

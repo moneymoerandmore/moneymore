@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -38,13 +39,25 @@ def sync_reference_data(
 
     calendar = provider.trading_calendar(start_date, end_date)
     validate_calendar(calendar)
-    calendar_snapshot = store.save_snapshot(
-        "trade_calendar",
-        calendar,
-        provider.name,
-        ["cal_date"],
-        f"{start_date}_{end_date}",
-    )
+    calendar_key = f"{start_date}_{end_date}"
+    try:
+        calendar_snapshot = store.save_snapshot(
+            "trade_calendar", calendar, provider.name, ["cal_date"], calendar_key
+        )
+    except FileExistsError:
+        # Future exchange calendars can be revised after the first capture.
+        # Preserve both immutable versions and let the curated table keep the
+        # latest observation instead of blocking the entire daily pipeline.
+        digest = hashlib.sha256(
+            calendar.sort_values("cal_date").to_json(orient="records").encode()
+        ).hexdigest()[:12]
+        calendar_snapshot = store.save_snapshot(
+            "trade_calendar",
+            calendar,
+            provider.name,
+            ["cal_date"],
+            f"{calendar_key}_revision_{digest}",
+        )
     return instrument_snapshot, calendar_snapshot
 
 

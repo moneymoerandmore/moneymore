@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -27,13 +28,21 @@ def sync_trading_calendar(
         raise ValueError(
             f"official trading calendar does not cover requested date: {trade_date}"
         )
-    store.save_snapshot(
-        "trade_calendar",
-        calendar,
-        provider.name,
-        ["exchange", "cal_date"]
-        if "exchange" in calendar.columns
-        else ["cal_date"],
-        f"{start_date}_{end_date}",
-    )
+    keys = ["exchange", "cal_date"] if "exchange" in calendar.columns else ["cal_date"]
+    snapshot_key = f"{start_date}_{end_date}"
+    try:
+        store.save_snapshot(
+            "trade_calendar", calendar, provider.name, keys, snapshot_key
+        )
+    except FileExistsError:
+        digest = hashlib.sha256(
+            calendar.sort_values(keys).to_json(orient="records").encode()
+        ).hexdigest()[:12]
+        store.save_snapshot(
+            "trade_calendar",
+            calendar,
+            provider.name,
+            keys,
+            f"{snapshot_key}_revision_{digest}",
+        )
     return calendar

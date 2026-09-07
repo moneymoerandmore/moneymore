@@ -6,7 +6,7 @@ const app = new URL("../app/", import.meta.url);
 
 test("dashboard presents the complete multi-sector portfolio", async () => {
   const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
-  for (const label of ["多行业动态组合", "整体配置全貌", "行业与个股", "策略研究", "运行与对账", "银行", "红利", "工业有色", "芯片", "创业板成长"]) {
+  for (const label of ["全局横截面组合", "整体配置全貌", "行业与个股", "策略研究", "运行与对账", "银行", "红利", "工业有色", "芯片", "创业板成长", "基线日内智能执行"]) {
     assert.match(source, new RegExp(label));
   }
   assert.match(source, /\/api\/sector-portfolio/);
@@ -17,6 +17,7 @@ test("dashboard presents the complete multi-sector portfolio", async () => {
   assert.match(source, /风险监控/);
   assert.match(source, /数据健康/);
   assert.match(source, /\/api\/data-quality/);
+  assert.match(source, /\/api\/intraday-execution/);
   assert.match(source, /DATA QUALITY CENTER/);
   assert.match(source, /账户风险状态机/);
   assert.match(source, /REDUCE_ONLY/);

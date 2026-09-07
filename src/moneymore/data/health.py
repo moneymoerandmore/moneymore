@@ -96,7 +96,12 @@ def run_data_health_checks(
         )
     )
     financial = _read_symbols(store, "fina_indicator", ordered)
-    covered_financial = set(financial["ts_code"].astype(str)) if not financial.empty else set()
+    qmt_financial = _read_symbols(store, "qmt_financial_indicator", ordered)
+    covered_financial = (
+        set(financial["ts_code"].astype(str)) if not financial.empty else set()
+    ) | (
+        set(qmt_financial["ts_code"].astype(str)) if not qmt_financial.empty else set()
+    )
     checks.append(
         _coverage_check(
             "FINANCIAL_COVERAGE", "fundamental", ordered, covered_financial, "BLOCK"
@@ -111,6 +116,17 @@ def run_data_health_checks(
                 "BLOCK" if not null_ann.empty else "PASS",
                 "财务数据公告日期必须完整",
                 null_ann["ts_code"].astype(str).unique().tolist(),
+            )
+        )
+    if not qmt_financial.empty:
+        null_qmt_ann = qmt_financial.loc[qmt_financial["ann_date"].isna()]
+        checks.append(
+            _issue(
+                "QMT_FINANCIAL_ANN_DATE",
+                "fundamental",
+                "BLOCK" if not null_qmt_ann.empty else "PASS",
+                "QMT财务数据公告日期必须完整",
+                null_qmt_ann["ts_code"].astype(str).unique().tolist(),
             )
         )
 

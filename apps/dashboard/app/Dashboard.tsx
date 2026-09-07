@@ -48,6 +48,11 @@ type OperationsCenter = {
   scheduler: Row; preview: Row & { steps?: Row[]; expected_effects?: string[]; warnings?: string[] };
   readiness: Row & { checks?: Row[] };
 };
+type IntradayExecution = {
+  policy_id: string; activation_date: string; account_id: string;
+  pending_orders: Row[]; fills: Row[]; account_ticks: Row[];
+  latest: Row & { decisions?: Row[]; executions?: Row[] };
+};
 type ModelRegistry = { versions: Row[]; artifacts: Row[]; bindings: Row[] };
 type MonthlyAcceptance = {
   cycle_id: string; start_date: string; observation_date: string; status: string;
@@ -62,6 +67,7 @@ type Challenger = {
   latest: Row & { selected?: string[]; scores?: Row[]; portfolio?: Bank["shadow"]["portfolio"] };
   orders: Row[]; fills: Row[]; reconciliation: Row;
   baseline: { account_id: string; latest: Row; orders?: Row[]; fills?: Row[] };
+  intraday_baseline?: { account_id:string; status:string; portfolio?:Row; orders:Row[]; fills:Row[] };
   historical_execution: Row & { strategies?: (Row & { summary?: Row })[] };
   point_in_time: Row & { historical_replay_gate?: Row };
   governance: Row & { releases?: Row[]; transitions?: Row[] };
@@ -137,14 +143,16 @@ export default function Dashboard() {
   const [models, setModels] = useState<ModelRegistry | null>(null);
   const [acceptance, setAcceptance] = useState<MonthlyAcceptance | null>(null);
   const [challenger, setChallenger] = useState<Challenger | null>(null);
+  const [intraday, setIntraday] = useState<IntradayExecution | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
     try {
-      const [b, s, e, q, o, m, a, c] = await Promise.all([
+      const [b, s, e, q, o, m, a, c, i] = await Promise.all([
         json<Bank>("/api/bank-dashboard"), json<Sectors>("/api/sector-portfolio"), json<Execution>("/api/multi-sector-execution"), json<DataQuality>("/api/data-quality"), json<OperationsCenter>("/api/operations-center"), json<ModelRegistry>("/api/model-registry"), json<MonthlyAcceptance>("/api/monthly-acceptance"), json<Challenger>("/api/qlib-challenger"),
+        json<IntradayExecution>("/api/intraday-execution"),
       ]);
-      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setError("");
+      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
   useEffect(() => {
@@ -158,7 +166,7 @@ export default function Dashboard() {
     catch (reason) { setError(reason instanceof Error ? reason.message : "任务启动失败"); }
     finally { setBusy(false); }
   };
-  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
+  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   const current = nav.find((item) => item.id === page)!;
   return <div className="app-shell">
     <aside>
@@ -175,7 +183,7 @@ export default function Dashboard() {
       {page === "research" && <Research sectors={sectors} models={models}/>}
       {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></>}
       {page === "data" && <DataHealth quality={quality}/>}
-      {page === "operations" && <Operations bank={bank} execution={execution} operations={operations} acceptance={acceptance} names={sectors.symbol_names} onRefresh={refresh}/>}
+      {page === "operations" && <Operations bank={bank} execution={execution} operations={operations} acceptance={acceptance} intraday={intraday} names={sectors.symbol_names} onRefresh={refresh}/>}
     </main>
   </div>;
 }
@@ -242,8 +250,9 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
   const globalView = observation?.global_strategy_view??challenger.comparison;
   return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
     <CandidateSwitcher observation={observation} selectedTag={text(selectedCandidate?.candidate_tag)} onSelect={setSelectedCandidateTag}/>
-    <div className="three-col account-columns">
+    <div className="four-col account-columns">
       <AccountColumn title="基线" badge="FACTOR BASELINE" accountId={challenger.baseline.account_id} status={text(challenger.baseline.latest.status)} equity={baselineEquity} portfolio={baselinePortfolio} orders={challenger.baseline.orders??[]} fills={challenger.baseline.fills??[]} names={names}/>
+      <AccountColumn title="基线·日内执行" badge="ADAPTIVE VWAP" accountId={text(challenger.intraday_baseline?.account_id)} status={text(challenger.intraday_baseline?.status)} equity={Number(challenger.intraday_baseline?.portfolio?.equity??0)} portfolio={challenger.intraday_baseline?.portfolio} orders={challenger.intraday_baseline?.orders??[]} fills={challenger.intraday_baseline?.fills??[]} names={names}/>
       <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challenger.latest.portfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challenger.orders} fills={challenger.fills} names={names}/>
       <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={text(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={selectedCandidate?.orders??observation?.orders??[]} fills={selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
     </div>
@@ -283,11 +292,12 @@ function TradeCycleComparison({ challenger, names, candidateAccountId }: { chall
   const analysis = challenger.trade_cycle_analysis??{};
   const accounts = [
     { id:"multi_sector_shadow", label:"因子基线" },
+    { id:"multi_sector_intraday_shadow", label:"因子基线·日内执行" },
     { id:"qlib_gru_shadow", label:"Qlib GRU 挑战者" },
     ...(candidateAccountId?[{id:candidateAccountId,label:"Qlib 候选者"}]:[]),
   ];
   const summaryRows = accounts.map(({id,label})=>({strategy:label,...(analysis[id]?.summary??{})}));
-  return <><Panel title="完整持仓周期胜率与赔率" subtitle="从首次建仓到仓位归零算一个闭合周期；分批买卖合并，费用、滑点和分红计入；未清仓周期不进入胜率"><Table rows={summaryRows} columns={[["strategy","策略"],["closed_cycles","闭合周期"],["wins","盈利"],["losses","亏损"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","累计已实现盈亏"],["average_return","平均周期收益"]]} format={{win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,average_return:pct}}/></Panel><div className="three-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 个股持仓周期`} subtitle="每只股票所有已闭合周期聚合；当前开放周期单独标记"><Table rows={analysis[id]?.by_symbol??[]} columns={[["symbol","证券"],["closed_cycles","闭合"],["wins","赢"],["losses","亏"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","已实现盈亏"],["open_cycle","持仓中"],["open_estimated_pnl","浮动盈亏"]]} format={{symbol:(v)=>security(v,names),win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,open_cycle:(v)=>v?"是":"否",open_estimated_pnl:money}}/></Panel>)}</div><div className="three-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 已闭合周期明细`} subtitle="用于核验每次从建仓到清仓的真实结果"><Table rows={(analysis[id]?.closed_cycles??[]).slice(0,100)} columns={[["entry_date","建仓日"],["exit_date","清仓日"],["symbol","证券"],["pnl","净盈亏"],["return_rate","周期收益"],["dividend_income","分红"],["fees","费用"],["fill_count","成交笔数"],["result","结果"]]} format={{symbol:(v)=>security(v,names),pnl:money,return_rate:pct,dividend_income:money,fees:money}}/></Panel>)}</div></>;
+  return <><Panel title="完整持仓周期胜率与赔率" subtitle="从首次建仓到仓位归零算一个闭合周期；分批买卖合并，费用、滑点和分红计入；未清仓周期不进入胜率"><Table rows={summaryRows} columns={[["strategy","策略"],["closed_cycles","闭合周期"],["wins","盈利"],["losses","亏损"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","累计已实现盈亏"],["average_return","平均周期收益"]]} format={{win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,average_return:pct}}/></Panel><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 个股持仓周期`} subtitle="每只股票所有已闭合周期聚合；当前开放周期单独标记"><Table rows={analysis[id]?.by_symbol??[]} columns={[["symbol","证券"],["closed_cycles","闭合"],["wins","赢"],["losses","亏"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","已实现盈亏"],["open_cycle","持仓中"],["open_estimated_pnl","浮动盈亏"]]} format={{symbol:(v)=>security(v,names),win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,open_cycle:(v)=>v?"是":"否",open_estimated_pnl:money}}/></Panel>)}</div><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 已闭合周期明细`} subtitle="用于核验每次从建仓到清仓的真实结果"><Table rows={(analysis[id]?.closed_cycles??[]).slice(0,100)} columns={[["entry_date","建仓日"],["exit_date","清仓日"],["symbol","证券"],["pnl","净盈亏"],["return_rate","周期收益"],["dividend_income","分红"],["fees","费用"],["fill_count","成交笔数"],["result","结果"]]} format={{symbol:(v)=>security(v,names),pnl:money,return_rate:pct,dividend_income:money,fees:money}}/></Panel>)}</div></>;
 }
 
 function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
@@ -302,6 +312,7 @@ function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
 
 const chartPalette: Record<string, { label: string; color: string }> = {
   "multi_sector_shadow": { label: "因子基线", color: "#102c24" },
+  "multi_sector_intraday_shadow": { label: "因子基线·日内执行", color: "#168a83" },
   "qlib_gru_shadow": { label: "Qlib GRU 挑战者", color: "#ef7655" },
 };
 const candidateChartColors=["#3568c0","#8b5fbf","#168a83","#c14974","#a56a00","#537188","#8b6f47"];
@@ -314,11 +325,18 @@ function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["c
     color: chartPalette[accountId]?.color??candidateChartColors[index%candidateChartColors.length],
     rows: rows as Row[],
   })).filter((series)=>series.rows.length > 0);
-  const [activeAccountId,setActiveAccountId]=useState("all");
-  return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略</span><button className={activeAccountId==="all"?"active":""} onClick={()=>setActiveAccountId("all")}>全部</button>{series.map((item)=><button key={item.accountId} className={activeAccountId===item.accountId?"active":""} onClick={()=>setActiveAccountId(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} activeAccountId={activeAccountId} onSelect={setActiveAccountId}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine activeAccountId={activeAccountId} onSelect={setActiveAccountId}/></div></>;
+  const [selectedAccountIds,setSelectedAccountIds]=useState<Set<string>>(()=>new Set());
+  const toggleAccount=(accountId:string)=>setSelectedAccountIds((current)=>{
+    if (!current.size) return new Set([accountId]);
+    const next=new Set(current);
+    if (next.has(accountId)) next.delete(accountId); else next.add(accountId);
+    return next;
+  });
+  const showAll=!selectedAccountIds.size;
+  return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略（可多选）</span><button className={showAll?"active":""} onClick={()=>setSelectedAccountIds(new Set())}>全部</button>{series.map((item)=><button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={!showAll&&selectedAccountIds.has(item.accountId)?"active":""} onClick={()=>toggleAccount(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/></div></>;
 }
 
-function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, activeAccountId, onSelect }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; activeAccountId:string; onSelect:(accountId:string)=>void }) {
+function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, selectedAccountIds, onToggle }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; selectedAccountIds:Set<string>; onToggle:(accountId:string)=>void }) {
   const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
   const dates = [...new Set(series.flatMap((item)=>item.rows.map((row)=>text(row.trade_date))))].sort();
   const dateIndex = new Map(dates.map((date,index)=>[date,index]));
@@ -334,8 +352,9 @@ function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, z
   const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(text(row.trade_date)).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
   const last = series.map((item)=>({ ...item, value: Number(item.rows.at(-1)?.[valueKey]??0) }));
   const ticks = [0, 0.5, 1];
-  const ordered=[...series].sort((a,b)=>Number(a.accountId===activeAccountId)-Number(b.accountId===activeAccountId));
-  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=>{const focused=activeAccountId==="all"||activeAccountId===item.accountId;return <button key={item.accountId} className={focused?"active":"muted"} onClick={()=>onSelect(activeAccountId===item.accountId?"all":item.accountId)}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></button>})}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{ordered.map((item)=>{const focused=activeAccountId==="all"||activeAccountId===item.accountId;return <g key={item.accountId} opacity={focused?1:.12}><path d={path(item.rows)} fill="none" stroke={item.color} strokeWidth={activeAccountId===item.accountId?"4":"2.5"} strokeLinecap="round" strokeLinejoin="round"/>{activeAccountId===item.accountId&&item.rows.map((row)=><circle key={text(row.trade_date)} cx={x(text(row.trade_date))} cy={y(Number(row[valueKey]))} r="3.2" fill={item.color} stroke="#fff" strokeWidth="1.5"><title>{`${item.label} · ${text(row.trade_date)} · ${formatValue(Number(row[valueKey]))}`}</title></circle>)}</g>})}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
+  const showAll=!selectedAccountIds.size;
+  const ordered=[...series].sort((a,b)=>Number(selectedAccountIds.has(a.accountId))-Number(selectedAccountIds.has(b.accountId)));
+  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);return <button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={focused?"active":"muted"} onClick={()=>onToggle(item.accountId)}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></button>})}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{ordered.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);const selected=selectedAccountIds.has(item.accountId);return <g key={item.accountId} opacity={focused?1:.12}><path d={path(item.rows)} fill="none" stroke={item.color} strokeWidth={selected?"4":"2.5"} strokeLinecap="round" strokeLinejoin="round"/>{selected&&item.rows.map((row)=><circle key={text(row.trade_date)} cx={x(text(row.trade_date))} cy={y(Number(row[valueKey]))} r="3.2" fill={item.color} stroke="#fff" strokeWidth="1.5"><title>{`${item.label} · ${text(row.trade_date)} · ${formatValue(Number(row[valueKey]))}`}</title></circle>)}</g>})}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
 }
 
 function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {
@@ -364,13 +383,17 @@ function DataHealth({ quality }: { quality: DataQuality }) {
     <Panel title="最近数据健康记录" subtitle="用于观察连续失败和恢复"><Table rows={quality.history} columns={[["trade_date","交易日"],["status","状态"],["target_count","标的数"],["blocking_count","阻断"],["warning_count","警告"]]}/></Panel></>;
 }
 
-function Operations({ bank, execution, operations, acceptance, names, onRefresh }: { bank: Bank; execution: Execution; operations: OperationsCenter; acceptance: MonthlyAcceptance; names: Record<string, string>; onRefresh: () => Promise<void> }) {
+function Operations({ bank, execution, operations, acceptance, intraday, names, onRefresh }: { bank: Bank; execution: Execution; operations: OperationsCenter; acceptance: MonthlyAcceptance; intraday: IntradayExecution; names: Record<string, string>; onRefresh: () => Promise<void> }) {
   const recover = async () => { await json("/api/risk-state/recover", { method: "POST" }); await onRefresh(); };
   const acknowledge = async (id: number) => { await json(`/api/notifications/${id}/acknowledge`, { method: "POST" }); await onRefresh(); };
   const [previewDate, setPreviewDate] = useState(text(operations.preview.trade_date));
   const [preview, setPreview] = useState(operations.preview);
   const inspect = async () => setPreview(await json(`/api/tasks/daily-run/preview?trade_date=${previewDate}`));
+  const firstTickEquity=Number(intraday.account_ticks[0]?.equity??0);
+  const intradaySeries=intraday.account_ticks.map((row)=>({...row,trade_date:row.observed_at,normalized_nav:firstTickEquity?Number(row.equity)/firstTickEquity:1}));
   return <><section className="ops-banner"><div><i/><small>SERVER SCHEDULER</small><h2>每日 {bank.scheduler.time}</h2><p>服务端持续运行 · Asia/Shanghai · 非 Codex 自动任务</p></div><span>{bank.scheduler.enabled?"已启用":"已暂停"}</span></section>
+    <Panel title="基线日内智能执行" subtitle={`${intraday.policy_id} · ${intraday.activation_date}起生效 · 仅改变成交时机，不改变日频目标`}><section className="kpis"><Kpi label="执行状态" value={text(intraday.latest.status??"等待交易时段")} note={text(intraday.latest.observed_at)}/><Kpi label="待处理委托" value={String(intraday.pending_orders.length)} note="基线综合账户" accent={intraday.pending_orders.length>0}/><Kpi label="本轮触发" value={String((intraday.latest.executions??[]).length)} note="VWAP / 价差 / 截止时间"/><Kpi label="本轮观察" value={String((intraday.latest.decisions??[]).length)} note="含持仓、可卖量和成本"/></section><Table rows={intraday.latest.decisions??[]} columns={[["symbol","证券"],["side","方向"],["quantity","数量"],["price","现价"],["vwap","VWAP"],["spread_bps","价差bps"],["action","动作"],["reason","原因"]]} format={{symbol:(v)=>security(v,names),price:num,vwap:num,spread_bps:num}}/></Panel>
+    <div className="two-col"><LineComparisonChart title="日内实时权益变化" subtitle="以当日首个QMT快照归一为100，每分钟刷新" series={[{accountId:intraday.account_id,label:"基线·日内执行",color:"#168a83",rows:intradaySeries}]} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(3)}`} selectedAccountIds={new Set([intraday.account_id])} onToggle={()=>{}}/><Panel title="日内实时成交" subtitle="成交后立即进入独立账户账本"><Table rows={intraday.fills.slice(-30).reverse()} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
     <section className="kpis"><Kpi label="综合账户权益" value={money(execution.portfolio?.equity)} note={execution.account_id}/><Kpi label="实际 / 可执行目标" value={`${pct(execution.metrics.gross_exposure)} / ${pct(execution.metrics.target_exposure)}`} note={`理论目标 ${pct(execution.metrics.theoretical_target_exposure??execution.metrics.target_exposure)} · 已考虑一手约束`}/><Kpi label="累计收益 / 回撤" value={`${pct((Number(execution.portfolio?.equity??1_000_000)/1_000_000)-1)} / ${pct(execution.metrics.drawdown)}`} note={`${execution.history.length}个日度快照`}/><Kpi label="账户风险状态" value={text(execution.risk_state.effective_state)} note={text(execution.risk_state.reason_code)} accent={text(execution.risk_state.effective_state)!=="NORMAL"}/></section>
     <Panel title="理论目标到可执行目标" subtitle="一手金额超过可分配预算的股票被剔除；释放预算优先在同一行业内重新分配"><Table rows={execution.target_adjustments??[]} columns={[["symbol","证券"],["sector","行业"],["theoretical_weight","理论权重"],["executable_weight","可执行权重"],["minimum_lot_weight","一手占账户"],["reason","调整原因"]]} format={{symbol:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),theoretical_weight:pct,executable_weight:pct,minimum_lot_weight:pct}}/></Panel>
     <section className="kpis"><Kpi label="下次自动运行" value={duration(operations.scheduler.seconds_to_next_run)} note={text(operations.scheduler.next_run)}/><Kpi label="待执行订单" value={String(operations.pending_orders.length)} note={`${text(preview.eligible_for_execution_count)}笔在所选交易日可撮合`} accent={operations.pending_orders.length>0}/><Kpi label="延期执行记录" value={String(operations.deferred_attempts.length)} note="涨跌停、T+1、现金不足"/><Kpi label="补跑预览" value={text(preview.market_session)} note={`${text(preview.trade_date)} · 只读检查`}/></section>
@@ -380,7 +403,6 @@ function Operations({ bank, execution, operations, acceptance, names, onRefresh 
     <Panel title="手动补跑影响预览" subtitle="预览不会启动任务、写入数据或改变模拟持仓"><div className="preview-controls"><input value={previewDate} onChange={(event)=>setPreviewDate(event.target.value)} maxLength={8}/><button className="recover" onClick={()=>void inspect()}>检查影响</button><b>{text(preview.calendar_source)}</b></div><section className="kpis"><Kpi label="历史运行" value={text(preview.prior_run_count)} note="该交易日已有任务数"/><Kpi label="全部待执行" value={text(preview.pending_order_count)} note="综合影子账户"/><Kpi label="预计可撮合" value={text(preview.eligible_for_execution_count)} note={`${text(preview.eligible_buy_count)}买 / ${text(preview.eligible_sell_count)}卖`}/><Kpi label="最近影子账本" value={text(preview.latest_shadow_date)} note="补跑前基线"/></section><Table rows={preview.steps??[]} columns={[["step_name","步骤"],["action","补跑动作"]]}/>{(preview.expected_effects??[]).map((item)=><p key={item}>· {item}</p>)}{(preview.warnings??[]).map((item)=><p className="error" key={item}>{item}</p>)}</Panel>
     <Panel title="账户风险状态机" subtitle="风险自动升级；状态降级必须人工确认"><div className="risk-machine">{["NORMAL","REDUCE_ONLY","SELL_ONLY","SUSPENDED"].map((state)=><div key={state} className={execution.risk_state.effective_state===state?"active":""}><b>{state}</b><small>{state==="NORMAL"?"允许正常调仓":state==="REDUCE_ONLY"?"只允许降低风险":state==="SELL_ONLY"?"目标强制降为零":"冻结全部订单"}</small></div>)}</div>{Boolean(execution.risk_state.recovery_required)&&<button className="recover" onClick={()=>void recover()}>确认恢复到 {text(execution.risk_state.proposed_state)}</button>}<Table rows={execution.risk_transitions.slice(0,10)} columns={[["trade_date","交易日"],["from_state","原状态"],["to_state","生效状态"],["proposed_state","建议状态"],["reason_code","原因"],["transition_type","类型"]]}/></Panel>
     <Panel title="风险监控" subtitle="阻断级告警会停止生成新订单"><div className="risk-alerts">{execution.risk_alerts.length?execution.risk_alerts.map((row)=><div key={text(row.code)} className={text(row.severity).toLowerCase()}><b>{text(row.severity)}</b><span>{text(row.message)}</span><small>{text(row.code)}</small></div>):<p className="empty">当前无风险告警</p>}</div></Panel>
-    <Panel title="任务告警中心" subtitle="流水线失败、数据阻断、风控暂停和延迟订单会在这里留痕"><div className="risk-alerts">{operations.notifications.length?operations.notifications.map((row)=><div key={row.id} className={text(row.severity).toLowerCase()}><b>{text(row.severity)}</b><span><strong>{text(row.title)}</strong><br/>{text(row.message)}</span><small>{text(row.trade_date)} · {text(row.code)} {!row.acknowledged&&<button className="recover" onClick={()=>void acknowledge(row.id)}>确认</button>}</small></div>):<p className="empty">当前无任务告警</p>}</div></Panel>
     <Panel title="可恢复步骤账本" subtitle="每个步骤独立重试；同一交易日已完成步骤在重跑时自动跳过"><Table rows={operations.task_steps.slice(0,30)} columns={[["run_id","运行"],["trade_date","交易日"],["step_name","步骤"],["attempt","尝试"],["status","状态"],["error","错误"]]}/></Panel>
     <div className="two-col"><Panel title="每日综合流水线"><div className="architecture compact">{["交易日校验","全市场数据同步","五行业因子截面","行业择时与风险预算","影子撮合","现金持仓对账"].map((name,index)=><div key={name}><b>0{index+1}</b><span><strong>{name}</strong><small>{index<4?"组合决策层":"执行审计层"}</small></span></div>)}</div></Panel><Panel title="最近任务"><Table rows={operations.task_runs.slice(0,15)} columns={[["trade_date","交易日"],["source","来源"],["status","状态"],["started_at","开始"],["finished_at","结束"],["error","错误"]]}/></Panel></div>
     <div className="two-col"><Panel title="行业收益与持仓归因" subtitle="当日贡献、实际仓位和浮动盈亏"><Table rows={execution.attribution} columns={[["sector","行业"],["daily_pnl","当日盈亏"],["daily_contribution","收益贡献"],["actual_weight","实际仓位"],["unrealized_pnl","浮动盈亏"]]} format={{sector:(v)=>meta[text(v)]?.label??text(v),daily_pnl:money,daily_contribution:pct,actual_weight:pct,unrealized_pnl:money}}/></Panel><Panel title="目标与实际仓位偏差" subtitle="解释未成交、整手和T+1差异"><Table rows={execution.deviations} columns={[["symbol","证券"],["target_weight","目标"],["actual_weight","实际"],["weight_gap","偏差"],["reason","原因"]]} format={{symbol:(v)=>security(v,names),target_weight:pct,actual_weight:pct,weight_gap:pct}}/></Panel></div>
@@ -388,7 +410,8 @@ function Operations({ bank, execution, operations, acceptance, names, onRefresh 
     <div className="two-col"><Panel title="组合风险归因" subtitle="波动、相关性、集中度与边际风险"><Table rows={execution.risk_attribution} columns={[["symbol","证券"],["sector","行业"],["weight","权重"],["volatility_contribution","波动贡献"],["correlation_contribution","相关性贡献"],["concentration_contribution","集中度"],["marginal_risk","边际风险"]]} format={{symbol:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),weight:pct,volatility_contribution:pct,correlation_contribution:pct,concentration_contribution:pct,marginal_risk:num}}/></Panel><Panel title="执行缺口归因" subtitle="整手、T+1、涨跌停、现金不足和其他执行约束"><Table rows={execution.execution_attribution} columns={[["reason","原因"],["symbol_count","证券数"],["absolute_weight_gap","绝对仓位缺口"],["signed_weight_gap","净缺口"],["execution_events","执行事件"]]} format={{absolute_weight_gap:pct,signed_weight_gap:pct}}/></Panel></div>
     <Panel title="当前综合持仓" subtitle="股票名、代码、实际数量和成本"><Table rows={execution.positions} columns={[["symbol","证券"],["quantity","数量"],["available_quantity","可用"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/></Panel>
     <Panel title="公司行为入账" subtitle="现金分红、送转股和权益登记均采用幂等审计账本"><Table rows={execution.corporate_action_ledger} columns={[["trade_date","入账日"],["symbol","证券"],["action_type","类型"],["entitled_quantity","登记股数"],["cash_amount","现金"],["share_quantity","新增股数"]]} format={{symbol:(v)=>security(v,names),cash_amount:money}}/></Panel>
-    <Panel title="最近委托与成交" subtitle="五行业目标统一进入影子账户，真实委托保持隔离"><Table rows={execution.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel></>;
+    <Panel title="最近委托与成交" subtitle="五行业目标统一进入影子账户，真实委托保持隔离"><Table rows={execution.orders.slice(0,30)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["quantity","数量"],["status","状态"],["reason_code","原因"]]} format={{symbol:(v)=>security(v,names)}}/></Panel>
+    <Panel title="任务告警中心" subtitle="流水线失败、数据阻断、风控暂停和延迟订单会在这里留痕"><div className="risk-alerts">{operations.notifications.length?operations.notifications.map((row)=><div key={row.id} className={text(row.severity).toLowerCase()}><b>{text(row.severity)}</b><span><strong>{text(row.title)}</strong><br/>{text(row.message)}</span><small>{text(row.trade_date)} · {text(row.code)} {!row.acknowledged&&<button className="recover" onClick={()=>void acknowledge(row.id)}>确认</button>}</small></div>):<p className="empty">当前无任务告警</p>}</div></Panel></>;
 }
 
 function Allocation({rows}:{rows:Row[]}){return <div className="allocation">{rows.map((row)=>{const m=sectorMeta(row.sector);return <div key={text(row.sector)}><div className="allocation-name"><i style={{background:m.color}}/><span><b>{m.label}</b><small>{m.thesis}</small></span></div><div className="bars"><span><i style={{width:`${Number(row.target_weight)*100}%`,background:`${m.color}55`}}/></span><span><i style={{width:`${Number(row.target_weight)*100}%`,background:m.color}}/></span></div><div className="values"><b>{pct(row.target_weight)}</b><small>全局选股后的行业暴露 · 非预算约束</small></div></div>})}</div>}

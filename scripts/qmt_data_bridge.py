@@ -167,12 +167,50 @@ def _daily(xtdata, trade_date: str) -> list[dict[str, object]]:
     return rows
 
 
+def _intraday(xtdata, symbols: list[str]) -> list[dict[str, object]]:
+    ticks = xtdata.get_full_tick(symbols) or {}
+    rows: list[dict[str, object]] = []
+    for symbol in symbols:
+        tick = ticks.get(symbol) or {}
+        price = float(tick.get("lastPrice", 0) or 0)
+        volume = float(tick.get("volume", 0) or 0)
+        amount = float(tick.get("amount", 0) or 0)
+        raw_vwap = amount / volume if volume > 0 else price
+        # Broker builds have reported stock volume in either shares or lots.
+        # Select the unit whose implied VWAP is closest to the live price.
+        candidates = [raw_vwap, raw_vwap / 100, raw_vwap * 100]
+        vwap = min(candidates, key=lambda value: abs(value - price)) if price else raw_vwap
+        bid_prices = tick.get("bidPrice") or []
+        ask_prices = tick.get("askPrice") or []
+        detail = xtdata.get_instrument_detail(symbol, True) or {}
+        rows.append(
+            {
+                "symbol": symbol,
+                "timestamp": int(tick.get("time", 0) or 0),
+                "last": price,
+                "open": float(tick.get("open", 0) or 0),
+                "high": float(tick.get("high", 0) or 0),
+                "low": float(tick.get("low", 0) or 0),
+                "pre_close": float(tick.get("lastClose", 0) or 0),
+                "volume": volume,
+                "amount": amount,
+                "vwap": float(vwap),
+                "bid1": float(bid_prices[0]) if bid_prices else 0.0,
+                "ask1": float(ask_prices[0]) if ask_prices else 0.0,
+                "up_limit": float(detail.get("UpStopPrice", 0) or 0),
+                "down_limit": float(detail.get("DownStopPrice", 0) or 0),
+            }
+        )
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["probe", "calendar", "daily"])
+    parser.add_argument("action", choices=["probe", "calendar", "daily", "intraday"])
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--trade-date")
+    parser.add_argument("--symbols")
     args = parser.parse_args()
     xtdata = _connect()
     if args.action == "probe":
@@ -187,10 +225,15 @@ def main() -> None:
         if not args.start or not args.end:
             parser.error("calendar requires --start and --end")
         result = _calendar(xtdata, args.start, args.end)
-    else:
+    elif args.action == "daily":
         if not args.trade_date:
             parser.error("daily requires --trade-date")
         result = _daily(xtdata, args.trade_date)
+    else:
+        symbols = sorted(set(filter(None, (args.symbols or "").split(","))))
+        if not symbols:
+            parser.error("intraday requires --symbols")
+        result = _intraday(xtdata, symbols)
     print(json.dumps(result, ensure_ascii=False, allow_nan=False))
 
 

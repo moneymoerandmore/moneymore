@@ -8,7 +8,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -32,6 +32,11 @@ from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .execution.paper import PaperBroker
 from .factors import build_default_registry, build_qmt_candidate_registry
+from .intraday_execution import (
+    INTRADAY_ACCOUNT,
+    POLICY_ID,
+    run_baseline_intraday_once,
+)
 from .long_term_review import evaluate_long_term_review
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle
@@ -66,7 +71,7 @@ from .research.detail import (
 from .research.governance import evaluate_bank_model_promotion
 from .research.single_stock import research_single_stock, robustness_single_stock
 from .signals import trend_decision
-from .strategy_comparison import build_fair_comparison
+from .strategy_comparison import build_branch_history, build_fair_comparison
 from .strategy_universe import (
     active_strategy_universe,
     refresh_market_cap_universe,
@@ -83,6 +88,7 @@ SERVICE_DATABASE = STATE / "service.sqlite3"
 SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+INTRADAY_BASELINE_ACTIVATION_DATE = "20260908"
 
 
 def _composite_universe_symbols(store: ParquetStore) -> list[str]:
@@ -105,19 +111,13 @@ def _composite_universe_symbols(store: ParquetStore) -> list[str]:
     )
     membership["date"] = membership["date"].astype(str)
     latest_date = membership["date"].max()
-    symbols.update(
-        membership.loc[membership["date"] == latest_date, "ts_code"].astype(str)
-    )
+    symbols.update(membership.loc[membership["date"] == latest_date, "ts_code"].astype(str))
     return sorted(symbols)
 
 
 def _selected_factor_symbols(store: ParquetStore) -> list[str]:
     recommendation = store.read("global_factor_recommendation")
-    return sorted(
-        recommendation.loc[
-            recommendation["selected"].astype(bool), "symbol"
-        ].astype(str)
-    )
+    return sorted(recommendation.loc[recommendation["selected"].astype(bool), "symbol"].astype(str))
 
 
 def _next_open_trade_date(store: ParquetStore, trade_date: str) -> str | None:
@@ -126,8 +126,7 @@ def _next_open_trade_date(store: ParquetStore, trade_date: str) -> str | None:
     calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
     calendar["cal_date"] = calendar["cal_date"].astype(str)
     future = calendar.loc[
-        (calendar["cal_date"] > trade_date)
-        & (calendar["is_open"].astype(int) == 1),
+        (calendar["cal_date"] > trade_date) & (calendar["is_open"].astype(int) == 1),
         "cal_date",
     ].sort_values()
     return str(future.iloc[0]) if not future.empty else None
@@ -140,6 +139,7 @@ class TaskService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._run_lock = threading.Lock()
+        self._last_intraday_minute = ""
         with sqlite3.connect(self.database) as connection:
             connection.execute(
                 """
@@ -327,14 +327,10 @@ class TaskService:
     def runs(self, limit: int = 20) -> list[dict[str, Any]]:
         with sqlite3.connect(self.database) as connection:
             connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT * FROM task_runs ORDER BY id DESC LIMIT ?", (limit,)
-            )
+            rows = connection.execute("SELECT * FROM task_runs ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(row) for row in rows]
 
-    def steps(
-        self, limit: int = 100, run_id: int | None = None
-    ) -> list[dict[str, Any]]:
+    def steps(self, limit: int = 100, run_id: int | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM task_step_runs"
         params: list[object] = []
         if run_id is not None:
@@ -552,9 +548,7 @@ class TaskService:
                 raise RuntimeError("task configuration is missing")
             result = dict(row)
             result["enabled"] = bool(result["enabled"])
-            result["schedule"] = (
-                f"每日 {int(result['hour']):02d}:{int(result['minute']):02d}"
-            )
+            result["schedule"] = f"每日 {int(result['hour']):02d}:{int(result['minute']):02d}"
             result["timezone"] = "Asia/Shanghai"
             return result
 
@@ -642,6 +636,29 @@ class TaskService:
     def _scheduler_loop(self) -> None:
         while not self._stop.wait(20):
             now = datetime.now(SHANGHAI)
+            minute_key = now.strftime("%Y%m%d%H%M")
+            in_market_session = time(9, 35) <= now.time() <= time(11, 30) or time(
+                13, 0
+            ) <= now.time() <= time(15, 0)
+            in_execution_window = (
+                now.weekday() < 5
+                and in_market_session
+                and now.strftime("%Y%m%d") >= INTRADAY_BASELINE_ACTIVATION_DATE
+            )
+            if in_execution_window and minute_key != self._last_intraday_minute:
+                self._last_intraday_minute = minute_key
+                try:
+                    load_dotenv(ROOT / ".env")
+                    run_baseline_intraday_once(root=ROOT, now=now)
+                except Exception as intraday_error:  # noqa: BLE001
+                    self._notify(
+                        "ERROR",
+                        "INTRADAY_EXECUTION_FAILED",
+                        "基线日内执行失败",
+                        f"{type(intraday_error).__name__}: {intraday_error}",
+                        trade_date=now.strftime("%Y%m%d"),
+                        dedupe_key=f"{minute_key}:intraday-execution-failed",
+                    )
             config = self.config()
             if not config["enabled"]:
                 continue
@@ -705,12 +722,16 @@ class TaskService:
         latest_data_date = str(daily["trade_date"].astype(str).max())
         calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
         calendar["cal_date"] = calendar["cal_date"].astype(str)
-        dates = calendar.loc[
-            (calendar["cal_date"] > latest_data_date)
-            & (calendar["cal_date"] <= as_of_date)
-            & (calendar["is_open"].astype(int) == 1),
-            "cal_date",
-        ].sort_values().tolist()
+        dates = (
+            calendar.loc[
+                (calendar["cal_date"] > latest_data_date)
+                & (calendar["cal_date"] <= as_of_date)
+                & (calendar["is_open"].astype(int) == 1),
+                "cal_date",
+            ]
+            .sort_values()
+            .tolist()
+        )
         # Data can be present while the service was offline before the
         # downstream strategy/execution stages ran.  The recovery watermark is
         # therefore the latest *completed workflow*, not only the latest bar.
@@ -774,9 +795,7 @@ class TaskService:
                 return
             completed: list[str] = []
             for trade_date in dates:
-                child_run_id = self._create_run(
-                    "daily_pipeline", trade_date, "RECOVERY"
-                )
+                child_run_id = self._create_run("daily_pipeline", trade_date, "RECOVERY")
                 self._execute(child_run_id, trade_date)
                 child = next(row for row in self.runs(100) if row["id"] == child_run_id)
                 if child["status"] != "COMPLETED":
@@ -878,9 +897,7 @@ class TaskService:
                 run_id,
                 trade_date,
                 "strategy_universe_refresh",
-                lambda: refresh_market_cap_universe(
-                    provider, store, trade_date
-                ),
+                lambda: refresh_market_cap_universe(provider, store, trade_date),
             )
             _, daily_basic_result = self._run_step(
                 run_id,
@@ -930,7 +947,7 @@ class TaskService:
                     capture_output=True,
                     text=True,
                     timeout=900,
-                )
+                ),
             )
             strategy_failures: list[str] = []
             try:
@@ -947,15 +964,11 @@ class TaskService:
                     skip_if_completed=False,
                 )
             except Exception as fundamental_error:  # noqa: BLE001
-                strategy_failures.append(
-                    "selected_fundamental_backfill: "
-                    f"{type(fundamental_error).__name__}: {fundamental_error}"
-                )
                 self._notify(
-                    "ERROR",
-                    "TARGET_FUNDAMENTAL_BACKFILL_FAILED",
-                    "新目标股基本面补齐失败",
-                    str(fundamental_error),
+                    "WARNING",
+                    "TARGET_FUNDAMENTAL_BACKFILL_DEGRADED",
+                    "新目标股基本面补齐降级",
+                    f"{fundamental_error}；继续由数据健康检查判断 QMT/本地基本面覆盖是否足够。",
                     trade_date=trade_date,
                     run_id=run_id,
                 )
@@ -983,9 +996,7 @@ class TaskService:
                         trade_date=trade_date,
                         run_id=run_id,
                     )
-                    raise RuntimeError(
-                        f"multi-sector pipeline status: {value.status}"
-                    )
+                    raise RuntimeError(f"multi-sector pipeline status: {value.status}")
                 return value
 
             multi_result = None
@@ -998,8 +1009,7 @@ class TaskService:
                 )
             except Exception as multi_error:  # noqa: BLE001
                 strategy_failures.append(
-                    "multi_sector_execution: "
-                    f"{type(multi_error).__name__}: {multi_error}"
+                    f"multi_sector_execution: {type(multi_error).__name__}: {multi_error}"
                 )
             deferred = (
                 []
@@ -1007,8 +1017,7 @@ class TaskService:
                 else [
                     row
                     for row in multi_result.executions
-                    if str(row.get("status", "")).upper()
-                    in {"DEFERRED", "REJECTED", "BLOCKED"}
+                    if str(row.get("status", "")).upper() in {"DEFERRED", "REJECTED", "BLOCKED"}
                 ]
             )
             if deferred:
@@ -1104,9 +1113,7 @@ class TaskService:
 
     def _set_running(self, run_id: int) -> None:
         with sqlite3.connect(self.database) as connection:
-            connection.execute(
-                "UPDATE task_runs SET status = 'RUNNING' WHERE id = ?", (run_id,)
-            )
+            connection.execute("UPDATE task_runs SET status = 'RUNNING' WHERE id = ?", (run_id,))
 
     def _finish(
         self,
@@ -1162,10 +1169,47 @@ def health() -> dict[str, object]:
         "mode": "PAPER_ONLY",
         "scheduler": bool(task_service._thread and task_service._thread.is_alive()),
         "weekly_training_scheduler": bool(
-            weekly_training_service._thread
-            and weekly_training_service._thread.is_alive()
+            weekly_training_service._thread and weekly_training_service._thread.is_alive()
         ),
         "server_time": datetime.now(SHANGHAI).isoformat(),
+    }
+
+
+@app.get("/api/intraday-execution")
+def intraday_execution_status() -> dict[str, object]:
+    today = datetime.now(SHANGHAI).strftime("%Y%m%d")
+    target = STATE / "intraday-execution" / f"{today}.json"
+    latest: dict[str, object] = {}
+    if target.exists():
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        observations = payload.get("observations", [])
+        latest = observations[-1] if observations else {}
+    broker = PaperBroker(PAPER_DATABASE)
+    pending = [
+        row
+        for row in broker.orders()
+        if row.get("account_id") == INTRADAY_ACCOUNT and row.get("status") == "PENDING"
+    ]
+    try:
+        ticks = _records(
+            ParquetStore(DATA)
+            .read(
+                "baseline_intraday_account_ticks",
+                filters=[("trade_date", "==", today)],
+            )
+            .sort_values("observed_at")
+            .tail(300)
+        )
+    except FileNotFoundError:
+        ticks = []
+    return {
+        "policy_id": POLICY_ID,
+        "activation_date": INTRADAY_BASELINE_ACTIVATION_DATE,
+        "account_id": INTRADAY_ACCOUNT,
+        "pending_orders": pending,
+        "fills": broker.fills(INTRADAY_ACCOUNT, today),
+        "account_ticks": ticks,
+        "latest": latest,
     }
 
 
@@ -1200,9 +1244,7 @@ def factor_research(universe: str = "bank_cn") -> dict[str, object]:
         raise HTTPException(status_code=400, detail="invalid universe")
     store = ParquetStore(DATA)
     try:
-        membership = store.read(
-            "universe_membership", filters=[("universe", "==", universe)]
-        )
+        membership = store.read("universe_membership", filters=[("universe", "==", universe)])
         ic = store.read("factor_ic_report")
         period_ic = store.read("factor_ic_period_report")
         quantiles = store.read("factor_quantile_report")
@@ -1231,9 +1273,7 @@ def bank_model() -> dict[str, object]:
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     latest_date = scores["date"].max()
-    latest_scores = scores.loc[scores["date"] == latest_date].sort_values(
-        "score", ascending=False
-    )
+    latest_scores = scores.loc[scores["date"] == latest_date].sort_values("score", ascending=False)
     latest_targets = targets.loc[
         (targets["date"] == targets["date"].max()) & targets["selected"]
     ].sort_values("rank")
@@ -1253,14 +1293,16 @@ def bank_model() -> dict[str, object]:
         "latest_scores": _records(
             latest_scores[
                 [
-                    "symbol", "score", "value_score", "defensive_score",
-                    "momentum_score", "quality_score",
+                    "symbol",
+                    "score",
+                    "value_score",
+                    "defensive_score",
+                    "momentum_score",
+                    "quality_score",
                 ]
             ].head(20)
         ),
-        "latest_holdings": _records(
-            latest_targets[["symbol", "rank", "target"]]
-        ),
+        "latest_holdings": _records(latest_targets[["symbol", "rank", "target"]]),
     }
 
 
@@ -1313,13 +1355,9 @@ def bank_timing() -> dict[str, object]:
         "latest_date": str(current["date"])[:10],
         "report": _records(report),
         "current": _records(latest),
-        "equity_curve": _records(
-            active_equity.iloc[::20][["date", "equity", "drawdown"]]
-        ),
+        "equity_curve": _records(active_equity.iloc[::20][["date", "equity", "drawdown"]]),
         "decision": (
-            "FULL_BANK_BUDGET"
-            if float(current["risk_degree"]) >= 0.8
-            else "REDUCED_BANK_BUDGET"
+            "FULL_BANK_BUDGET" if float(current["risk_degree"]) >= 0.8 else "REDUCED_BANK_BUDGET"
         ),
         "evidence_note": (
             "The timing candidates were selected using already inspected history. "
@@ -1340,9 +1378,7 @@ def sector_portfolio() -> dict[str, object]:
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
-    config = yaml.safe_load(
-        (ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8")
-    )
+    config = yaml.safe_load((ROOT / "configs" / "sector_models.yaml").read_text(encoding="utf-8"))
     try:
         strategy_universe = active_strategy_universe(store)
         strategy_universe_info = universe_summary(strategy_universe)
@@ -1362,9 +1398,7 @@ def sector_portfolio() -> dict[str, object]:
         strategy_constituents["selected"] = (
             strategy_constituents["selected"].fillna(False).astype(bool)
         )
-        strategy_constituents["target_weight"] = (
-            strategy_constituents["target_weight"].fillna(0.0)
-        )
+        strategy_constituents["target_weight"] = strategy_constituents["target_weight"].fillna(0.0)
         industry_catalog = _records(
             strategy_constituents.groupby("industry", as_index=False)
             .agg(
@@ -1419,13 +1453,9 @@ def sector_portfolio() -> dict[str, object]:
         global_recommendation["date"].max(),
         int(config["global_selection"]["correlation_lookback"]),
     )
-    correlation_values = correlation.values[
-        np.triu_indices(len(correlation), 1)
-    ]
+    correlation_values = correlation.values[np.triu_indices(len(correlation), 1)]
     average_correlation = float(np.nanmean(correlation_values))
-    effective_bets = len(selected_symbols) / (
-        1 + (len(selected_symbols) - 1) * average_correlation
-    )
+    effective_bets = len(selected_symbols) / (1 + (len(selected_symbols) - 1) * average_correlation)
 
     universes = []
     for sector, definition in config["universes"].items():
@@ -1491,10 +1521,9 @@ def bank_execution() -> dict[str, object]:
                 (BANK_ACCOUNT,),
             )
         ]
-    orders = [
-        row for row in reversed(broker.orders())
-        if row.get("account_id") == BANK_ACCOUNT
-    ][:100]
+    orders = [row for row in reversed(broker.orders()) if row.get("account_id") == BANK_ACCOUNT][
+        :100
+    ]
     latest = _latest_bank_shadow()
     return {
         "orders": orders,
@@ -1530,9 +1559,7 @@ def multi_sector_execution() -> dict[str, object]:
             )
         ]
     orders = [
-        row
-        for row in reversed(broker.orders())
-        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
+        row for row in reversed(broker.orders()) if row.get("account_id") == MULTI_SECTOR_ACCOUNT
     ][:100]
     latest = _latest_multi_sector_shadow()
     position_symbols = [str(row["symbol"]) for row in positions]
@@ -1543,22 +1570,15 @@ def multi_sector_execution() -> dict[str, object]:
             columns=["ts_code", "trade_date", "close"],
             filters=[("ts_code", "in", position_symbols)],
         )
-        latest_daily = (
-            daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1)
-        )
+        latest_daily = daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1)
         live_marks = {
-            str(row["ts_code"]): float(row["close"])
-            for row in latest_daily.to_dict("records")
+            str(row["ts_code"]): float(row["close"]) for row in latest_daily.to_dict("records")
         }
     live_portfolio = broker.account_snapshot(live_marks, MULTI_SECTOR_ACCOUNT)
     catch_up_dir = STATE / "catch-up"
-    catch_up_reports = (
-        sorted(catch_up_dir.glob("*.json")) if catch_up_dir.exists() else []
-    )
+    catch_up_reports = sorted(catch_up_dir.glob("*.json")) if catch_up_dir.exists() else []
     latest_catch_up = (
-        json.loads(catch_up_reports[-1].read_text(encoding="utf-8"))
-        if catch_up_reports
-        else None
+        json.loads(catch_up_reports[-1].read_text(encoding="utf-8")) if catch_up_reports else None
     )
     analytics: dict[str, list[dict[str, object]]] = {}
     for api_key, table in {
@@ -1577,8 +1597,7 @@ def multi_sector_execution() -> dict[str, object]:
         "account_id": MULTI_SECTOR_ACCOUNT,
         "status": (
             "COMPLETED_CATCH_UP"
-            if latest_catch_up
-            and latest_catch_up.get("trade_date") == latest.get("trade_date")
+            if latest_catch_up and latest_catch_up.get("trade_date") == latest.get("trade_date")
             else latest.get("status", "AWAITING_FIRST_RUN")
         ),
         "trade_date": latest.get("trade_date"),
@@ -1597,9 +1616,7 @@ def multi_sector_execution() -> dict[str, object]:
         "return_attribution": latest.get("return_attribution", []),
         "risk_attribution": latest.get("risk_attribution", []),
         "execution_attribution": latest.get("execution_attribution", []),
-        "attribution_reconciliation": latest.get(
-            "attribution_reconciliation", {}
-        ),
+        "attribution_reconciliation": latest.get("attribution_reconciliation", {}),
         "corporate_actions_today": latest.get(
             "corporate_actions", {"registered": [], "settled": []}
         ),
@@ -1661,10 +1678,7 @@ def qlib_challenger() -> dict[str, object]:
     reports = sorted(reports_dir.glob("*.json")) if reports_dir.exists() else []
     latest = (
         max(
-            (
-                json.loads(path.read_text(encoding="utf-8"))
-                for path in reports
-            ),
+            (json.loads(path.read_text(encoding="utf-8")) for path in reports),
             key=lambda report: str(report.get("created_at", "")),
         )
         if reports
@@ -1739,19 +1753,13 @@ def qlib_challenger() -> dict[str, object]:
         "passed": bool(
             model_metrics
             and int(model_metrics["samples"]) >= int(gate_config["minimum_samples"])
-            and float(model_metrics["rank_ic"])
-            >= float(gate_config["minimum_rank_ic"])
-            and float(model_metrics["rank_ic_ir"])
-            >= float(gate_config["minimum_rank_ic_ir"])
-            and float(
-                model_metrics.get("cost_adjusted_top_k_excess_return", -1)
-            )
+            and float(model_metrics["rank_ic"]) >= float(gate_config["minimum_rank_ic"])
+            and float(model_metrics["rank_ic_ir"]) >= float(gate_config["minimum_rank_ic_ir"])
+            and float(model_metrics.get("cost_adjusted_top_k_excess_return", -1))
             > float(gate_config["minimum_cost_adjusted_excess_return"])
             and int(research.get("stability", {}).get("seed_count", 0))
             >= int(gate_config["minimum_seed_count"])
-            and float(
-                research.get("stability", {}).get("positive_seed_ratio", 0)
-            )
+            and float(research.get("stability", {}).get("positive_seed_ratio", 0))
             >= float(gate_config["minimum_positive_seed_ratio"])
         ),
     }
@@ -1760,10 +1768,8 @@ def qlib_challenger() -> dict[str, object]:
         **promotion_gate,
         "passed": bool(
             model_metrics
-            and float(model_metrics["rank_ic"])
-            >= float(promotion_gate["minimum_rank_ic"])
-            and float(model_metrics["rank_ic_ir"])
-            >= float(promotion_gate["minimum_rank_ic_ir"])
+            and float(model_metrics["rank_ic"]) >= float(promotion_gate["minimum_rank_ic"])
+            and float(model_metrics["rank_ic_ir"]) >= float(promotion_gate["minimum_rank_ic_ir"])
             and int(forward_evaluation.get("matured_days", 0))
             >= int(promotion_gate["minimum_forward_days"])
             and float(forward_evaluation.get("rank_ic") or -1)
@@ -1771,13 +1777,12 @@ def qlib_challenger() -> dict[str, object]:
         ),
     }
     orders = [
-        row
-        for row in reversed(broker.orders())
-        if row.get("account_id") == QLIB_CHALLENGER_ACCOUNT
+        row for row in reversed(broker.orders()) if row.get("account_id") == QLIB_CHALLENGER_ACCOUNT
     ][:100]
     comparison_sources: dict[str, pd.DataFrame] = {}
     for account_id, table in (
         (MULTI_SECTOR_ACCOUNT, "multi_sector_account_daily"),
+        (INTRADAY_ACCOUNT, "baseline_intraday_account_daily"),
         (QLIB_CHALLENGER_ACCOUNT, "qlib_challenger_account_daily"),
     ):
         try:
@@ -1785,6 +1790,13 @@ def qlib_challenger() -> dict[str, object]:
         except FileNotFoundError:
             history = pd.DataFrame()
         comparison_sources[account_id] = history
+    baseline_history = comparison_sources.get(MULTI_SECTOR_ACCOUNT, pd.DataFrame())
+    comparison_sources[INTRADAY_ACCOUNT] = build_branch_history(
+        baseline_history,
+        comparison_sources.get(INTRADAY_ACCOUNT, pd.DataFrame()),
+        branch_account_id=INTRADAY_ACCOUNT,
+        activation_date=INTRADAY_BASELINE_ACTIVATION_DATE,
+    )
     fair_comparison = build_fair_comparison(
         comparison_sources,
         minimum_observation_days=20,
@@ -1794,13 +1806,10 @@ def qlib_challenger() -> dict[str, object]:
     observed_candidate = candidate_rows[0] if candidate_rows else None
     candidate_history_all = pd.DataFrame()
     try:
-        candidate_history_all = store.read(CANDIDATE_HISTORY_TABLE).sort_values(
-            "trade_date"
-        )
+        candidate_history_all = store.read(CANDIDATE_HISTORY_TABLE).sort_values("trade_date")
     except FileNotFoundError:
         pass
     active_history = comparison_sources.get(QLIB_CHALLENGER_ACCOUNT, pd.DataFrame())
-    baseline_history = comparison_sources.get(MULTI_SECTOR_ACCOUNT, pd.DataFrame())
     observation_policy = challenger_config.get("candidate_observation_policy", {})
     preliminary_days = int(observation_policy.get("preliminary_review_days", 20))
     formal_days = int(observation_policy.get("formal_review_days", 60))
@@ -1869,12 +1878,12 @@ def qlib_challenger() -> dict[str, object]:
     ]
     all_strategy_histories = {
         MULTI_SECTOR_ACCOUNT: baseline_history,
+        INTRADAY_ACCOUNT: comparison_sources.get(INTRADAY_ACCOUNT, pd.DataFrame()),
         QLIB_CHALLENGER_ACCOUNT: active_history,
         **{
             str(row["account_id"]): (
                 candidate_history_all.loc[
-                    candidate_history_all["account_id"].astype(str)
-                    == str(row["account_id"])
+                    candidate_history_all["account_id"].astype(str) == str(row["account_id"])
                 ].copy()
                 if not candidate_history_all.empty
                 else pd.DataFrame()
@@ -1929,9 +1938,7 @@ def qlib_challenger() -> dict[str, object]:
             target_volatility=0.10,
         )
         candidate_orders = [
-            row
-            for row in reversed(broker.orders())
-            if row.get("account_id") == candidate_account
+            row for row in reversed(broker.orders()) if row.get("account_id") == candidate_account
         ][:100]
         candidate_observation = {
             "status": "OBSERVING",
@@ -1940,9 +1947,7 @@ def qlib_challenger() -> dict[str, object]:
             "leaderboard": candidate_leaderboard,
             "latest": observed_candidate.get("latest_report") or {},
             "latest_trade_date": observed_candidate.get("latest_trade_date"),
-            "research_gate_passed": observed_candidate.get(
-                "research_gate_passed", False
-            ),
+            "research_gate_passed": observed_candidate.get("research_gate_passed", False),
             "orders": candidate_orders,
             "fills": broker.fills(candidate_account),
             "reconciliation": asdict(broker.reconcile(candidate_account)),
@@ -1956,6 +1961,7 @@ def qlib_challenger() -> dict[str, object]:
     cycle_marks: dict[str, float] = {}
     comparison_account_ids = [
         MULTI_SECTOR_ACCOUNT,
+        INTRADAY_ACCOUNT,
         QLIB_CHALLENGER_ACCOUNT,
         *(str(row["account_id"]) for row in candidate_rows),
     ]
@@ -1972,8 +1978,7 @@ def qlib_challenger() -> dict[str, object]:
         )
         latest_marks = daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1)
         cycle_marks = {
-            str(row["ts_code"]): float(row["close"])
-            for row in latest_marks.to_dict("records")
+            str(row["ts_code"]): float(row["close"]) for row in latest_marks.to_dict("records")
         }
     trade_cycle_analysis = {
         account_id: analyze_trade_cycles(
@@ -1984,14 +1989,21 @@ def qlib_challenger() -> dict[str, object]:
         )
         for account_id in comparison_account_ids
     }
+    try:
+        intraday_portfolio = broker.account_snapshot(cycle_marks, INTRADAY_ACCOUNT)
+    except ValueError:
+        intraday_portfolio = {
+            "equity": 0,
+            "cash": 0,
+            "market_value": 0,
+            "positions": [],
+        }
     return {
         "account_id": QLIB_CHALLENGER_ACCOUNT,
         "research": research,
         "forward": forward_evaluation,
         "latest": latest,
-        "next_trade_date": _next_open_trade_date(
-            store, str(latest.get("trade_date", ""))
-        ),
+        "next_trade_date": _next_open_trade_date(store, str(latest.get("trade_date", ""))),
         "orders": orders,
         "fills": broker.fills(QLIB_CHALLENGER_ACCOUNT),
         "reconciliation": asdict(broker.reconcile(QLIB_CHALLENGER_ACCOUNT)),
@@ -2003,6 +2015,19 @@ def qlib_challenger() -> dict[str, object]:
         "drift": drift,
         "long_term_review": long_term_review,
         "candidate_observation": candidate_observation,
+        "intraday_baseline": {
+            "account_id": INTRADAY_ACCOUNT,
+            "status": "BRANCHED_FROM_BASELINE_20260908",
+            "parent_account_id": MULTI_SECTOR_ACCOUNT,
+            "activation_date": INTRADAY_BASELINE_ACTIVATION_DATE,
+            "portfolio": intraday_portfolio,
+            "orders": [
+                row
+                for row in reversed(broker.orders())
+                if row.get("account_id") == INTRADAY_ACCOUNT
+            ][:100],
+            "fills": broker.fills(INTRADAY_ACCOUNT),
+        },
         "baseline": {
             "account_id": MULTI_SECTOR_ACCOUNT,
             "latest": _latest_multi_sector_shadow(),
@@ -2182,9 +2207,7 @@ def candidates() -> dict[str, object]:
     return {
         "items": rows,
         "active_count": sum(bool(row["enabled"]) for row in rows),
-        "target_gross_weight": sum(
-            float(row["target_weight"]) for row in rows if row["enabled"]
-        ),
+        "target_gross_weight": sum(float(row["target_weight"]) for row in rows if row["enabled"]),
         "max_gross_weight": BacktestConfig.from_yaml(
             ROOT / "configs" / "default.yaml"
         ).max_gross_exposure,
@@ -2211,9 +2234,7 @@ def fills() -> list[dict[str, object]]:
         return []
     with sqlite3.connect(PAPER_DATABASE) as connection:
         connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            "SELECT * FROM fills ORDER BY id DESC LIMIT 50"
-        ).fetchall()
+        rows = connection.execute("SELECT * FROM fills ORDER BY id DESC LIMIT 50").fetchall()
         return [dict(row) for row in rows]
 
 
@@ -2222,15 +2243,11 @@ def execution() -> dict[str, object]:
     broker = PaperBroker(PAPER_DATABASE)
     with sqlite3.connect(PAPER_DATABASE) as connection:
         connection.row_factory = sqlite3.Row
-        fills_rows = connection.execute(
-            "SELECT * FROM fills ORDER BY id DESC LIMIT 100"
-        ).fetchall()
+        fills_rows = connection.execute("SELECT * FROM fills ORDER BY id DESC LIMIT 100").fetchall()
         attempt_rows = connection.execute(
             "SELECT * FROM execution_attempts ORDER BY id DESC LIMIT 100"
         ).fetchall()
-        position_rows = connection.execute(
-            "SELECT * FROM positions ORDER BY symbol"
-        ).fetchall()
+        position_rows = connection.execute("SELECT * FROM positions ORDER BY symbol").fetchall()
     return {
         "orders": list(reversed(broker.orders()))[:100],
         "fills": [dict(row) for row in fills_rows],
@@ -2285,8 +2302,7 @@ def operations_center() -> dict[str, object]:
     pending_orders = [
         row
         for row in reversed(broker.orders())
-        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
-        and row.get("status") == "PENDING"
+        if row.get("account_id") == MULTI_SECTOR_ACCOUNT and row.get("status") == "PENDING"
     ]
     with sqlite3.connect(PAPER_DATABASE) as connection:
         connection.row_factory = sqlite3.Row
@@ -2310,14 +2326,10 @@ def operations_center() -> dict[str, object]:
         "scheduler": {
             **config,
             "next_run": scheduled.isoformat(),
-            "seconds_to_next_run": max(
-                0, int((scheduled - now).total_seconds())
-            ),
+            "seconds_to_next_run": max(0, int((scheduled - now).total_seconds())),
         },
         "pending_orders": pending_orders,
-        "deferred_attempts": [
-            row for row in attempts if row["outcome"] != "FILLED"
-        ],
+        "deferred_attempts": [row for row in attempts if row["outcome"] != "FILLED"],
         "recent_attempts": attempts,
         "task_runs": task_service.runs(30),
         "task_steps": task_service.steps(100),
@@ -2329,9 +2341,7 @@ def operations_center() -> dict[str, object]:
 
 @app.get("/api/operational-readiness")
 def operational_readiness() -> dict[str, object]:
-    return _operational_readiness(
-        datetime.now(SHANGHAI).strftime("%Y%m%d")
-    )
+    return _operational_readiness(datetime.now(SHANGHAI).strftime("%Y%m%d"))
 
 
 def _operational_readiness(trade_date: str) -> dict[str, object]:
@@ -2339,9 +2349,7 @@ def _operational_readiness(trade_date: str) -> dict[str, object]:
     checks = []
     try:
         calendar = store.read("trade_calendar")
-        current = calendar.loc[
-            calendar["cal_date"].astype(str) == trade_date
-        ]
+        current = calendar.loc[calendar["cal_date"].astype(str) == trade_date]
         covered = len(current) == 1
         session = (
             "OPEN"
@@ -2365,9 +2373,7 @@ def _operational_readiness(trade_date: str) -> dict[str, object]:
         }
     )
     config = task_service.config()
-    scheduler_alive = bool(
-        task_service._thread and task_service._thread.is_alive()
-    )
+    scheduler_alive = bool(task_service._thread and task_service._thread.is_alive())
     checks.extend(
         [
             {
@@ -2379,9 +2385,7 @@ def _operational_readiness(trade_date: str) -> dict[str, object]:
                 "code": "SCHEDULER_THREAD",
                 "status": "PASS" if scheduler_alive else "BLOCK",
                 "message": (
-                    "调度线程正在运行"
-                    if scheduler_alive
-                    else "调度线程未运行，需要重启API服务"
+                    "调度线程正在运行" if scheduler_alive else "调度线程未运行，需要重启API服务"
                 ),
             },
         ]
@@ -2390,9 +2394,7 @@ def _operational_readiness(trade_date: str) -> dict[str, object]:
     repair = sum(row["status"] == "REPAIR" for row in checks)
     return {
         "trade_date": trade_date,
-        "status": (
-            "BLOCKED" if blocking else "REQUIRES_SYNC" if repair else "READY"
-        ),
+        "status": ("BLOCKED" if blocking else "REQUIRES_SYNC" if repair else "READY"),
         "market_session": session,
         "blocking_count": blocking,
         "repair_count": repair,
@@ -2426,32 +2428,23 @@ def _daily_run_preview(trade_date: str) -> dict[str, object]:
             calendar_source = "WEEKDAY_ESTIMATE"
             market_session = (
                 "OPEN_ESTIMATED"
-                if datetime.strptime(trade_date, "%Y%m%d")
-                .replace(tzinfo=SHANGHAI)
-                .weekday()
-                < 5
+                if datetime.strptime(trade_date, "%Y%m%d").replace(tzinfo=SHANGHAI).weekday() < 5
                 else "CLOSED_ESTIMATED"
             )
     except FileNotFoundError:
         calendar_source = "WEEKDAY_ESTIMATE"
         market_session = (
             "OPEN_ESTIMATED"
-            if datetime.strptime(trade_date, "%Y%m%d")
-            .replace(tzinfo=SHANGHAI)
-            .weekday()
-            < 5
+            if datetime.strptime(trade_date, "%Y%m%d").replace(tzinfo=SHANGHAI).weekday() < 5
             else "CLOSED_ESTIMATED"
         )
     broker = PaperBroker(PAPER_DATABASE)
     pending = [
         row
         for row in broker.orders()
-        if row.get("account_id") == MULTI_SECTOR_ACCOUNT
-        and row.get("status") == "PENDING"
+        if row.get("account_id") == MULTI_SECTOR_ACCOUNT and row.get("status") == "PENDING"
     ]
-    eligible = [
-        row for row in pending if str(row["signal_date"]) < trade_date
-    ]
+    eligible = [row for row in pending if str(row["signal_date"]) < trade_date]
     latest_shadow = _latest_multi_sector_shadow()
     return {
         **preview,
@@ -2504,15 +2497,11 @@ def update_task_config(payload: dict[str, object]) -> dict[str, object]:
 
 @app.post("/api/tasks/daily-run")
 def trigger_daily(payload: dict[str, str] | None = None) -> dict[str, object]:
-    trade_date = (payload or {}).get(
-        "trade_date", datetime.now(SHANGHAI).strftime("%Y%m%d")
-    )
+    trade_date = (payload or {}).get("trade_date", datetime.now(SHANGHAI).strftime("%Y%m%d"))
     if len(trade_date) != 8 or not trade_date.isdigit():
         raise HTTPException(status_code=400, detail="trade_date must use YYYYMMDD")
     return {
-        "run_id": task_service.trigger_recovery(
-            trade_date, force_current_session=True
-        ),
+        "run_id": task_service.trigger_recovery(trade_date, force_current_session=True),
         "status": "QUEUED_RECOVERY",
         "mode": "RECOVER_MISSING_TRADING_DAYS_THEN_RECALCULATE",
     }
@@ -2617,8 +2606,5 @@ def _fundamental_context(symbol: str) -> dict[str, object] | None:
             "境内外投资面临市场、政策、汇率与地缘政治风险",
         ],
         "source": "中国长江电力股份有限公司2025年年度报告",
-        "source_url": (
-            "https://www.cypc.com.cn/cypc/attachDir/2026/05/"
-            "2026051815345898336.pdf"
-        ),
+        "source_url": ("https://www.cypc.com.cn/cypc/attachDir/2026/05/2026051815345898336.pdf"),
     }
