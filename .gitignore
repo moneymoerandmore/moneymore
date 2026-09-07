@@ -2,6 +2,9 @@
 .runtime/
 __pycache__/
 .pytest_cache/
+.test-temp/
+.test-tmp/
+.test-run-*/
 .ruff_cache/
 *.py[cod]
 *.egg-info/
