@@ -27,7 +27,7 @@ from .data.fundamental_sync import (
     sync_daily_basic_universe,
     sync_missing_target_fundamentals,
 )
-from .data.qmt_provider import create_market_data_provider
+from .data.qmt_provider import QmtTushareProvider, create_market_data_provider
 from .data.research import load_total_return_stock_bars
 from .data.store import ParquetStore
 from .execution.paper import PaperBroker
@@ -44,7 +44,7 @@ from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
 )
-from .open_execution import execute_accounts_at_open
+from .open_execution import execute_accounts_at_qmt_open
 from .point_in_time import materialize_point_in_time_store
 from .portfolio_constructor import adjusted_close_panel, trailing_return_correlation
 from .qlib_candidate_observer import (
@@ -140,6 +140,8 @@ class TaskService:
         self._thread: threading.Thread | None = None
         self._run_lock = threading.Lock()
         self._last_intraday_minute = ""
+        self._last_open_execution_date = ""
+        self._last_open_execution_minute = ""
         with sqlite3.connect(self.database) as connection:
             connection.execute(
                 """
@@ -376,7 +378,6 @@ class TaskService:
     def preview(self, trade_date: str) -> dict[str, object]:
         step_names = [
             "bank_pipeline",
-            "open_order_execution",
             "strategy_universe_refresh",
             "composite_daily_basic",
             "sector_research",
@@ -637,6 +638,46 @@ class TaskService:
         while not self._stop.wait(20):
             now = datetime.now(SHANGHAI)
             minute_key = now.strftime("%Y%m%d%H%M")
+            trade_date = now.strftime("%Y%m%d")
+            open_execution_window = (
+                now.weekday() < 5
+                and time(9, 31) <= now.time() <= time(18, 25)
+                and self._is_open_trade_date(trade_date)
+            )
+            if (
+                open_execution_window
+                and trade_date != self._last_open_execution_date
+                and minute_key != self._last_open_execution_minute
+            ):
+                self._last_open_execution_minute = minute_key
+                try:
+                    load_dotenv(ROOT / ".env")
+                    result = execute_accounts_at_qmt_open(
+                        provider=QmtTushareProvider(root=ROOT),
+                        broker=PaperBroker(PAPER_DATABASE),
+                        config=BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml"),
+                        trade_date=trade_date,
+                        account_ids=[
+                            MULTI_SECTOR_ACCOUNT,
+                            QLIB_CHALLENGER_ACCOUNT,
+                            *[
+                                candidate_account_id(str(row["candidate_tag"]))
+                                for row in candidate_catalog(ROOT)
+                            ],
+                        ],
+                        audit_dir=STATE / "open-execution",
+                    )
+                    if result["status"] == "COMPLETED":
+                        self._last_open_execution_date = trade_date
+                except Exception as open_error:  # noqa: BLE001
+                    self._notify(
+                        "ERROR",
+                        "OPEN_EXECUTION_FAILED",
+                        "开盘撮合失败",
+                        f"{type(open_error).__name__}: {open_error}",
+                        trade_date=trade_date,
+                        dedupe_key=f"{minute_key}:open-execution-failed",
+                    )
             in_market_session = time(9, 35) <= now.time() <= time(11, 30) or time(
                 13, 0
             ) <= now.time() <= time(15, 0)
@@ -664,9 +705,20 @@ class TaskService:
                 continue
             if (now.hour, now.minute) < (int(config["hour"]), int(config["minute"])):
                 continue
-            trade_date = now.strftime("%Y%m%d")
             if self._scheduler_should_trigger(trade_date, now):
                 self.trigger_recovery(trade_date, "SCHEDULED")
+
+    @staticmethod
+    def _is_open_trade_date(trade_date: str) -> bool:
+        try:
+            calendar = ParquetStore(DATA).read(
+                "trade_calendar",
+                columns=["cal_date", "is_open"],
+                filters=[("cal_date", "==", trade_date)],
+            )
+        except (FileNotFoundError, ValueError):
+            return False
+        return bool(len(calendar) == 1 and int(calendar.iloc[0]["is_open"]) == 1)
 
     def _scheduler_should_trigger(
         self,
@@ -871,27 +923,6 @@ class TaskService:
                 return
             if result is not None and result.status != "COMPLETED":
                 raise RuntimeError(f"bank pipeline status: {result.status}")
-
-            self._run_step(
-                run_id,
-                trade_date,
-                "open_order_execution",
-                lambda: execute_accounts_at_open(
-                    store=store,
-                    broker=broker,
-                    config=config,
-                    trade_date=trade_date,
-                    account_ids=[
-                        MULTI_SECTOR_ACCOUNT,
-                        QLIB_CHALLENGER_ACCOUNT,
-                        *[
-                            candidate_account_id(str(row["candidate_tag"]))
-                            for row in candidate_catalog(ROOT)
-                        ],
-                    ],
-                    audit_dir=STATE / "open-execution",
-                ),
-            )
 
             self._run_step(
                 run_id,
@@ -1211,6 +1242,46 @@ def intraday_execution_status() -> dict[str, object]:
         "account_ticks": ticks,
         "latest": latest,
     }
+
+
+def _open_execution_status(trade_date: str) -> dict[str, object]:
+    target = STATE / "open-execution" / f"{trade_date}.json"
+    audit = (
+        json.loads(target.read_text(encoding="utf-8"))
+        if target.exists()
+        else {
+            "trade_date": trade_date,
+            "status": "WAITING_FOR_OPEN",
+            "price_source": "QMT_SESSION_OPEN",
+            "accounts": [],
+        }
+    )
+    account_ids = [
+        MULTI_SECTOR_ACCOUNT,
+        QLIB_CHALLENGER_ACCOUNT,
+        *[candidate_account_id(str(row["candidate_tag"])) for row in candidate_catalog(ROOT)],
+    ]
+    broker = PaperBroker(PAPER_DATABASE)
+    pending = [
+        row
+        for row in broker.orders()
+        if str(row.get("account_id")) in account_ids
+        and row.get("status") == "PENDING"
+        and str(row.get("signal_date", "")) < trade_date
+    ]
+    fills = [row for account_id in account_ids for row in broker.fills(account_id, trade_date)]
+    return {
+        **audit,
+        "scheduled_time": "09:31",
+        "account_ids": account_ids,
+        "pending_orders": pending,
+        "fills": sorted(fills, key=lambda row: int(row.get("id", 0)), reverse=True),
+    }
+
+
+@app.get("/api/open-execution")
+def open_execution_status() -> dict[str, object]:
+    return _open_execution_status(datetime.now(SHANGHAI).strftime("%Y%m%d"))
 
 
 @app.get("/api/weekly-training")
@@ -1980,15 +2051,39 @@ def qlib_challenger() -> dict[str, object]:
         cycle_marks = {
             str(row["ts_code"]): float(row["close"]) for row in latest_marks.to_dict("records")
         }
-    trade_cycle_analysis = {
-        account_id: analyze_trade_cycles(
+    trade_cycle_analysis = {}
+    for account_id in comparison_account_ids:
+        fills = broker.fills(account_id)
+        actions = broker.corporate_actions(account_id)
+        if account_id == INTRADAY_ACCOUNT:
+            # The intraday account is a true fork of the factor baseline.  Its
+            # opening positions therefore need the parent's pre-fork ledger
+            # when reconstructing complete holding cycles; only post-fork
+            # executions come from the independent account.
+            fills = [
+                row
+                for row in broker.fills(MULTI_SECTOR_ACCOUNT)
+                if str(row.get("trade_date", "")) < INTRADAY_BASELINE_ACTIVATION_DATE
+            ] + [
+                row
+                for row in fills
+                if str(row.get("trade_date", "")) >= INTRADAY_BASELINE_ACTIVATION_DATE
+            ]
+            actions = [
+                row
+                for row in broker.corporate_actions(MULTI_SECTOR_ACCOUNT)
+                if str(row.get("trade_date", "")) < INTRADAY_BASELINE_ACTIVATION_DATE
+            ] + [
+                row
+                for row in actions
+                if str(row.get("trade_date", "")) >= INTRADAY_BASELINE_ACTIVATION_DATE
+            ]
+        trade_cycle_analysis[account_id] = analyze_trade_cycles(
             account_id,
-            broker.fills(account_id),
-            broker.corporate_actions(account_id),
+            fills,
+            actions,
             cycle_marks,
         )
-        for account_id in comparison_account_ids
-    }
     try:
         intraday_portfolio = broker.account_snapshot(cycle_marks, INTRADAY_ACCOUNT)
     except ValueError:
@@ -2336,6 +2431,7 @@ def operations_center() -> dict[str, object]:
         "notifications": task_service.notifications(100),
         "preview": preview,
         "readiness": _operational_readiness(today),
+        "open_execution": _open_execution_status(today),
     }
 
 

@@ -7,7 +7,7 @@ from moneymore.data.store import ParquetStore
 from moneymore.execution.paper import PaperBroker
 from moneymore.execution.risk import OrderIntent, RiskResult
 from moneymore.models import Side
-from moneymore.open_execution import execute_accounts_at_open
+from moneymore.open_execution import execute_accounts_at_open, execute_accounts_at_qmt_open
 
 
 def _config() -> BacktestConfig:
@@ -25,9 +25,7 @@ def _config() -> BacktestConfig:
     )
 
 
-def test_open_execution_fills_all_accounts_once(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_open_execution_fills_all_accounts_once(tmp_path: Path, monkeypatch) -> None:
     broker = PaperBroker(tmp_path / "paper.sqlite3")
     accounts = ["factor", "challenger", "candidate"]
     for index, account in enumerate(accounts):
@@ -72,3 +70,55 @@ def test_open_execution_fills_all_accounts_once(
     assert first["execution_events"] == 3
     assert second["execution_events"] == 0
     assert all(broker.reconcile(account).matched for account in accounts)
+
+
+def test_qmt_open_execution_uses_session_open_and_is_idempotent(tmp_path: Path) -> None:
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000, "factor")
+    broker.submit(
+        RiskResult(
+            True,
+            OrderIntent(
+                idempotency_key="qmt-buy",
+                strategy_id="test",
+                symbol="600036.SH",
+                side=Side.BUY,
+                quantity=100,
+                signal_date="20260907",
+                reason_code="TEST",
+            ),
+            None,
+        ),
+        "factor",
+    )
+
+    class Provider:
+        @staticmethod
+        def intraday_quotes(_symbols: list[str]) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": "600036.SH",
+                        "open": 40.0,
+                        "last": 41.0,
+                        "up_limit": 44.0,
+                        "down_limit": 36.0,
+                    }
+                ]
+            )
+
+    arguments = {
+        "provider": Provider(),
+        "broker": broker,
+        "config": _config(),
+        "trade_date": "20260908",
+        "account_ids": ["factor"],
+        "audit_dir": tmp_path / "audit",
+    }
+    first = execute_accounts_at_qmt_open(**arguments)
+    second = execute_accounts_at_qmt_open(**arguments)
+
+    assert first["price_source"] == "QMT_SESSION_OPEN"
+    assert first["execution_events"] == 1
+    assert second["execution_events"] == 0
+    assert broker.fills("factor")[0]["price"] < 40.1
