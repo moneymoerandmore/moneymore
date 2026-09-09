@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 
 type Row = Record<string, unknown>;
 type Page = "overview" | "sectors" | "research" | "challenger" | "data" | "operations";
@@ -54,6 +54,19 @@ type IntradayExecution = {
   pending_orders: Row[]; fills: Row[]; account_ticks: Row[];
   latest: Row & { decisions?: Row[]; executions?: Row[] };
 };
+type LiveAccount = {
+  portfolio: Bank["shadow"]["portfolio"] & { market_value?:number };
+  positions: Row[]; orders: Row[]; fills: Row[];
+  today_fills: Row[]; pending_orders: Row[];
+};
+type LiveAccounts = {
+  observed_at:string; quote_source:string; symbol_count:number;
+  accounts:Record<string,LiveAccount>;
+};
+type SecurityHistory = {
+  symbol:string; name:string; bars:Row[]; fills:Row[];
+  coverage: { start_date:string; end_date:string; trading_days:number; fill_count:number };
+};
 type ModelRegistry = { versions: Row[]; artifacts: Row[]; bindings: Row[] };
 type MonthlyAcceptance = {
   cycle_id: string; start_date: string; observation_date: string; status: string;
@@ -85,6 +98,9 @@ type Challenger = {
     global_strategy_view?: Challenger["comparison"] & { strategy_count?:number };
   };
 };
+
+const SecurityNavigationContext=createContext<(symbol:string,accountId?:string)=>void>(()=>{});
+const SecurityAccountContext=createContext<string>("multi_sector_shadow");
 
 const nav: { id: Page; label: string; note: string }[] = [
   { id: "overview", label: "组合总览", note: "PORTFOLIO" },
@@ -145,6 +161,11 @@ export default function Dashboard() {
   const [acceptance, setAcceptance] = useState<MonthlyAcceptance | null>(null);
   const [challenger, setChallenger] = useState<Challenger | null>(null);
   const [intraday, setIntraday] = useState<IntradayExecution | null>(null);
+  const [live, setLive] = useState<LiveAccounts | null>(null);
+  const [securityDetail,setSecurityDetail]=useState<SecurityHistory|null>(null);
+  const [securityDetailAccount,setSecurityDetailAccount]=useState("");
+  const [securityDetailLoading,setSecurityDetailLoading]=useState(false);
+  const [securityDetailError,setSecurityDetailError]=useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
@@ -156,20 +177,47 @@ export default function Dashboard() {
       setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
+  const refreshLive = useCallback(async () => {
+    try { setLive(await json<LiveAccounts>("/api/live-accounts")); }
+    catch { /* retain the last valid live snapshot */ }
+  }, []);
   useEffect(() => {
     const initial = window.setTimeout(refresh, 0);
     const id = window.setInterval(refresh, 30_000);
     return () => { clearTimeout(initial); clearInterval(id); };
   }, [refresh]);
+  useEffect(() => {
+    const initial = window.setTimeout(refreshLive, 250);
+    const id = window.setInterval(refreshLive, 5_000);
+    return () => { clearTimeout(initial); clearInterval(id); };
+  }, [refreshLive]);
   const run = async () => {
     setBusy(true);
     try { await json("/api/tasks/daily-run", { method: "POST" }); window.setTimeout(refresh, 1200); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "任务启动失败"); }
     finally { setBusy(false); }
   };
+  const openSecurity=useCallback(async(symbol:string,accountId?:string)=>{
+    setSecurityDetailLoading(true); setSecurityDetailError("");
+    setSecurityDetailAccount(accountId??"");
+    try { setSecurityDetail(await json<SecurityHistory>(`/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
+    catch(reason) { setSecurityDetailError(reason instanceof Error?reason.message:"证券历史加载失败"); }
+    finally { setSecurityDetailLoading(false); }
+  },[]);
+  useEffect(() => {
+    const symbol=securityDetail?.symbol;
+    if(!symbol)return;
+    const id=window.setInterval(async()=>{
+      try { setSecurityDetail(await json<SecurityHistory>(`/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
+      catch { /* keep the last valid candle while QMT reconnects */ }
+    },10_000);
+    return ()=>clearInterval(id);
+  },[securityDetail?.symbol]);
   if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   const current = nav.find((item) => item.id === page)!;
-  return <div className="app-shell">
+  const liveBaseline=live?.accounts[execution.account_id];
+  const displayedExecution=liveBaseline?{...execution,portfolio:liveBaseline.portfolio,positions:liveBaseline.positions,orders:liveBaseline.orders,fills:liveBaseline.fills}:execution;
+  return <SecurityNavigationContext.Provider value={(symbol,accountId)=>void openSecurity(symbol,accountId)}><div className="app-shell">
     <aside>
       <div className="brand"><span>M</span><div><b>MoneyMore</b><small>MULTI-SECTOR QUANT</small></div></div>
       <div className="system-card"><i/><small>ACTIVE SYSTEM</small><b>全局横截面组合</b><span>统一候选池 · 行业仅作归因</span></div>
@@ -177,16 +225,16 @@ export default function Dashboard() {
       <div className="aside-foot"><i/> PAPER ONLY<br/><small>{bank.scheduler.time} · {bank.scheduler.timezone}</small></div>
     </aside>
     <main className="workspace">
-      <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> 数据日 {sectors.latest_date}</span><button onClick={() => void refresh()}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "恢复中…" : "恢复并重算"}</button></div></header>
+      <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> {live?.quote_source==="QMT_REALTIME"?"实时 · "+live.observed_at.slice(11,19):"数据日 "+sectors.latest_date}</span><button onClick={() => { void refresh(); void refreshLive(); }}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "恢复中…" : "恢复并重算"}</button></div></header>
       {error && <div className="error">{error}</div>}
-      {page === "overview" && <Overview sectors={sectors} execution={execution}/>}
-      {page === "sectors" && <SectorPage sectors={sectors}/>}
-      {page === "research" && <Research sectors={sectors} models={models}/>}
-      {page === "challenger" && <><ChallengerPage challenger={challenger} names={sectors.symbol_names}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></>}
+      {page === "overview" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Overview sectors={sectors} execution={displayedExecution}/></SecurityAccountContext.Provider>}
+      {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
+      {page === "research" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Research sectors={sectors} models={models}/></SecurityAccountContext.Provider>}
+      {page === "challenger" && <SecurityAccountContext.Provider value="qlib_gru_shadow"><ChallengerPage challenger={challenger} names={sectors.symbol_names} live={live}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></SecurityAccountContext.Provider>}
       {page === "data" && <DataHealth quality={quality}/>}
-      {page === "operations" && <Operations bank={bank} execution={execution} operations={operations} acceptance={acceptance} intraday={intraday} names={sectors.symbol_names} onRefresh={refresh}/>}
+      {page === "operations" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Operations bank={bank} execution={displayedExecution} operations={operations} acceptance={acceptance} intraday={intraday} live={live} names={sectors.symbol_names} onRefresh={refresh}/></SecurityAccountContext.Provider>}
     </main>
-  </div>;
+  </div>{(securityDetailLoading||securityDetailError||securityDetail)&&<SecurityHistoryModal detail={securityDetail} initialAccountId={securityDetailAccount} loading={securityDetailLoading} error={securityDetailError} onClose={()=>{setSecurityDetail(null);setSecurityDetailError("");}}/>}</SecurityNavigationContext.Provider>;
 }
 
 function Overview({ sectors, execution }: { sectors: Sectors; execution: Execution }) {
@@ -229,7 +277,7 @@ function Research({ sectors, models }: { sectors: Sectors; models: ModelRegistry
     <Panel title="迁移前分行业历史诊断（归档）" subtitle="旧人工候选池研究结果，仅保留审计，不代表当前Top1000策略"><Table rows={reports} columns={[["sector","旧分类"],["cagr","年化"],["volatility","波动率"],["sharpe","夏普"],["max_drawdown","最大回撤"],["fills","成交数"]]} format={{sector:(v)=>meta[text(v)]?.label??text(v),cagr:pct,volatility:pct,sharpe:num,max_drawdown:pct}}/></Panel><Evidence sectors={sectors}/></>;
 }
 
-function ChallengerPage({ challenger, names }: { challenger: Challenger; names: Record<string, string> }) {
+function ChallengerPage({ challenger, names, live }: { challenger: Challenger; names: Record<string, string>; live:LiveAccounts|null }) {
   const candidateVersions = challenger.candidate_observation?.candidates??[];
   const [selectedCandidateTag,setSelectedCandidateTag] = useState("");
   const selectedCandidate = candidateVersions.find((row)=>row.candidate_tag===selectedCandidateTag)??candidateVersions.find((row)=>Boolean(row.latest_trade_date))??candidateVersions[0];
@@ -242,20 +290,25 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
     sectorRanks[sector] = (sectorRanks[sector]??0) + 1;
     return {...row, sector_rank:sectorRanks[sector], selected:selected.has(text(row.instrument))};
   });
-  const challengerEquity = Number(challenger.latest.portfolio?.equity??1_000_000);
-  const baselinePortfolio = challenger.baseline.latest.portfolio as Row|undefined;
+  const challengerLive=live?.accounts[challenger.account_id];
+  const baselineLive=live?.accounts[challenger.baseline.account_id];
+  const intradayLive=live?.accounts[text(challenger.intraday_baseline?.account_id)];
+  const challengerPortfolio = challengerLive?.portfolio??challenger.latest.portfolio;
+  const challengerEquity = Number(challengerPortfolio?.equity??1_000_000);
+  const baselinePortfolio = (baselineLive?.portfolio??challenger.baseline.latest.portfolio) as Row|undefined;
   const baselineEquity = Number(baselinePortfolio?.equity??1_000_000);
   const observation = challenger.candidate_observation;
-  const candidatePortfolio = selectedCandidate?.latest?.portfolio??observation?.latest?.portfolio;
+  const candidateLive=live?.accounts[text(selectedCandidate?.account_id??observation?.account_id)];
+  const candidatePortfolio = candidateLive?.portfolio??selectedCandidate?.latest?.portfolio??observation?.latest?.portfolio;
   const candidateEquity = Number(candidatePortfolio?.equity??1_000_000);
   const globalView = observation?.global_strategy_view??challenger.comparison;
   return <><Intro tag="QLIB CHALLENGER LAB" title="深度学习只能通过公平竞赛晋级">挑战者使用独立资金、模型、信号、订单和持仓。因子影子账户保持冻结；GPU只加速训练，不改变样本外和成本后晋级标准。</Intro>
     <CandidateSwitcher observation={observation} selectedTag={text(selectedCandidate?.candidate_tag)} onSelect={setSelectedCandidateTag}/>
     <div className="four-col account-columns">
-      <AccountColumn title="基线" badge="FACTOR BASELINE" accountId={challenger.baseline.account_id} status={text(challenger.baseline.latest.status)} equity={baselineEquity} portfolio={baselinePortfolio} orders={challenger.baseline.orders??[]} fills={challenger.baseline.fills??[]} names={names}/>
-      <AccountColumn title="基线·日内执行" badge="ADAPTIVE VWAP" accountId={text(challenger.intraday_baseline?.account_id)} status={text(challenger.intraday_baseline?.status)} equity={Number(challenger.intraday_baseline?.portfolio?.equity??0)} portfolio={challenger.intraday_baseline?.portfolio} orders={challenger.intraday_baseline?.orders??[]} fills={challenger.intraday_baseline?.fills??[]} names={names}/>
-      <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challenger.latest.portfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challenger.orders} fills={challenger.fills} names={names}/>
-      <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={text(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={selectedCandidate?.orders??observation?.orders??[]} fills={selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
+      <AccountColumn title="基线" badge="FACTOR BASELINE" accountId={challenger.baseline.account_id} status={text(challenger.baseline.latest.status)} equity={baselineEquity} portfolio={baselinePortfolio} orders={baselineLive?.orders??challenger.baseline.orders??[]} fills={baselineLive?.fills??challenger.baseline.fills??[]} names={names}/>
+      <AccountColumn title="基线·日内执行" badge="ADAPTIVE VWAP" accountId={text(challenger.intraday_baseline?.account_id)} status={text(challenger.intraday_baseline?.status)} equity={Number(intradayLive?.portfolio.equity??challenger.intraday_baseline?.portfolio?.equity??0)} portfolio={intradayLive?.portfolio??challenger.intraday_baseline?.portfolio} orders={intradayLive?.orders??challenger.intraday_baseline?.orders??[]} fills={intradayLive?.fills??challenger.intraday_baseline?.fills??[]} names={names}/>
+      <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challengerPortfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challengerLive?.orders??challenger.orders} fills={challengerLive?.fills??challenger.fills} names={names}/>
+      <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={text(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={candidateLive?.orders??selectedCandidate?.orders??observation?.orders??[]} fills={candidateLive?.fills??selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
     </div>
     <PerformanceComparisonCharts comparison={globalView}/>
     <CandidateObservation challenger={challenger} selectedTag={text(selectedCandidate?.candidate_tag)}/>
@@ -270,7 +323,7 @@ function ChallengerPage({ challenger, names }: { challenger: Challenger; names: 
 function AccountColumn({ title, badge, accountId, status, equity, portfolio, targetExposure, exposurePolicy, orders, fills, names, accent=false }: { title:string; badge:string; accountId:string; status:string; equity:number; portfolio?:Row; targetExposure?:number; exposurePolicy?:Row; orders:Row[]; fills:Row[]; names:Record<string,string>; accent?:boolean }) {
   const positions = (portfolio?.positions??[]) as Row[];
   const marketValue = Number(portfolio?.market_value??0);
-  return <article className={`account-column${accent?" account-column-accent":""}`}><header><span>{badge}</span><h3>{title}</h3><small>{accountId}</small></header><div className="account-equity"><b>{money(equity)}</b><span>累计 {pct(equity/1_000_000-1)} · 仓位 {pct(equity?marketValue/equity:0)}{Number.isFinite(targetExposure)?` / 目标 ${pct(targetExposure)}`:""}</span>{exposurePolicy?.realized_volatility!=null&&<small>组合波动 {pct(exposurePolicy.realized_volatility)} · 风险目标 {pct(exposurePolicy.annual_target)}</small>}<i>{status}</i></div><h4>当前持仓 · {positions.length}</h4><Table rows={positions.slice(0,12)} columns={[["symbol","证券"],["quantity","数量"],["avg_cost","成本"]]} format={{symbol:(v)=>security(v,names),avg_cost:num}}/><h4>最近委托</h4><Table rows={orders.slice(0,8)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["status","状态"]]} format={{symbol:(v)=>security(v,names)}}/><h4>最近成交</h4><Table rows={fills.slice(-8).reverse()} columns={[["trade_date","成交日"],["symbol","股票"],["side","方向"],["quantity","数量"],["price","成交价"]]} format={{symbol:(v)=>names[text(v)]??"未知证券",price:num}}/></article>;
+  return <SecurityAccountContext.Provider value={accountId}><article className={`account-column${accent?" account-column-accent":""}`}><header><span>{badge}</span><h3>{title}</h3><small>{accountId}</small></header><div className="account-equity"><b>{money(equity)}</b><span>累计 {pct(equity/1_000_000-1)} · 仓位 {pct(equity?marketValue/equity:0)}{Number.isFinite(targetExposure)?` / 目标 ${pct(targetExposure)}`:""}</span>{exposurePolicy?.realized_volatility!=null&&<small>组合波动 {pct(exposurePolicy.realized_volatility)} · 风险目标 {pct(exposurePolicy.annual_target)}</small>}<i>{status}</i></div><h4>当前持仓 · {positions.length}</h4><Table rows={positions.slice(0,12)} columns={[["symbol","证券"],["quantity","数量"],["avg_cost","成本"],["last","现价"],["market_value","市值"],["unrealized_pnl","浮盈亏"]]} format={{symbol:(v)=>security(v,names),avg_cost:num,last:num,market_value:money,unrealized_pnl:money}}/><h4>最近委托</h4><Table rows={orders.slice(0,8)} columns={[["signal_date","信号日"],["symbol","证券"],["side","方向"],["status","状态"]]} format={{symbol:(v)=>security(v,names)}}/><h4>最近成交</h4><Table rows={fills.slice(-8).reverse()} columns={[["trade_date","成交日"],["symbol","股票"],["side","方向"],["quantity","数量"],["price","成交价"]]} format={{symbol:(v)=>names[text(v)]??"未知证券",price:num}}/></article></SecurityAccountContext.Provider>;
 }
 
 function CandidateSwitcher({ observation, selectedTag, onSelect }: { observation:Challenger["candidate_observation"]; selectedTag:string; onSelect:(tag:string)=>void }) {
@@ -298,7 +351,7 @@ function TradeCycleComparison({ challenger, names, candidateAccountId }: { chall
     ...(candidateAccountId?[{id:candidateAccountId,label:"Qlib 候选者"}]:[]),
   ];
   const summaryRows = accounts.map(({id,label})=>({strategy:label,...(analysis[id]?.summary??{})}));
-  return <><Panel title="完整持仓周期胜率与赔率" subtitle="从首次建仓到仓位归零算一个闭合周期；分批买卖合并，费用、滑点和分红计入；未清仓周期不进入胜率"><Table rows={summaryRows} columns={[["strategy","策略"],["closed_cycles","闭合周期"],["wins","盈利"],["losses","亏损"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","累计已实现盈亏"],["average_return","平均周期收益"]]} format={{win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,average_return:pct}}/></Panel><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 个股持仓周期`} subtitle="每只股票所有已闭合周期聚合；当前开放周期单独标记"><Table rows={analysis[id]?.by_symbol??[]} columns={[["symbol","证券"],["closed_cycles","闭合"],["wins","赢"],["losses","亏"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","已实现盈亏"],["open_cycle","持仓中"],["open_estimated_pnl","浮动盈亏"]]} format={{symbol:(v)=>security(v,names),win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,open_cycle:(v)=>v?"是":"否",open_estimated_pnl:money}}/></Panel>)}</div><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 已闭合周期明细`} subtitle="用于核验每次从建仓到清仓的真实结果"><Table rows={(analysis[id]?.closed_cycles??[]).slice(0,100)} columns={[["entry_date","建仓日"],["exit_date","清仓日"],["symbol","证券"],["pnl","净盈亏"],["return_rate","周期收益"],["dividend_income","分红"],["fees","费用"],["fill_count","成交笔数"],["result","结果"]]} format={{symbol:(v)=>security(v,names),pnl:money,return_rate:pct,dividend_income:money,fees:money}}/></Panel>)}</div></>;
+  return <><Panel title="完整持仓周期胜率与赔率" subtitle="从首次建仓到仓位归零算一个闭合周期；分批买卖合并，费用、滑点和分红计入；未清仓周期不进入胜率"><Table rows={summaryRows} columns={[["strategy","策略"],["closed_cycles","闭合周期"],["wins","盈利"],["losses","亏损"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","累计已实现盈亏"],["average_return","平均周期收益"]]} format={{win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,average_return:pct}}/></Panel><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 个股持仓周期`} subtitle="每只股票所有已闭合周期聚合；当前开放周期单独标记"><Table strategyAccountId={id} rows={analysis[id]?.by_symbol??[]} columns={[["symbol","证券"],["closed_cycles","闭合"],["wins","赢"],["losses","亏"],["win_rate","胜率"],["payoff_ratio","赔率"],["profit_factor","盈亏因子"],["realized_pnl","已实现盈亏"],["open_cycle","持仓中"],["open_estimated_pnl","浮动盈亏"]]} format={{symbol:(v)=>security(v,names),win_rate:pct,payoff_ratio:num,profit_factor:num,realized_pnl:money,open_cycle:(v)=>v?"是":"否",open_estimated_pnl:money}}/></Panel>)}</div><div className="four-col">{accounts.map(({id,label})=><Panel key={id} title={`${label} · 已闭合周期明细`} subtitle="用于核验每次从建仓到清仓的真实结果"><Table strategyAccountId={id} rows={(analysis[id]?.closed_cycles??[]).slice(0,100)} columns={[["entry_date","建仓日"],["exit_date","清仓日"],["symbol","证券"],["pnl","净盈亏"],["return_rate","周期收益"],["dividend_income","分红"],["fees","费用"],["fill_count","成交笔数"],["result","结果"]]} format={{symbol:(v)=>security(v,names),pnl:money,return_rate:pct,dividend_income:money,fees:money}}/></Panel>)}</div></>;
 }
 
 function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
@@ -384,7 +437,7 @@ function DataHealth({ quality }: { quality: DataQuality }) {
     <Panel title="最近数据健康记录" subtitle="用于观察连续失败和恢复"><Table rows={quality.history} columns={[["trade_date","交易日"],["status","状态"],["target_count","标的数"],["blocking_count","阻断"],["warning_count","警告"]]}/></Panel></>;
 }
 
-function Operations({ bank, execution, operations, acceptance, intraday, names, onRefresh }: { bank: Bank; execution: Execution; operations: OperationsCenter; acceptance: MonthlyAcceptance; intraday: IntradayExecution; names: Record<string, string>; onRefresh: () => Promise<void> }) {
+function Operations({ bank, execution, operations, acceptance, intraday, live, names, onRefresh }: { bank: Bank; execution: Execution; operations: OperationsCenter; acceptance: MonthlyAcceptance; intraday: IntradayExecution; live:LiveAccounts|null; names: Record<string, string>; onRefresh: () => Promise<void> }) {
   const recover = async () => { await json("/api/risk-state/recover", { method: "POST" }); await onRefresh(); };
   const acknowledge = async (id: number) => { await json(`/api/notifications/${id}/acknowledge`, { method: "POST" }); await onRefresh(); };
   const [previewDate, setPreviewDate] = useState(text(operations.preview.trade_date));
@@ -392,11 +445,18 @@ function Operations({ bank, execution, operations, acceptance, intraday, names, 
   const inspect = async () => setPreview(await json(`/api/tasks/daily-run/preview?trade_date=${previewDate}`));
   const firstTickEquity=Number(intraday.account_ticks[0]?.equity??0);
   const intradaySeries=intraday.account_ticks.map((row)=>({...row,trade_date:row.observed_at,normalized_nav:firstTickEquity?Number(row.equity)/firstTickEquity:1}));
-  const openExecution=operations.open_execution??{};
+  const liveAccountRows=Object.values(live?.accounts??{});
+  const openExecution={
+    ...(operations.open_execution??{}),
+    ...(live?{
+      fills:liveAccountRows.flatMap((row)=>row.today_fills),
+      pending_orders:liveAccountRows.flatMap((row)=>row.pending_orders),
+    }:{}),
+  };
   const accountLabel=(value:unknown)=>chartPalette[text(value)]?.label??(text(value).startsWith("qlib_candidate_")?`Qlib 候选者 ${text(value).replace("qlib_candidate_","")}`:text(value));
   return <><section className="ops-banner"><div><i/><small>SERVER SCHEDULER</small><h2>09:31 开盘撮合 · 18:30 收盘流水线</h2><p>开盘执行昨日计划；收盘后更新数据、计算信号并生成下一交易日计划</p></div><span>{bank.scheduler.enabled?"已启用":"已暂停"}</span></section>
     <Panel title="今日开盘执行" subtitle={`${text(openExecution.price_source)} · 纯基线、Qlib挑战者及全部候选者同步在开盘阶段生效`}><section className="kpis"><Kpi label="执行状态" value={text(openExecution.status??"WAITING_FOR_OPEN")} note={`${text(openExecution.trade_date)} · ${text(openExecution.scheduled_time??"09:31")}`}/><Kpi label="覆盖策略" value={String((openExecution.account_ids??[]).length)} note="独立账户、同一开盘价口径"/><Kpi label="今日成交" value={String((openExecution.fills??[]).length)} note="成交后立即进入持仓与权益" accent={Number((openExecution.fills??[]).length)>0}/><Kpi label="遗留待撮合" value={String((openExecution.pending_orders??[]).length)} note="缺行情或交易限制将继续重试" accent={Number((openExecution.pending_orders??[]).length)>0}/></section><Table rows={openExecution.accounts??[]} columns={[["account_id","策略账户"],["pending_before","开盘前委托"],["executions","执行事件"],["reconciliation","对账"]]} format={{account_id:accountLabel,reconciliation:(v)=>Boolean((v as Row)?.matched)?"一致":"异常"}}/><h4>今日开盘成交明细</h4><Table rows={openExecution.fills??[]} columns={[["account_id","策略"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{account_id:accountLabel,symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel>
-    <Panel title="基线日内智能执行" subtitle={`${intraday.policy_id} · ${intraday.activation_date}起生效 · 仅改变成交时机，不改变日频目标`}><section className="kpis"><Kpi label="执行状态" value={text(intraday.latest.status??"等待交易时段")} note={text(intraday.latest.observed_at)}/><Kpi label="待处理委托" value={String(intraday.pending_orders.length)} note="基线综合账户" accent={intraday.pending_orders.length>0}/><Kpi label="本轮触发" value={String((intraday.latest.executions??[]).length)} note="VWAP / 价差 / 截止时间"/><Kpi label="本轮观察" value={String((intraday.latest.decisions??[]).length)} note="含持仓、可卖量和成本"/></section><Table rows={intraday.latest.decisions??[]} columns={[["symbol","证券"],["side","方向"],["quantity","数量"],["price","现价"],["vwap","VWAP"],["spread_bps","价差bps"],["action","动作"],["reason","原因"]]} format={{symbol:(v)=>security(v,names),price:num,vwap:num,spread_bps:num}}/></Panel>
+    <Panel title="基线日内智能执行" subtitle={`${intraday.policy_id} · ${intraday.activation_date}起生效 · 仅改变成交时机，不改变日频目标`}><section className="kpis"><Kpi label="执行状态" value={text(intraday.latest.status??"等待交易时段")} note={text(intraday.latest.observed_at)}/><Kpi label="待处理委托" value={String(intraday.pending_orders.length)} note="基线综合账户" accent={intraday.pending_orders.length>0}/><Kpi label="本轮触发" value={String((intraday.latest.executions??[]).length)} note="VWAP / 价差 / 截止时间"/><Kpi label="本轮观察" value={String((intraday.latest.decisions??[]).length)} note="含持仓、可卖量和成本"/></section><Table strategyAccountId={text(intraday.account_id)} rows={intraday.latest.decisions??[]} columns={[["symbol","证券"],["side","方向"],["quantity","数量"],["price","现价"],["vwap","VWAP"],["spread_bps","价差bps"],["action","动作"],["reason","原因"]]} format={{symbol:(v)=>security(v,names),price:num,vwap:num,spread_bps:num}}/></Panel>
     <div className="two-col"><LineComparisonChart title="日内实时权益变化" subtitle="以当日首个QMT快照归一为100，每分钟刷新" series={[{accountId:intraday.account_id,label:"基线·日内执行",color:"#168a83",rows:intradaySeries}]} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(3)}`} selectedAccountIds={new Set([intraday.account_id])} onToggle={()=>{}}/><Panel title="日内实时成交" subtitle="成交后立即进入独立账户账本"><Table rows={intraday.fills.slice(-30).reverse()} columns={[["trade_date","成交日"],["symbol","证券"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{symbol:(v)=>security(v,names),price:num,fee:money}}/></Panel></div>
     <section className="kpis"><Kpi label="综合账户权益" value={money(execution.portfolio?.equity)} note={execution.account_id}/><Kpi label="实际 / 可执行目标" value={`${pct(execution.metrics.gross_exposure)} / ${pct(execution.metrics.target_exposure)}`} note={`理论目标 ${pct(execution.metrics.theoretical_target_exposure??execution.metrics.target_exposure)} · 已考虑一手约束`}/><Kpi label="累计收益 / 回撤" value={`${pct((Number(execution.portfolio?.equity??1_000_000)/1_000_000)-1)} / ${pct(execution.metrics.drawdown)}`} note={`${execution.history.length}个日度快照`}/><Kpi label="账户风险状态" value={text(execution.risk_state.effective_state)} note={text(execution.risk_state.reason_code)} accent={text(execution.risk_state.effective_state)!=="NORMAL"}/></section>
     <Panel title="理论目标到可执行目标" subtitle="一手金额超过可分配预算的股票被剔除；释放预算优先在同一行业内重新分配"><Table rows={execution.target_adjustments??[]} columns={[["symbol","证券"],["sector","行业"],["theoretical_weight","理论权重"],["executable_weight","可执行权重"],["minimum_lot_weight","一手占账户"],["reason","调整原因"]]} format={{symbol:(v)=>security(v,names),sector:(v)=>meta[text(v)]?.label??text(v),theoretical_weight:pct,executable_weight:pct,minimum_lot_weight:pct}}/></Panel>
@@ -423,6 +483,32 @@ function SectorCards({rows,names}:{rows:Row[];names:Record<string,string>}){retu
 function UniverseCard({universe,names}:{universe:Universe;names:Record<string,string>}){const m=sectorMeta(universe.sector);const selectedCount=universe.ranking.filter((row)=>Boolean(row.selected)).length;return <article className="universe-card" style={{"--sector":m.color} as React.CSSProperties}><header><div><span>{m.label}</span><h3>{universe.name}</h3><small>{universe.fund_code} · {universe.style}</small></div><b>{selectedCount}<small>目标持仓</small></b></header><div className="factor-chips">{Object.entries(universe.factor_weights).map(([f,w])=><span key={f}>{factorLabels[f]??f}<b>{pct(w)}</b></span>)}</div><Table rows={universe.ranking.slice(0,universe.sector==="bank"?12:10)} columns={[["rank","排名"],["symbol","证券"],["score","模型分"],["selected","目标"]]} format={{symbol:(v)=>security(v,names),score:num,selected:(v)=>v?"持有":"—"}}/></article>}
 function Evidence({sectors}:{sectors:Sectors}){return <div className="evidence"><b>证据边界</b><p>{sectors.warning}</p><span>{sectors.evidence_status}</span></div>}
 function Intro({tag,title,children}:{tag:string;title:string;children:ReactNode}){return <section className="intro"><span>{tag}</span><h2>{title}</h2><p>{children}</p></section>}
+function SecurityHistoryModal({detail,initialAccountId,loading,error,onClose}:{detail:SecurityHistory|null;initialAccountId:string;loading:boolean;error:string;onClose:()=>void}){
+  const [range,setRange]=useState("3M");
+  const [accountId,setAccountId]=useState(initialAccountId);
+  const [hovered,setHovered]=useState<(Row&{left:number;top:number})|null>(null);
+  useEffect(()=>{setRange("3M");setAccountId(initialAccountId);setHovered(null)},[detail?.symbol,initialAccountId]);
+  if(loading)return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal loading-detail" onClick={(event)=>event.stopPropagation()}><b>正在载入K线与交易记录…</b></section></div>;
+  if(error)return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal loading-detail" onClick={(event)=>event.stopPropagation()}><button className="modal-close" onClick={onClose}>×</button><b>{error}</b></section></div>;
+  if(!detail)return null;
+  const barCount=range==="1M"?20:range==="3M"?60:range==="6M"?120:range==="1Y"?250:range==="3Y"?750:detail.bars.length;
+  const accountIds=[...new Set([initialAccountId,...detail.fills.map((row)=>text(row.account_id))].filter(Boolean))];
+  const selectedAccountId=accountIds.includes(accountId)?accountId:accountIds[0]??"";
+  const strategyFills=detail.fills.filter((row)=>text(row.account_id)===selectedAccountId);
+  const bars=detail.bars.slice(-barCount);
+  const visibleDates=new Set(bars.map((row)=>text(row.trade_date)));
+  const fills=strategyFills.filter((row)=>visibleDates.has(text(row.trade_date)));
+  const width=1080,height=430,left=58,right=22,top=18,bottom=35;
+  const values=[...bars.flatMap((row)=>[Number(row.high),Number(row.low)]),...fills.map((row)=>Number(row.price))].filter(Number.isFinite);
+  const min=Math.min(...values),max=Math.max(...values),span=Math.max(max-min,0.01);
+  const step=(width-left-right)/Math.max(bars.length,1),body=Math.max(1,Math.min(6,step*.62));
+  const x=(index:number)=>left+(index+.5)*step;
+  const y=(value:number)=>top+(max-value)/span*(height-top-bottom);
+  const dateIndex=new Map(bars.map((row,index)=>[text(row.trade_date),index]));
+  const accountName=(value:unknown)=>chartPalette[text(value)]?.label??(text(value).startsWith("qlib_candidate_")?`Qlib候选 ${text(value).replace("qlib_candidate_","")}`:text(value));
+  return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal" onClick={(event)=>event.stopPropagation()}><header><div><small>SECURITY TRADE HISTORY</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap">{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{(max-tick*span).toFixed(2)}</text></g>)}{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open);const color=up?"#d55445":"#218c74";const topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close)));return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?color:"#fff"} stroke={color}><title>{`${text(row.trade_date)} 开${num(row.open)} 高${num(row.high)} 低${num(row.low)} 收${num(row.close)}`}</title></rect></g>})}{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY";const lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length;const badgeY=buy?Math.min(height-bottom-14,priceY+30+lane*23):Math.max(top+14,priceY-30-lane*23);const connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="5"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text><title>{`${buy?"BUY":"SELL"} · ${tradeDate} · ${Number(fill.price).toFixed(3)} · ${text(fill.quantity)}股`}</title></g>})}<text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>BUY 买入</span><span><i className="sell"/>SELL 卖出</span></div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle="图表和明细始终使用同一个策略账户，不混合其他策略"><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money}}/></Panel></section></div>;
+}
+
 function Panel({title,subtitle,children}:{title:string;subtitle?:string;children:ReactNode}){return <section className="panel"><header><div><h3>{title}</h3>{subtitle&&<p>{subtitle}</p>}</div><span>•••</span></header>{children}</section>}
 function Kpi({label,value,note,accent}:{label:string;value:string;note:string;accent?:boolean}){return <div className={`kpi ${accent?"accent":""}`}><small>{label}</small><b>{value}</b><span>{note}</span></div>}
-function Table({rows,columns,format={}}:{rows:Row[];columns:[string,string][];format?:Record<string,(v:unknown)=>string>}){if(!rows.length)return <p className="empty">暂无数据</p>;return <div className="table-wrap"><table><thead><tr>{columns.map(([,l])=><th key={l}>{l}</th>)}</tr></thead><tbody>{rows.map((row,i)=><tr key={i}>{columns.map(([k])=><td key={k}>{format[k]?format[k](row[k]):text(row[k])}</td>)}</tr>)}</tbody></table></div>}
+function Table({rows,columns,format={},strategyAccountId}:{rows:Row[];columns:[string,string][];format?:Record<string,(v:unknown)=>ReactNode>;strategyAccountId?:string}){const openSecurity=useContext(SecurityNavigationContext);const inheritedAccountId=useContext(SecurityAccountContext);if(!rows.length)return <p className="empty">暂无数据</p>;return <div className="table-wrap"><table><thead><tr>{columns.map(([,l])=><th key={l}>{l}</th>)}</tr></thead><tbody>{rows.map((row,i)=><tr key={i}>{columns.map(([k])=>{const value=row[k],content=format[k]?format[k](value):text(value);const isSecurity=(k==="symbol"||k==="instrument")&&/^\d{6}\.(SH|SZ|BJ)$/.test(text(value));const accountId=text(row.account_id)!=="—"?text(row.account_id):(strategyAccountId??inheritedAccountId);return <td key={k}>{isSecurity?<button className="security-link" onClick={()=>openSecurity(text(value),accountId)}>{content}</button>:content}</td>})}</tr>)}</tbody></table></div>}

@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time as clock
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, time, timedelta
@@ -35,6 +36,7 @@ from .factors import build_default_registry, build_qmt_candidate_registry
 from .intraday_execution import (
     INTRADAY_ACCOUNT,
     POLICY_ID,
+    prepare_intraday_branch_orders,
     run_baseline_intraday_once,
 )
 from .long_term_review import evaluate_long_term_review
@@ -89,6 +91,124 @@ SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 INTRADAY_BASELINE_ACTIVATION_DATE = "20260908"
+_LIVE_ACCOUNT_CACHE: dict[str, object] = {"expires_at": 0.0, "payload": {}}
+_LIVE_ACCOUNT_LOCK = threading.Lock()
+
+
+def _live_account_snapshot() -> dict[str, object]:
+    """Return live paper ledgers marked with one batched QMT quote request."""
+    now = datetime.now(SHANGHAI)
+    with _LIVE_ACCOUNT_LOCK:
+        if clock.monotonic() < float(_LIVE_ACCOUNT_CACHE["expires_at"]):
+            return dict(_LIVE_ACCOUNT_CACHE["payload"])
+        broker = PaperBroker(PAPER_DATABASE)
+        with sqlite3.connect(PAPER_DATABASE) as connection:
+            connection.row_factory = sqlite3.Row
+            account_ids = [
+                str(row["account_id"])
+                for row in connection.execute("SELECT account_id FROM accounts ORDER BY account_id")
+            ]
+            held_symbols = {
+                str(row["symbol"])
+                for row in connection.execute(
+                    "SELECT DISTINCT symbol FROM positions WHERE quantity != 0"
+                )
+            }
+            pending_symbols = {
+                str(row["symbol"])
+                for row in connection.execute(
+                    "SELECT DISTINCT symbol FROM orders WHERE status = 'PENDING'"
+                )
+            }
+        symbols = sorted(held_symbols | pending_symbols)
+        marks: dict[str, float] = {}
+        quote_rows: list[dict[str, object]] = []
+        quote_source = "DAILY_FALLBACK"
+        if symbols:
+            try:
+                daily = ParquetStore(DATA).read(
+                    "daily",
+                    columns=["ts_code", "trade_date", "close"],
+                    filters=[("ts_code", "in", symbols)],
+                )
+                latest = (
+                    daily.sort_values("trade_date")
+                    .groupby("ts_code", as_index=False)
+                    .tail(1)
+                )
+                marks = {
+                    str(row["ts_code"]): float(row["close"])
+                    for row in latest.to_dict("records")
+                }
+            except (FileNotFoundError, ValueError):
+                pass
+            try:
+                load_dotenv(ROOT / ".env")
+                quotes = QmtTushareProvider(root=ROOT, timeout_seconds=15).intraday_quotes(
+                    symbols
+                )
+                quote_rows = [
+                    dict(row)
+                    for row in quotes.to_dict("records")
+                    if float(row.get("last", 0) or 0) > 0
+                ]
+                marks.update(
+                    {
+                        str(row["symbol"]): float(row["last"])
+                        for row in quote_rows
+                    }
+                )
+                if quote_rows:
+                    quote_source = "QMT_REALTIME"
+            except Exception:  # noqa: BLE001 - retain last official close on QMT outage
+                pass
+        all_orders = broker.orders()
+        today = now.strftime("%Y%m%d")
+        accounts: dict[str, object] = {}
+        for account_id in account_ids:
+            portfolio = broker.account_snapshot(marks, account_id)
+            enriched_positions = []
+            for position in portfolio["positions"]:
+                symbol = str(position["symbol"])
+                last = float(marks.get(symbol, 0))
+                quantity = int(position["quantity"])
+                cost = float(position["avg_cost"])
+                enriched_positions.append(
+                    {
+                        **position,
+                        "last": last,
+                        "market_value": quantity * last,
+                        "unrealized_pnl": quantity * (last - cost),
+                    }
+                )
+            portfolio["positions"] = enriched_positions
+            orders = [
+                row for row in reversed(all_orders) if row.get("account_id") == account_id
+            ][:100]
+            fills = broker.fills(account_id)
+            accounts[account_id] = {
+                "portfolio": portfolio,
+                "positions": enriched_positions,
+                "orders": orders,
+                "fills": fills[-100:],
+                "today_fills": [
+                    row for row in fills if str(row.get("trade_date", "")) == today
+                ],
+                "pending_orders": [
+                    row for row in orders if str(row.get("status")) == "PENDING"
+                ],
+            }
+        payload: dict[str, object] = {
+            "observed_at": now.isoformat(),
+            "quote_source": quote_source,
+            "symbol_count": len(symbols),
+            "quotes": quote_rows,
+            "accounts": accounts,
+        }
+        _LIVE_ACCOUNT_CACHE.update(
+            {"expires_at": clock.monotonic() + 4.0, "payload": payload}
+        )
+        return payload
 
 
 def _composite_universe_symbols(store: ParquetStore) -> list[str]:
@@ -254,6 +374,14 @@ class TaskService:
         if self._thread and self._thread.is_alive():
             return
         self._recover_interrupted_runs()
+        today = datetime.now(SHANGHAI).strftime("%Y%m%d")
+        open_audit = STATE / "open-execution" / f"{today}.json"
+        if open_audit.exists():
+            try:
+                if json.loads(open_audit.read_text(encoding="utf-8")).get("status") == "COMPLETED":
+                    self._last_open_execution_date = today
+            except (json.JSONDecodeError, OSError):
+                pass
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._scheduler_loop,
@@ -652,9 +780,11 @@ class TaskService:
                 self._last_open_execution_minute = minute_key
                 try:
                     load_dotenv(ROOT / ".env")
+                    broker = PaperBroker(PAPER_DATABASE)
+                    prepare_intraday_branch_orders(broker, trade_date)
                     result = execute_accounts_at_qmt_open(
                         provider=QmtTushareProvider(root=ROOT),
-                        broker=PaperBroker(PAPER_DATABASE),
+                        broker=broker,
                         config=BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml"),
                         trade_date=trade_date,
                         account_ids=[
@@ -1204,6 +1334,119 @@ def health() -> dict[str, object]:
         ),
         "server_time": datetime.now(SHANGHAI).isoformat(),
     }
+
+
+@app.get("/api/live-accounts")
+def live_accounts() -> dict[str, object]:
+    return _live_account_snapshot()
+
+
+@app.get("/api/security-history")
+def security_history(symbol: str) -> dict[str, object]:
+    normalized = symbol.strip().upper()
+    if not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", normalized):
+        raise HTTPException(status_code=400, detail="invalid security symbol")
+    store = ParquetStore(DATA)
+    try:
+        bars = store.read(
+            "daily",
+            columns=[
+                "ts_code",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vol",
+                "amount",
+            ],
+            filters=[("ts_code", "==", normalized)],
+        ).sort_values("trade_date")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if bars.empty:
+        raise HTTPException(status_code=404, detail="security history not found")
+    bars = _append_live_daily_bar(bars, normalized)
+    with sqlite3.connect(PAPER_DATABASE) as connection:
+        connection.row_factory = sqlite3.Row
+        fills = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT id, account_id, symbol, side, quantity, price, fee, trade_date
+                FROM fills WHERE symbol = ?
+                ORDER BY trade_date, id
+                """,
+                (normalized,),
+            )
+        ]
+    names = _instrument_names(store)
+    return {
+        "symbol": normalized,
+        "name": names.get(normalized, normalized),
+        "bars": _records(bars),
+        "fills": fills,
+        "coverage": {
+            "start_date": str(bars.iloc[0]["trade_date"]),
+            "end_date": str(bars.iloc[-1]["trade_date"]),
+            "trading_days": len(bars),
+            "fill_count": len(fills),
+        },
+    }
+
+
+def _append_live_daily_bar(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Append today's QMT tick as a provisional daily candle when needed."""
+    today = datetime.now(SHANGHAI).strftime("%Y%m%d")
+    if today in set(bars["trade_date"].astype(str)):
+        result = bars.copy()
+        result["is_realtime"] = False
+        return result
+    try:
+        cached_quotes = _live_account_snapshot().get("quotes", [])
+        quotes = pd.DataFrame(
+            [row for row in cached_quotes if str(row.get("symbol")) == symbol]
+        )
+        if quotes.empty:
+            load_dotenv(ROOT / ".env")
+            quotes = QmtTushareProvider(root=ROOT, timeout_seconds=15).intraday_quotes(
+                [symbol]
+            )
+    except Exception:  # noqa: BLE001 - stale charts are preferable to a failed detail view
+        return bars
+    if quotes.empty:
+        return bars
+    quote = quotes.iloc[0]
+    timestamp = int(quote.get("timestamp", 0) or 0)
+    quote_date = (
+        datetime.fromtimestamp(timestamp / 1000, SHANGHAI).strftime("%Y%m%d")
+        if timestamp > 0
+        else ""
+    )
+    prices = [
+        float(quote.get(column, 0) or 0)
+        for column in ("open", "high", "low", "last")
+    ]
+    if quote_date != today or any(price <= 0 for price in prices):
+        return bars
+    result = bars.copy()
+    result["is_realtime"] = False
+    live = pd.DataFrame(
+        [
+            {
+                "ts_code": symbol,
+                "trade_date": today,
+                "open": prices[0],
+                "high": prices[1],
+                "low": prices[2],
+                "close": prices[3],
+                "vol": float(quote.get("volume", 0) or 0),
+                "amount": float(quote.get("amount", 0) or 0) / 1000.0,
+                "is_realtime": True,
+            }
+        ]
+    )
+    return pd.concat([result, live], ignore_index=True)
 
 
 @app.get("/api/intraday-execution")

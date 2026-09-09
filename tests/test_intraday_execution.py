@@ -1,6 +1,15 @@
+import sqlite3
 from datetime import time
 
-from moneymore.intraday_execution import decide_intraday_execution
+from moneymore.execution.paper import PaperBroker
+from moneymore.execution.risk import OrderIntent, RiskResult
+from moneymore.intraday_execution import (
+    INTRADAY_ACCOUNT,
+    decide_intraday_execution,
+    prepare_intraday_branch_orders,
+)
+from moneymore.models import Side
+from moneymore.multi_sector_daily import MULTI_SECTOR_ACCOUNT
 
 
 def test_intraday_policy_avoids_open_noise_and_wide_spreads() -> None:
@@ -53,3 +62,47 @@ def test_intraday_policy_snipes_favorable_vwap_and_has_deadline() -> None:
     assert favorable.reason == "VWAP_SNIPER_TRIGGER"
     assert deadline.action == "EXECUTE"
     assert deadline.reason == "DEADLINE_FALLBACK"
+
+
+def test_intraday_order_mirroring_recovers_parent_already_filled_today(tmp_path) -> None:
+    broker = PaperBroker(tmp_path / "paper.sqlite3")
+    broker.initialize_account(100_000, MULTI_SECTOR_ACCOUNT)
+    intent = OrderIntent(
+        idempotency_key="baseline-order",
+        strategy_id="baseline",
+        symbol="600036.SH",
+        side=Side.BUY,
+        quantity=100,
+        signal_date="20260908",
+        reason_code="TEST",
+    )
+    broker.submit(RiskResult(True, intent, None), MULTI_SECTOR_ACCOUNT)
+    with sqlite3.connect(broker.database) as connection:
+        connection.execute(
+            "UPDATE orders SET status = 'FILLED' WHERE idempotency_key = ?",
+            (intent.idempotency_key,),
+        )
+        connection.execute(
+            """
+            INSERT INTO fills(
+                account_id, idempotency_key, symbol, side, quantity,
+                price, fee, trade_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                MULTI_SECTOR_ACCOUNT,
+                intent.idempotency_key,
+                intent.symbol,
+                intent.side.value,
+                intent.quantity,
+                40.0,
+                5.0,
+                "20260909",
+            ),
+        )
+
+    assert prepare_intraday_branch_orders(broker, "20260909") == 1
+    mirrored = [row for row in broker.orders() if row["account_id"] == INTRADAY_ACCOUNT]
+    assert len(mirrored) == 1
+    assert mirrored[0]["status"] == "PENDING"
+    assert prepare_intraday_branch_orders(broker, "20260909") == 0

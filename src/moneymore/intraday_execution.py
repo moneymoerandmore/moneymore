@@ -50,10 +50,19 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
             )
         parents = connection.execute(
             """
-            SELECT * FROM orders WHERE account_id = ? AND status = 'PENDING'
-              AND signal_date < ? ORDER BY created_at, idempotency_key
+            SELECT o.* FROM orders o
+            WHERE o.account_id = ? AND o.signal_date < ?
+              AND (
+                o.status = 'PENDING'
+                OR EXISTS (
+                    SELECT 1 FROM fills f
+                    WHERE f.idempotency_key = o.idempotency_key
+                      AND f.trade_date = ?
+                )
+              )
+            ORDER BY o.created_at, o.idempotency_key
             """,
-            (MULTI_SECTOR_ACCOUNT, trade_date),
+            (MULTI_SECTOR_ACCOUNT, trade_date, trade_date),
         ).fetchall()
         mirrored = 0
         for row in parents:
@@ -79,6 +88,11 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
             )
             mirrored += int(cursor.rowcount > 0)
     return mirrored
+
+
+def prepare_intraday_branch_orders(broker: PaperBroker, trade_date: str) -> int:
+    """Mirror parent orders before open execution; recover same-day races safely."""
+    return _ensure_comparison_account_and_orders(broker, trade_date)
 
 
 @dataclass(frozen=True)
