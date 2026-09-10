@@ -326,3 +326,17 @@ pnpm test
 - `BLOCKED`：调度被暂停或后台线程未运行，需要人工处理。
 
 页面中的 `WEEKDAY_ESTIMATE` 永远只用于预览警告，不能授权生成或撮合模拟订单。
+
+统一健康状态总线：
+
+- [http://127.0.0.1:8788/api/system-health](http://127.0.0.1:8788/api/system-health)
+
+健康总线统一检查守护心跳、API/Web进程、QMT行情时效、调度线程、SQLite账本、账户对账和磁盘容量。出现阻断项时返回 FROZEN，开盘撮合与日内执行共用该门禁并停止新增交易。Dashboard每5秒刷新该状态；本地守护器每10秒写入 state/runtime/supervisor-heartbeat.json，子进程重启记录保存在 logs/supervisor-events.jsonl。
+
+量化主机的Windows可用性配置由管理员脚本管理：
+
+- 安装：powershell -ExecutionPolicy Bypass -File scripts/configure_quant_host.ps1 -Action Install
+- 审计：powershell -ExecutionPolicy Bypass -File scripts/configure_quant_host.ps1 -Action Audit
+- 回滚：powershell -ExecutionPolicy Bypass -File scripts/configure_quant_host.ps1 -Action Rollback
+
+安装动作禁止有用户登录时被Windows Update自动重启，注册 SYSTEM 级 MoneyMore开机任务和当前交易用户的MiniQMT登录任务。原Windows Update策略首次安装时备份至 state/runtime/windows-availability-before.json；脚本不会配置不安全的Windows自动登录。

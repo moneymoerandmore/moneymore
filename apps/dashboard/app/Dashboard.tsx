@@ -63,6 +63,11 @@ type LiveAccounts = {
   observed_at:string; quote_source:string; symbol_count:number;
   accounts:Record<string,LiveAccount>;
 };
+type SystemHealth = {
+  observed_at:string; system_status:"HEALTHY"|"DEGRADED"|"FROZEN";
+  trading_gate:"OPEN"|"FROZEN"; blocking_count:number; warning_count:number;
+  checks:Row[];
+};
 type SecurityHistory = {
   symbol:string; name:string; bars:Row[]; fills:Row[];
   coverage: { start_date:string; end_date:string; trading_days:number; fill_count:number };
@@ -162,6 +167,7 @@ export default function Dashboard() {
   const [challenger, setChallenger] = useState<Challenger | null>(null);
   const [intraday, setIntraday] = useState<IntradayExecution | null>(null);
   const [live, setLive] = useState<LiveAccounts | null>(null);
+  const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [securityDetail,setSecurityDetail]=useState<SecurityHistory|null>(null);
   const [securityDetailAccount,setSecurityDetailAccount]=useState("");
   const [securityDetailLoading,setSecurityDetailLoading]=useState(false);
@@ -178,7 +184,13 @@ export default function Dashboard() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
   const refreshLive = useCallback(async () => {
-    try { setLive(await json<LiveAccounts>("/api/live-accounts")); }
+    try {
+      const [accounts,health]=await Promise.all([
+        json<LiveAccounts>("/api/live-accounts"),
+        json<SystemHealth>("/api/system-health"),
+      ]);
+      setLive(accounts); setSystemHealth(health);
+    }
     catch { /* retain the last valid live snapshot */ }
   }, []);
   useEffect(() => {
@@ -226,6 +238,7 @@ export default function Dashboard() {
     </aside>
     <main className="workspace">
       <header><div><small>MONEYMORE / {current.note}</small><h1>{current.label}</h1></div><div className="header-actions"><span><i/> {live?.quote_source==="QMT_REALTIME"?"实时 · "+live.observed_at.slice(11,19):"数据日 "+sectors.latest_date}</span><button onClick={() => { void refresh(); void refreshLive(); }}>刷新</button><button className="primary" disabled={busy} onClick={() => void run()}>{busy ? "恢复中…" : "恢复并重算"}</button></div></header>
+      {systemHealth&&<SystemHealthBar health={systemHealth}/>}
       {error && <div className="error">{error}</div>}
       {page === "overview" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Overview sectors={sectors} execution={displayedExecution}/></SecurityAccountContext.Provider>}
       {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
@@ -507,6 +520,11 @@ function SecurityHistoryModal({detail,initialAccountId,loading,error,onClose}:{d
   const dateIndex=new Map(bars.map((row,index)=>[text(row.trade_date),index]));
   const accountName=(value:unknown)=>chartPalette[text(value)]?.label??(text(value).startsWith("qlib_candidate_")?`Qlib候选 ${text(value).replace("qlib_candidate_","")}`:text(value));
   return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal" onClick={(event)=>event.stopPropagation()}><header><div><small>SECURITY TRADE HISTORY</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap">{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{(max-tick*span).toFixed(2)}</text></g>)}{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open);const color=up?"#d55445":"#218c74";const topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close)));return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?color:"#fff"} stroke={color}><title>{`${text(row.trade_date)} 开${num(row.open)} 高${num(row.high)} 低${num(row.low)} 收${num(row.close)}`}</title></rect></g>})}{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY";const lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length;const badgeY=buy?Math.min(height-bottom-14,priceY+30+lane*23):Math.max(top+14,priceY-30-lane*23);const connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="5"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text><title>{`${buy?"BUY":"SELL"} · ${tradeDate} · ${Number(fill.price).toFixed(3)} · ${text(fill.quantity)}股`}</title></g>})}<text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>BUY 买入</span><span><i className="sell"/>SELL 卖出</span></div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle="图表和明细始终使用同一个策略账户，不混合其他策略"><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money}}/></Panel></section></div>;
+}
+
+function SystemHealthBar({health}:{health:SystemHealth}){
+  const [expanded,setExpanded]=useState(false);
+  return <section className={`system-health-bar ${health.system_status.toLowerCase()}`}><button onClick={()=>setExpanded(!expanded)}><i/><b>{health.system_status==="HEALTHY"?"系统健康":health.system_status==="DEGRADED"?"系统降级":"交易已冻结"}</b><span>交易门禁 {health.trading_gate} · {health.blocking_count} 阻断 · {health.warning_count} 警告</span><em>{health.observed_at.slice(11,19)} {expanded?"收起":"详情"}</em></button>{expanded&&<div>{health.checks.map((row)=><article key={text(row.code)} className={text(row.status).toLowerCase()}><b>{text(row.status)}</b><span>{text(row.code)}</span><small>{text(row.message)}</small></article>)}</div>}</section>;
 }
 
 function Panel({title,subtitle,children}:{title:string;subtitle?:string;children:ReactNode}){return <section className="panel"><header><div><h3>{title}</h3>{subtitle&&<p>{subtitle}</p>}</div><span>•••</span></header>{children}</section>}

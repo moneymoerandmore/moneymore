@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -209,6 +210,161 @@ def _live_account_snapshot() -> dict[str, object]:
             {"expires_at": clock.monotonic() + 4.0, "payload": payload}
         )
         return payload
+
+
+def _runtime_health_bus() -> dict[str, object]:
+    now = datetime.now(SHANGHAI)
+    checks: list[dict[str, object]] = []
+
+    def add(code: str, status: str, message: str, **details: object) -> None:
+        checks.append({"code": code, "status": status, "message": message, **details})
+
+    heartbeat_path = STATE / "runtime" / "supervisor-heartbeat.json"
+    try:
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8-sig"))
+        heartbeat_at = datetime.fromisoformat(str(heartbeat["observed_at"]))
+        heartbeat_age = max(0.0, (now - heartbeat_at.astimezone(SHANGHAI)).total_seconds())
+        children_ok = bool(heartbeat.get("api_running") and heartbeat.get("web_running"))
+        add(
+            "SUPERVISOR_HEARTBEAT",
+            "PASS" if heartbeat_age <= 35 and children_ok else "BLOCK",
+            f"守护心跳 {heartbeat_age:.0f} 秒前，API/Web 子进程{'正常' if children_ok else '异常'}",
+            age_seconds=heartbeat_age,
+            **heartbeat,
+        )
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
+        add("SUPERVISOR_HEARTBEAT", "BLOCK", "未读取到有效的本地守护心跳")
+
+    scheduler_alive = bool(task_service._thread and task_service._thread.is_alive())
+    training_alive = bool(
+        weekly_training_service._thread and weekly_training_service._thread.is_alive()
+    )
+    add(
+        "DAILY_SCHEDULER",
+        "PASS" if scheduler_alive else "BLOCK",
+        "日度策略调度线程正常" if scheduler_alive else "日度策略调度线程已停止",
+    )
+    add(
+        "TRAINING_SCHEDULER",
+        "PASS" if training_alive else "WARN",
+        "每周训练调度线程正常" if training_alive else "每周训练调度线程已停止",
+    )
+
+    try:
+        with sqlite3.connect(PAPER_DATABASE, timeout=3) as connection:
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        add(
+            "PAPER_LEDGER",
+            "PASS" if integrity.lower() == "ok" else "BLOCK",
+            f"模拟交易账本检查：{integrity}",
+        )
+    except sqlite3.Error as error:
+        add("PAPER_LEDGER", "BLOCK", f"模拟交易账本不可用：{error}")
+
+    live = _live_account_snapshot()
+    quotes = list(live.get("quotes", []))
+    quote_timestamps = [
+        int(row.get("timestamp", 0) or 0) for row in quotes if row.get("timestamp")
+    ]
+    quote_age = (
+        max(
+            0.0,
+            (
+                now
+                - datetime.fromtimestamp(max(quote_timestamps) / 1000, SHANGHAI)
+            ).total_seconds(),
+        )
+        if quote_timestamps
+        else None
+    )
+    in_session = now.weekday() < 5 and (
+        time(9, 30) <= now.time() <= time(11, 30)
+        or time(13, 0) <= now.time() <= time(15, 0)
+    )
+    qmt_ok = live.get("quote_source") == "QMT_REALTIME" and (
+        not in_session or (quote_age is not None and quote_age <= 120)
+    )
+    add(
+        "QMT_MARKET_DATA",
+        "PASS" if qmt_ok else "BLOCK" if in_session else "WARN",
+        (
+            f"QMT行情正常，最新行情延迟 {quote_age:.0f} 秒"
+            if quote_age is not None and qmt_ok
+            else "交易时段QMT行情缺失或延迟超过120秒"
+            if in_session
+            else "非交易时段未取得QMT实时行情，使用正式收盘数据"
+        ),
+        quote_source=live.get("quote_source"),
+        quote_age_seconds=quote_age,
+        symbol_count=live.get("symbol_count", 0),
+    )
+
+    reconciled = True
+    mismatches: list[str] = []
+    broker = PaperBroker(PAPER_DATABASE)
+    for account_id in live.get("accounts", {}):
+        result = broker.reconcile(str(account_id))
+        # The intraday comparator was intentionally forked with the baseline's
+        # existing cash and positions.  Its post-fork fills cannot reconstruct
+        # that opening balance, so validate order/fill linkage for this account.
+        branch_matched = (
+            str(account_id) == INTRADAY_ACCOUNT
+            and result.missing_fill_count == 0
+            and result.orphan_fill_count == 0
+        )
+        if not result.matched and not branch_matched:
+            reconciled = False
+            mismatches.append(str(account_id))
+    add(
+        "ACCOUNT_RECONCILIATION",
+        "PASS" if reconciled else "BLOCK",
+        "全部模拟账户订单成交对账一致" if reconciled else f"账户对账异常：{','.join(mismatches)}",
+        mismatched_accounts=mismatches,
+    )
+
+    free_gb = shutil.disk_usage(ROOT).free / (1024**3)
+    disk_status = "BLOCK" if free_gb < 2 else "WARN" if free_gb < 10 else "PASS"
+    add("DISK_CAPACITY", disk_status, f"项目磁盘剩余 {free_gb:.1f} GB", free_gb=free_gb)
+
+    try:
+        latest_daily = str(
+            ParquetStore(DATA).read("daily", columns=["trade_date"])["trade_date"]
+            .astype(str)
+            .max()
+        )
+        age_days = (
+            now.date() - datetime.strptime(latest_daily, "%Y%m%d").date()
+        ).days
+        add(
+            "OFFICIAL_DAILY_DATA",
+            "PASS" if age_days <= 1 else "WARN",
+            f"正式日线最新数据日 {latest_daily}",
+            latest_trade_date=latest_daily,
+        )
+    except (FileNotFoundError, ValueError):
+        add("OFFICIAL_DAILY_DATA", "WARN", "尚未确认正式日线数据日期")
+
+    blocking = [row for row in checks if row["status"] == "BLOCK"]
+    warnings = [row for row in checks if row["status"] == "WARN"]
+    return {
+        "observed_at": now.isoformat(),
+        "system_status": "FROZEN" if blocking else "DEGRADED" if warnings else "HEALTHY",
+        "trading_gate": "FROZEN" if blocking else "OPEN",
+        "blocking_count": len(blocking),
+        "warning_count": len(warnings),
+        "checks": checks,
+    }
+
+
+def _require_trading_gate() -> None:
+    health = _runtime_health_bus()
+    if health["trading_gate"] != "OPEN":
+        blocked = [
+            str(row["code"])
+            for row in health["checks"]
+            if row["status"] == "BLOCK"
+        ]
+        raise RuntimeError(f"SYSTEM_HEALTH_FROZEN: {','.join(blocked)}")
 
 
 def _composite_universe_symbols(store: ParquetStore) -> list[str]:
@@ -780,6 +936,7 @@ class TaskService:
                 self._last_open_execution_minute = minute_key
                 try:
                     load_dotenv(ROOT / ".env")
+                    _require_trading_gate()
                     broker = PaperBroker(PAPER_DATABASE)
                     prepare_intraday_branch_orders(broker, trade_date)
                     result = execute_accounts_at_qmt_open(
@@ -820,6 +977,7 @@ class TaskService:
                 self._last_intraday_minute = minute_key
                 try:
                     load_dotenv(ROOT / ".env")
+                    _require_trading_gate()
                     run_baseline_intraday_once(root=ROOT, now=now)
                 except Exception as intraday_error:  # noqa: BLE001
                     self._notify(
@@ -1339,6 +1497,11 @@ def health() -> dict[str, object]:
 @app.get("/api/live-accounts")
 def live_accounts() -> dict[str, object]:
     return _live_account_snapshot()
+
+
+@app.get("/api/system-health")
+def system_health() -> dict[str, object]:
+    return _runtime_health_bus()
 
 
 @app.get("/api/security-history")

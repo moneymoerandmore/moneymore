@@ -14,6 +14,8 @@ $Node = Join-Path $ProjectRoot ".runtime\node\node.exe"
 $Vinext = Join-Path $ProjectRoot "apps\dashboard\node_modules\vinext\dist\cli.js"
 $SupervisorPidFile = Join-Path $RuntimeDir "local-service.pid"
 $StopFile = Join-Path $RuntimeDir "local-service.stop"
+$HeartbeatFile = Join-Path $RuntimeDir "supervisor-heartbeat.json"
+$SupervisorEventLog = Join-Path $LogDir "supervisor-events.jsonl"
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir, $LogDir | Out-Null
 
@@ -54,7 +56,27 @@ function Start-ChildProcess(
         -WorkingDirectory $WorkingDirectory -WindowStyle Hidden `
         -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -PassThru
     Set-Content -LiteralPath (Join-Path $RuntimeDir "$Name.pid") -Value $Process.Id
+    [pscustomobject]@{
+        observed_at = [DateTimeOffset]::Now.ToString("o")
+        event = "CHILD_STARTED"
+        component = $Name
+        pid = $Process.Id
+    } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
     return $Process
+}
+
+function Write-SupervisorHeartbeat($Api, $Web) {
+    $Payload = [pscustomobject]@{
+        observed_at = [DateTimeOffset]::Now.ToString("o")
+        supervisor_pid = $PID
+        api_pid = if ($Api -and -not $Api.HasExited) { $Api.Id } else { $null }
+        web_pid = if ($Web -and -not $Web.HasExited) { $Web.Id } else { $null }
+        api_running = [bool]($Api -and -not $Api.HasExited)
+        web_running = [bool]($Web -and -not $Web.HasExited)
+    }
+    $Temporary = "$HeartbeatFile.tmp"
+    $Payload | ConvertTo-Json -Compress | Set-Content -LiteralPath $Temporary
+    Move-Item -LiteralPath $Temporary -Destination $HeartbeatFile -Force
 }
 
 function Assert-Runtime {
@@ -120,12 +142,13 @@ switch ($Action) {
                         $Vinext, "start", "--hostname", "127.0.0.1", "--port", "$WebPort"
                     ) (Join-Path $ProjectRoot "apps\dashboard")
                 }
+                Write-SupervisorHeartbeat $Api $Web
                 Start-Sleep -Seconds 10
             }
         } finally {
             Stop-RecordedProcess (Join-Path $RuntimeDir "api.pid")
             Stop-RecordedProcess (Join-Path $RuntimeDir "web.pid")
-            Remove-Item -LiteralPath $SupervisorPidFile, $StopFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $SupervisorPidFile, $StopFile, $HeartbeatFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
