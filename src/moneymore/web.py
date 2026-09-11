@@ -1543,6 +1543,22 @@ def security_history(symbol: str) -> dict[str, object]:
                 (normalized,),
             )
         ]
+    # The intraday account is a branch of the factor baseline, not a fresh
+    # account.  Expose the parent's pre-activation fills as inherited display
+    # rows so a security chart shows the branch's complete trading lineage.
+    inherited_fills = [
+        {
+            **row,
+            "account_id": INTRADAY_ACCOUNT,
+            "source_account_id": MULTI_SECTOR_ACCOUNT,
+            "inherited": True,
+        }
+        for row in fills
+        if str(row.get("account_id")) == MULTI_SECTOR_ACCOUNT
+        and str(row.get("trade_date", "")) < INTRADAY_BASELINE_ACTIVATION_DATE
+    ]
+    fills.extend(inherited_fills)
+    fills.sort(key=lambda row: (str(row.get("trade_date", "")), int(row.get("id", 0))))
     names = _instrument_names(store)
     return {
         "symbol": normalized,
