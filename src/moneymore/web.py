@@ -24,6 +24,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .bank_daily import BANK_ACCOUNT, run_bank_daily_pipeline
+from .baseline_exposure_daily import (
+    BASELINE_EXPOSURE_ACCOUNT,
+    BASELINE_EXPOSURE_HISTORY,
+    run_baseline_exposure_daily,
+)
 from .config import BacktestConfig
 from .data.fundamental_sync import (
     sync_daily_basic_universe,
@@ -35,8 +40,10 @@ from .data.store import ParquetStore
 from .execution.paper import PaperBroker
 from .factors import build_default_registry, build_qmt_candidate_registry
 from .intraday_execution import (
+    EXPOSURE_INTRADAY_ACCOUNT,
     INTRADAY_ACCOUNT,
     POLICY_ID,
+    prepare_exposure_intraday_branch_orders,
     prepare_intraday_branch_orders,
     run_baseline_intraday_once,
 )
@@ -944,6 +951,7 @@ class TaskService:
                     _require_trading_gate()
                     broker = PaperBroker(PAPER_DATABASE)
                     prepare_intraday_branch_orders(broker, trade_date)
+                    prepare_exposure_intraday_branch_orders(broker, trade_date)
                     result = execute_accounts_at_qmt_open(
                         provider=QmtTushareProvider(root=ROOT),
                         broker=broker,
@@ -951,6 +959,7 @@ class TaskService:
                         trade_date=trade_date,
                         account_ids=[
                             MULTI_SECTOR_ACCOUNT,
+                            BASELINE_EXPOSURE_ACCOUNT,
                             QLIB_CHALLENGER_ACCOUNT,
                             *[
                                 candidate_account_id(str(row["candidate_tag"]))
@@ -984,6 +993,16 @@ class TaskService:
                     load_dotenv(ROOT / ".env")
                     _require_trading_gate()
                     run_baseline_intraday_once(root=ROOT, now=now)
+                    run_baseline_intraday_once(
+                        root=ROOT,
+                        now=now,
+                        source_account=BASELINE_EXPOSURE_ACCOUNT,
+                        account_id=EXPOSURE_INTRADAY_ACCOUNT,
+                        snapshot_table="baseline_pysystemtrade_intraday_snapshots",
+                        tick_table="baseline_pysystemtrade_intraday_account_ticks",
+                        daily_table="baseline_pysystemtrade_intraday_account_daily",
+                        audit_subdirectory="baseline-pysystemtrade-intraday-execution",
+                    )
                 except Exception as intraday_error:  # noqa: BLE001
                     self._notify(
                         "ERROR",
@@ -1353,6 +1372,34 @@ class TaskService:
                     trade_date=trade_date,
                     run_id=run_id,
                 )
+            if multi_result is not None:
+                try:
+                    def execute_baseline_exposure() -> Any:
+                        daily_path = DATA / "processed" / "daily.parquet"
+                        snapshot = build_market_risk_snapshot(
+                            str(DATA), daily_path.stat().st_mtime_ns
+                        )
+                        contestant = snapshot["exposure_league"]["contestants"][0]
+                        return run_baseline_exposure_daily(
+                            store=store,
+                            broker=broker,
+                            config=config,
+                            trade_date=trade_date,
+                            baseline_report=asdict(multi_result),
+                            target_exposure=float(contestant["target_exposure"]),
+                            signal_dir=STATE / "baseline-pysystemtrade-signals",
+                            report_dir=STATE / "baseline-pysystemtrade-shadow",
+                        )
+                    self._run_step(
+                        run_id,
+                        trade_date,
+                        "baseline_pysystemtrade_execution",
+                        execute_baseline_exposure,
+                    )
+                except Exception as overlay_error:  # noqa: BLE001
+                    strategy_failures.append(
+                        f"baseline_pysystemtrade_execution: {type(overlay_error).__name__}: {overlay_error}"
+                    )
             independent_steps = [
                 (
                     "qlib_challenger_execution",
@@ -1532,7 +1579,80 @@ def system_health() -> dict[str, object]:
 @app.get("/api/market-risk")
 def market_risk() -> dict[str, object]:
     daily_path = DATA / "processed" / "daily.parquet"
-    return build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
+    payload = build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
+    broker = PaperBroker(PAPER_DATABASE)
+    broker.initialize_account(1_000_000, BASELINE_EXPOSURE_ACCOUNT)
+    try:
+        history = _records(ParquetStore(DATA).read(BASELINE_EXPOSURE_HISTORY).sort_values("trade_date"))
+    except FileNotFoundError:
+        history = []
+    comparison = list(payload["exposure_league"].get("strategy_comparison", []))
+    store = ParquetStore(DATA)
+    try:
+        baseline_history = store.read("multi_sector_account_daily").sort_values("trade_date")
+        intraday_history = store.read("baseline_intraday_account_daily").sort_values("trade_date")
+        branch = build_branch_history(
+            baseline_history, intraday_history,
+            branch_account_id=INTRADAY_ACCOUNT,
+            activation_date=INTRADAY_BASELINE_ACTIVATION_DATE,
+        )
+        if not branch.empty:
+            branch["normalized_nav"] = branch["equity"] / float(branch["equity"].iloc[0])
+            comparison.extend(
+                {"trade_date": str(row["trade_date"]), "strategy_id": "baseline_intraday", "strategy": "基线 + 日内实时", "normalized_nav": float(row["normalized_nav"])}
+                for row in branch.to_dict("records")
+            )
+    except FileNotFoundError:
+        pass
+    overlay_counterfactual = [
+        dict(row) for row in comparison if row.get("strategy_id") == "baseline_pysystemtrade"
+    ]
+    try:
+        controlled_intraday = store.read("baseline_pysystemtrade_intraday_account_daily").sort_values("trade_date")
+    except FileNotFoundError:
+        controlled_intraday = pd.DataFrame()
+    if controlled_intraday.empty:
+        comparison.extend(
+            {**row, "strategy_id": "baseline_pysystemtrade_intraday", "strategy": "基线 + 仓位控制 + 日内实时"}
+            for row in overlay_counterfactual
+        )
+    else:
+        first = str(controlled_intraday.iloc[0]["trade_date"])
+        lineage = [row for row in overlay_counterfactual if str(row["trade_date"]) < first]
+        base_nav = float(lineage[-1]["normalized_nav"]) if lineage else 1.0
+        first_equity = float(controlled_intraday.iloc[0]["equity"])
+        comparison.extend(
+            [{**row, "strategy_id": "baseline_pysystemtrade_intraday", "strategy": "基线 + 仓位控制 + 日内实时"} for row in lineage]
+            + [
+                {"trade_date": str(row["trade_date"]), "strategy_id": "baseline_pysystemtrade_intraday", "strategy": "基线 + 仓位控制 + 日内实时", "normalized_nav": base_nav * float(row["equity"]) / first_equity}
+                for row in controlled_intraday.to_dict("records")
+            ]
+        )
+    payload["exposure_league"]["strategy_comparison"] = comparison
+    payload["paper_accounts"] = {
+        "baseline": {
+            "account_id": MULTI_SECTOR_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == MULTI_SECTOR_ACCOUNT][:100],
+            "fills": broker.fills(MULTI_SECTOR_ACCOUNT)[-100:],
+        },
+        "baseline_pysystemtrade": {
+            "account_id": BASELINE_EXPOSURE_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == BASELINE_EXPOSURE_ACCOUNT][:100],
+            "fills": broker.fills(BASELINE_EXPOSURE_ACCOUNT)[-100:],
+            "history": history,
+        },
+        "baseline_intraday": {
+            "account_id": INTRADAY_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == INTRADAY_ACCOUNT][:100],
+            "fills": broker.fills(INTRADAY_ACCOUNT)[-100:],
+        },
+        "baseline_pysystemtrade_intraday": {
+            "account_id": EXPOSURE_INTRADAY_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == EXPOSURE_INTRADAY_ACCOUNT][:100],
+            "fills": broker.fills(EXPOSURE_INTRADAY_ACCOUNT)[-100:],
+        },
+    }
+    return payload
 
 
 @app.get("/api/security-history")
@@ -1711,6 +1831,8 @@ def _open_execution_status(trade_date: str) -> dict[str, object]:
     )
     account_ids = [
         MULTI_SECTOR_ACCOUNT,
+        BASELINE_EXPOSURE_ACCOUNT,
+        EXPOSURE_INTRADAY_ACCOUNT,
         QLIB_CHALLENGER_ACCOUNT,
         *[candidate_account_id(str(row["candidate_tag"])) for row in candidate_catalog(ROOT)],
     ]

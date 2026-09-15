@@ -264,7 +264,7 @@ export default function Dashboard() {
       {page === "overview" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Overview sectors={sectors} execution={displayedExecution}/></SecurityAccountContext.Provider>}
       {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
       {page === "research" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Research sectors={sectors} models={models}/></SecurityAccountContext.Provider>}
-      {page === "risk" && <MarketRiskPage risk={marketRisk}/>}
+      {page === "risk" && <MarketRiskPage risk={marketRisk} live={live} names={sectors.symbol_names}/>}
       {page === "challenger" && <SecurityAccountContext.Provider value="qlib_gru_shadow"><ChallengerPage challenger={challenger} names={sectors.symbol_names} live={live}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></SecurityAccountContext.Provider>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Operations bank={bank} execution={displayedExecution} operations={operations} acceptance={acceptance} intraday={intraday} live={live} names={sectors.symbol_names} onRefresh={refresh}/></SecurityAccountContext.Provider>}
@@ -272,18 +272,41 @@ export default function Dashboard() {
   </div>{(securityDetailLoading||securityDetailError||securityDetail)&&<SecurityHistoryModal detail={securityDetail} initialAccountId={securityDetailAccount} loading={securityDetailLoading} error={securityDetailError} onClose={()=>{setSecurityDetail(null);setSecurityDetailError("");}}/>}</SecurityNavigationContext.Provider>;
 }
 
-function MarketRiskPage({ risk }: { risk:MarketRisk }) {
+function MarketRiskPage({ risk, live, names }: { risk:MarketRisk; live?:LiveAccounts; names:Record<string,string> }) {
   const selectedRow=risk.exposure_league.contestants[0];
   const leagueSeries=selectedRow?[{accountId:text(selectedRow.method_id),label:"pysystemtrade 总仓位",color:"#7657d5",rows:(risk.exposure_league.history??[]).filter((row)=>text(row.method_id)===text(selectedRow.method_id)&&Number.isFinite(Number(row.target_exposure)))}]:[];
   const comparison=(risk.exposure_league.strategy_comparison??[]) as Row[];
   const strategySeries=[
     {accountId:"baseline",label:"原基线",color:"#102c24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline")},
+    {accountId:"baseline_intraday",label:"基线 + 日内实时",color:"#168a83",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_intraday")},
     {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#d08a24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
+    {accountId:"baseline_pysystemtrade_intraday",label:"基线 + 仓位控制 + 日内实时",color:"#c14974",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade_intraday")},
   ];
+  const paper=(risk.paper_accounts??{}) as Row;
+  const baseline=(paper.baseline??{}) as Row;
+  const overlay=(paper.baseline_pysystemtrade??{}) as Row;
+  const baselineIntraday=(paper.baseline_intraday??{}) as Row;
+  const overlayIntraday=(paper.baseline_pysystemtrade_intraday??{}) as Row;
+  const baselineId=text(baseline.account_id);
+  const overlayId=text(overlay.account_id);
+  const baselineIntradayId=text(baselineIntraday.account_id);
+  const overlayIntradayId=text(overlayIntraday.account_id);
+  const baselineLive=live?.accounts[baselineId];
+  const overlayLive=live?.accounts[overlayId];
+  const baselineIntradayLive=live?.accounts[baselineIntradayId];
+  const overlayIntradayLive=live?.accounts[overlayIntradayId];
+  const baselinePortfolio=baselineLive?.portfolio;
+  const overlayPortfolio=overlayLive?.portfolio;
   return <>
     <Intro tag="BASELINE × EXPOSURE" title="基线策略叠加市场总仓位">只保留 pysystemtrade 作为正交仓位层。原基线回答“买什么”，叠加策略再决定“总共买多少”；T日收盘信号从下一交易日生效。</Intro>
     <section className="exposure-methods">{selectedRow&&<button className="active"><small>pysystemtrade 当前建议总仓位</small><b>{pct(selectedRow.target_exposure)}</b><span>{text(selectedRow.explanation)}</span></button>}</section>
-    <LineComparisonChart title="原基线 vs 基线 + pysystemtrade" subtitle={text(risk.exposure_league.comparison_mode)} series={strategySeries} valueKey="normalized_nav" formatValue={(value)=>value.toFixed(4)} selectedAccountIds={new Set()} onToggle={()=>{}}/>
+    <LineComparisonChart title="四种基线执行组合对比" subtitle={`${text(risk.exposure_league.comparison_mode)}；日内分支仅改变成交时机`} series={strategySeries} valueKey="normalized_nav" formatValue={(value)=>value.toFixed(4)} selectedAccountIds={new Set()} onToggle={()=>{}}/>
+    <div className="four-col account-columns">
+      <AccountColumn title="原基线" badge="FACTOR BASELINE" accountId={baselineId} status="正常模拟" equity={Number(baselinePortfolio?.equity??1_000_000)} portfolio={baselinePortfolio} orders={baselineLive?.orders??(baseline.orders as Row[]??[])} fills={baselineLive?.fills??(baseline.fills as Row[]??[])} names={names}/>
+      <AccountColumn title="基线 + 日内实时" badge="ADAPTIVE VWAP" accountId={baselineIntradayId} status="日内择价模拟" equity={Number(baselineIntradayLive?.portfolio.equity??1_000_000)} portfolio={baselineIntradayLive?.portfolio} orders={baselineIntradayLive?.orders??(baselineIntraday.orders as Row[]??[])} fills={baselineIntradayLive?.fills??(baselineIntraday.fills as Row[]??[])} names={names}/>
+      <AccountColumn title="基线 + pysystemtrade" badge="EXPOSURE OVERLAY" accountId={overlayId} status="独立模拟" equity={Number(overlayPortfolio?.equity??1_000_000)} portfolio={overlayPortfolio} targetExposure={Number(selectedRow?.target_exposure)} orders={overlayLive?.orders??(overlay.orders as Row[]??[])} fills={overlayLive?.fills??(overlay.fills as Row[]??[])} names={names}/>
+      <AccountColumn title="仓位控制 + 日内实时" badge="EXPOSURE × VWAP" accountId={overlayIntradayId} status="双层独立模拟" equity={Number(overlayIntradayLive?.portfolio.equity??1_000_000)} portfolio={overlayIntradayLive?.portfolio} targetExposure={Number(selectedRow?.target_exposure)} orders={overlayIntradayLive?.orders??(overlayIntraday.orders as Row[]??[])} fills={overlayIntradayLive?.fills??(overlayIntraday.fills as Row[]??[])} names={names}/>
+    </div>
     <LineComparisonChart title="pysystemtrade 历史总股票仓位" subtitle={`${text(risk.exposure_league.input_asset)}；${text(risk.exposure_league.history_mode)}`} series={leagueSeries} valueKey="target_exposure" formatValue={pct} yMin={0} yMax={1} selectedAccountIds={new Set()} onToggle={()=>{}}/>
     <Panel title="当前仓位信号" subtitle={`数据日 ${risk.as_of_date} · 覆盖 ${risk.coverage}/${risk.universe_size} 只`}><Table rows={risk.exposure_league.contestants} columns={[["framework","方法"],["status","状态"],["target_exposure","当前总仓位"],["trained_until","截止日期"],["explanation","方法说明"]]} format={{target_exposure:pct}}/></Panel>
   </>;

@@ -41,7 +41,7 @@ Stop-LegacyMoneyMoreListener 8788
 Stop-LegacyMoneyMoreListener 3000
 
 $PowerShell = (Get-Command powershell.exe).Source
-$Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ServiceScript`" -Action Start"
+$Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ServiceScript`" -Action Run"
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Action = New-ScheduledTaskAction -Execute $PowerShell -Argument $Arguments -WorkingDirectory $ProjectRoot
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
@@ -51,6 +51,7 @@ $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interact
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings `
     -Principal $Principal -Description "MoneyMore API, dashboard and daily scheduler" -Force | Out-Null
 
-& $ServiceScript -Action Start
+Start-ScheduledTask -TaskName $TaskName
+Start-Sleep -Seconds 3
 Write-Output "Installed Windows auto-start task: $TaskName"
-Write-Output "MoneyMore will start automatically after Windows login, without Codex."
+Write-Output "MoneyMore supervisor is directly hosted by Task Scheduler and starts after Windows login."

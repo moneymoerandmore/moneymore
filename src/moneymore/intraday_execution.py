@@ -15,28 +15,36 @@ from .data.qmt_provider import QmtTushareProvider
 from .data.store import ParquetStore
 from .execution.paper import ExecutionBar, PaperBroker
 from .multi_sector_daily import MULTI_SECTOR_ACCOUNT
+from .baseline_exposure_daily import BASELINE_EXPOSURE_ACCOUNT
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 POLICY_ID = "adaptive_vwap_sniper_v1"
 INTRADAY_ACCOUNT = "multi_sector_intraday_shadow"
+EXPOSURE_INTRADAY_ACCOUNT = "multi_sector_pysystemtrade_intraday_shadow"
 
 
-def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) -> int:
+def _ensure_comparison_account_and_orders(
+    broker: PaperBroker,
+    trade_date: str,
+    *,
+    source_account: str = MULTI_SECTOR_ACCOUNT,
+    target_account: str = INTRADAY_ACCOUNT,
+) -> int:
     """Clone the baseline once, then mirror eligible parent orders exactly."""
     with sqlite3.connect(broker.database) as connection:
         source = connection.execute(
             "SELECT initial_cash, cash, updated_at FROM accounts WHERE account_id = ?",
-            (MULTI_SECTOR_ACCOUNT,),
+            (source_account,),
         ).fetchone()
         if source is None:
             raise RuntimeError("baseline paper account is not initialized")
         exists = connection.execute(
-            "SELECT 1 FROM accounts WHERE account_id = ?", (INTRADAY_ACCOUNT,)
+            "SELECT 1 FROM accounts WHERE account_id = ?", (target_account,)
         ).fetchone()
         if exists is None:
             connection.execute(
                 "INSERT INTO accounts(account_id, initial_cash, cash, updated_at) VALUES (?, ?, ?, ?)",
-                (INTRADAY_ACCOUNT, *source),
+                (target_account, *source),
             )
             connection.execute(
                 """
@@ -46,7 +54,7 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
                 SELECT ?, symbol, quantity, available_quantity, avg_cost, last_buy_date
                 FROM positions WHERE account_id = ?
                 """,
-                (INTRADAY_ACCOUNT, MULTI_SECTOR_ACCOUNT),
+                (target_account, source_account),
             )
         parents = connection.execute(
             """
@@ -62,11 +70,11 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
               )
             ORDER BY o.created_at, o.idempotency_key
             """,
-            (MULTI_SECTOR_ACCOUNT, trade_date, trade_date),
+            (source_account, trade_date, trade_date),
         ).fetchall()
         mirrored = 0
         for row in parents:
-            key = f"{INTRADAY_ACCOUNT}:{row[0]}"
+            key = f"{target_account}:{row[0]}"
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO orders(
@@ -83,7 +91,7 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
                     row[6],
                     row[7],
                     row[8],
-                    INTRADAY_ACCOUNT,
+                    target_account,
                 ),
             )
             mirrored += int(cursor.rowcount > 0)
@@ -93,6 +101,14 @@ def _ensure_comparison_account_and_orders(broker: PaperBroker, trade_date: str) 
 def prepare_intraday_branch_orders(broker: PaperBroker, trade_date: str) -> int:
     """Mirror parent orders before open execution; recover same-day races safely."""
     return _ensure_comparison_account_and_orders(broker, trade_date)
+
+
+def prepare_exposure_intraday_branch_orders(broker: PaperBroker, trade_date: str) -> int:
+    return _ensure_comparison_account_and_orders(
+        broker, trade_date,
+        source_account=BASELINE_EXPOSURE_ACCOUNT,
+        target_account=EXPOSURE_INTRADAY_ACCOUNT,
+    )
 
 
 @dataclass(frozen=True)
@@ -157,15 +173,23 @@ def run_baseline_intraday_once(
     *,
     root: Path,
     now: datetime | None = None,
+    source_account: str = MULTI_SECTOR_ACCOUNT,
+    account_id: str = INTRADAY_ACCOUNT,
+    snapshot_table: str = "baseline_intraday_snapshots",
+    tick_table: str = "baseline_intraday_account_ticks",
+    daily_table: str = "baseline_intraday_account_daily",
+    audit_subdirectory: str = "intraday-execution",
 ) -> dict[str, object]:
     current = (now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     trade_date = current.strftime("%Y%m%d")
     broker = PaperBroker(root / "state" / "paper_orders.sqlite3")
-    mirrored = _ensure_comparison_account_and_orders(broker, trade_date)
+    mirrored = _ensure_comparison_account_and_orders(
+        broker, trade_date, source_account=source_account, target_account=account_id
+    )
     pending = [
         row
         for row in broker.orders()
-        if row.get("account_id") == INTRADAY_ACCOUNT
+        if row.get("account_id") == account_id
         and row.get("status") == "PENDING"
         and str(row.get("signal_date", "")) < trade_date
     ]
@@ -173,14 +197,14 @@ def run_baseline_intraday_once(
         "policy_id": POLICY_ID,
         "trade_date": trade_date,
         "observed_at": current.isoformat(),
-        "account_id": INTRADAY_ACCOUNT,
+        "account_id": account_id,
         "mirrored_orders": mirrored,
         "pending_orders": len(pending),
         "decisions": [],
         "executions": [],
         "status": "TRACKING" if not pending else "RUNNING",
     }
-    empty_account = broker.account_snapshot({}, INTRADAY_ACCOUNT)
+    empty_account = broker.account_snapshot({}, account_id)
     held_symbols = {str(row["symbol"]) for row in empty_account.get("positions", [])}
     symbols = sorted(held_symbols | {str(row["symbol"]) for row in pending})
     if not symbols:
@@ -195,7 +219,7 @@ def run_baseline_intraday_once(
     quotes["trade_date"] = trade_date
     quotes["observed_at"] = current.isoformat()
     store.merge_curated(
-        "baseline_intraday_snapshots",
+        snapshot_table,
         [quotes],
         ["trade_date", "observed_at", "symbol"],
     )
@@ -203,7 +227,7 @@ def run_baseline_intraday_once(
     quote_map = {str(row["symbol"]): row for row in quotes.to_dict("records")}
     account = broker.account_snapshot(
         {symbol: float(row["last"]) for symbol, row in quote_map.items()},
-        INTRADAY_ACCOUNT,
+        account_id,
     )
     positions = {str(row["symbol"]): row for row in account.get("positions", [])}
     decisions: list[dict[str, object]] = []
@@ -248,18 +272,18 @@ def run_baseline_intraday_once(
                     can_sell=can_sell,
                 ),
                 config,
-                INTRADAY_ACCOUNT,
+                account_id,
             )
         )
-    process_corporate_actions(store, broker, INTRADAY_ACCOUNT, trade_date, held_symbols)
+    process_corporate_actions(store, broker, account_id, trade_date, held_symbols)
     marks = {symbol: float(row["last"]) for symbol, row in quote_map.items()}
-    account = broker.account_snapshot(marks, INTRADAY_ACCOUNT)
+    account = broker.account_snapshot(marks, account_id)
     equity = float(account["equity"])
     market_value = float(account["market_value"])
     account_row = pd.DataFrame(
         [
             {
-                "account_id": INTRADAY_ACCOUNT,
+                "account_id": account_id,
                 "trade_date": trade_date,
                 "observed_at": current.isoformat(),
                 "equity": equity,
@@ -270,12 +294,12 @@ def run_baseline_intraday_once(
         ]
     )
     store.merge_curated(
-        "baseline_intraday_account_ticks",
+        tick_table,
         [account_row],
         ["account_id", "trade_date", "observed_at"],
     )
     store.merge_curated(
-        "baseline_intraday_account_daily",
+        daily_table,
         [account_row],
         ["account_id", "trade_date"],
     )
@@ -285,7 +309,7 @@ def run_baseline_intraday_once(
     payload["status"] = (
         "COMPLETED" if executions else ("WAITING_FOR_TRIGGER" if pending else "TRACKING")
     )
-    audit_dir = root / "state" / "intraday-execution"
+    audit_dir = root / "state" / audit_subdirectory
     audit_dir.mkdir(parents=True, exist_ok=True)
     target = audit_dir / f"{trade_date}.json"
     history = []

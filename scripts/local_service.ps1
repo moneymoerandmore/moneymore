@@ -145,6 +145,14 @@ switch ($Action) {
                 Write-SupervisorHeartbeat $Api $Web
                 Start-Sleep -Seconds 10
             }
+        } catch {
+            [pscustomobject]@{
+                observed_at = [DateTimeOffset]::Now.ToString("o")
+                event = "SUPERVISOR_FATAL"
+                component = "supervisor"
+                error = $_.Exception.ToString()
+            } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
+            throw
         } finally {
             Stop-RecordedProcess (Join-Path $RuntimeDir "api.pid")
             Stop-RecordedProcess (Join-Path $RuntimeDir "web.pid")
