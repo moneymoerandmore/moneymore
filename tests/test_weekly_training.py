@@ -85,4 +85,4 @@ def test_failed_cycle_stops_after_maximum_attempts(tmp_path: Path, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()),
     )
     assert service.check_and_launch(now, "TEST") is None
-    assert service.status()["attempts_exhausted"] is True
+    assert service.status(now=now)["attempts_exhausted"] is True

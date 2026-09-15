@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 
 type Row = Record<string, unknown>;
-type Page = "overview" | "sectors" | "research" | "challenger" | "data" | "operations";
+type Page = "overview" | "sectors" | "research" | "risk" | "challenger" | "data" | "operations";
 type Bank = {
   latest_date: string; latest_scores: Row[]; latest_holdings: Row[];
   scheduler: { enabled: boolean; time: string; timezone: string; next_run?: string };
@@ -68,6 +68,11 @@ type SystemHealth = {
   trading_gate:"OPEN"|"FROZEN"; blocking_count:number; warning_count:number;
   checks:Row[];
 };
+type MarketRisk = {
+  status:string; as_of_date:string; effective_for:string; universe_version:string;
+  universe_size:number; coverage:number;
+  exposure_league:Row & { contestants:Row[]; audit_contestants:Row[]; history:Row[] };
+};
 type SecurityHistory = {
   symbol:string; name:string; bars:Row[]; fills:Row[];
   coverage: { start_date:string; end_date:string; trading_days:number; fill_count:number };
@@ -111,6 +116,7 @@ const nav: { id: Page; label: string; note: string }[] = [
   { id: "overview", label: "组合总览", note: "PORTFOLIO" },
   { id: "sectors", label: "行业与个股", note: "SLEEVES" },
   { id: "research", label: "策略研究", note: "MODELS" },
+  { id: "risk", label: "市场与仓位", note: "RISK" },
   { id: "challenger", label: "Qlib挑战者", note: "AI LAB" },
   { id: "data", label: "数据健康", note: "QUALITY" },
   { id: "operations", label: "运行与对账", note: "PAPER" },
@@ -140,6 +146,19 @@ const pct = (v: unknown) => `${(Number(v ?? 0) * 100).toFixed(1)}%`;
 const num = (v: unknown) => Number(v ?? 0).toFixed(2);
 const modelScore = (v: unknown) => Number(v ?? 0).toFixed(6);
 const text = (v: unknown) => v == null ? "—" : String(v);
+const reviewStatusName = (value: unknown) => ({
+  OBSERVING:"观察积累中",
+  PRELIMINARY_REVIEW:"初步评审中",
+  PRELIMINARY_REVIEW_DUE:"等待初步评审",
+  CONTINUE_TO_60D:"继续观察至60日",
+  EARLY_REJECTED:"提前淘汰",
+  FORMAL_REVIEW_READY:"等待正式评审",
+  FORMAL_REVIEW_DUE:"等待正式评审",
+  PROMOTED:"已晋级",
+  REJECTED:"已淘汰",
+  EXPERIMENTAL_PAPER:"模拟观察中",
+  AWAITING_OBSERVATION:"等待首次观察",
+}[text(value)]??text(value));
 const security = (v: unknown, names: Record<string, string>) => {
   const code = text(v);
   return names[code] ? `${names[code]} · ${code}` : code;
@@ -168,6 +187,7 @@ export default function Dashboard() {
   const [intraday, setIntraday] = useState<IntradayExecution | null>(null);
   const [live, setLive] = useState<LiveAccounts | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
+  const [marketRisk, setMarketRisk] = useState<MarketRisk | null>(null);
   const [securityDetail,setSecurityDetail]=useState<SecurityHistory|null>(null);
   const [securityDetailAccount,setSecurityDetailAccount]=useState("");
   const [securityDetailLoading,setSecurityDetailLoading]=useState(false);
@@ -176,11 +196,12 @@ export default function Dashboard() {
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
     try {
-      const [b, s, e, q, o, m, a, c, i] = await Promise.all([
+      const [b, s, e, q, o, m, a, c, i, r] = await Promise.all([
         json<Bank>("/api/bank-dashboard"), json<Sectors>("/api/sector-portfolio"), json<Execution>("/api/multi-sector-execution"), json<DataQuality>("/api/data-quality"), json<OperationsCenter>("/api/operations-center"), json<ModelRegistry>("/api/model-registry"), json<MonthlyAcceptance>("/api/monthly-acceptance"), json<Challenger>("/api/qlib-challenger"),
         json<IntradayExecution>("/api/intraday-execution"),
+        json<MarketRisk>("/api/market-risk"),
       ]);
-      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setError("");
+      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setMarketRisk(r); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
   const refreshLive = useCallback(async () => {
@@ -225,7 +246,7 @@ export default function Dashboard() {
     },10_000);
     return ()=>clearInterval(id);
   },[securityDetail?.symbol]);
-  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
+  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday || !marketRisk) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   const current = nav.find((item) => item.id === page)!;
   const liveBaseline=live?.accounts[execution.account_id];
   const displayedExecution=liveBaseline?{...execution,portfolio:liveBaseline.portfolio,positions:liveBaseline.positions,orders:liveBaseline.orders,fills:liveBaseline.fills}:execution;
@@ -243,11 +264,29 @@ export default function Dashboard() {
       {page === "overview" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Overview sectors={sectors} execution={displayedExecution}/></SecurityAccountContext.Provider>}
       {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
       {page === "research" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Research sectors={sectors} models={models}/></SecurityAccountContext.Provider>}
+      {page === "risk" && <MarketRiskPage risk={marketRisk}/>}
       {page === "challenger" && <SecurityAccountContext.Provider value="qlib_gru_shadow"><ChallengerPage challenger={challenger} names={sectors.symbol_names} live={live}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></SecurityAccountContext.Provider>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Operations bank={bank} execution={displayedExecution} operations={operations} acceptance={acceptance} intraday={intraday} live={live} names={sectors.symbol_names} onRefresh={refresh}/></SecurityAccountContext.Provider>}
     </main>
   </div>{(securityDetailLoading||securityDetailError||securityDetail)&&<SecurityHistoryModal detail={securityDetail} initialAccountId={securityDetailAccount} loading={securityDetailLoading} error={securityDetailError} onClose={()=>{setSecurityDetail(null);setSecurityDetailError("");}}/>}</SecurityNavigationContext.Provider>;
+}
+
+function MarketRiskPage({ risk }: { risk:MarketRisk }) {
+  const selectedRow=risk.exposure_league.contestants[0];
+  const leagueSeries=selectedRow?[{accountId:text(selectedRow.method_id),label:"pysystemtrade 总仓位",color:"#7657d5",rows:(risk.exposure_league.history??[]).filter((row)=>text(row.method_id)===text(selectedRow.method_id)&&Number.isFinite(Number(row.target_exposure)))}]:[];
+  const comparison=(risk.exposure_league.strategy_comparison??[]) as Row[];
+  const strategySeries=[
+    {accountId:"baseline",label:"原基线",color:"#102c24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline")},
+    {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#d08a24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
+  ];
+  return <>
+    <Intro tag="BASELINE × EXPOSURE" title="基线策略叠加市场总仓位">只保留 pysystemtrade 作为正交仓位层。原基线回答“买什么”，叠加策略再决定“总共买多少”；T日收盘信号从下一交易日生效。</Intro>
+    <section className="exposure-methods">{selectedRow&&<button className="active"><small>pysystemtrade 当前建议总仓位</small><b>{pct(selectedRow.target_exposure)}</b><span>{text(selectedRow.explanation)}</span></button>}</section>
+    <LineComparisonChart title="原基线 vs 基线 + pysystemtrade" subtitle={text(risk.exposure_league.comparison_mode)} series={strategySeries} valueKey="normalized_nav" formatValue={(value)=>value.toFixed(4)} selectedAccountIds={new Set()} onToggle={()=>{}}/>
+    <LineComparisonChart title="pysystemtrade 历史总股票仓位" subtitle={`${text(risk.exposure_league.input_asset)}；${text(risk.exposure_league.history_mode)}`} series={leagueSeries} valueKey="target_exposure" formatValue={pct} yMin={0} yMax={1} selectedAccountIds={new Set()} onToggle={()=>{}}/>
+    <Panel title="当前仓位信号" subtitle={`数据日 ${risk.as_of_date} · 覆盖 ${risk.coverage}/${risk.universe_size} 只`}><Table rows={risk.exposure_league.contestants} columns={[["framework","方法"],["status","状态"],["target_exposure","当前总仓位"],["trained_until","截止日期"],["explanation","方法说明"]]} format={{target_exposure:pct}}/></Panel>
+  </>;
 }
 
 function Overview({ sectors, execution }: { sectors: Sectors; execution: Execution }) {
@@ -321,7 +360,7 @@ function ChallengerPage({ challenger, names, live }: { challenger: Challenger; n
       <AccountColumn title="基线" badge="FACTOR BASELINE" accountId={challenger.baseline.account_id} status={text(challenger.baseline.latest.status)} equity={baselineEquity} portfolio={baselinePortfolio} orders={baselineLive?.orders??challenger.baseline.orders??[]} fills={baselineLive?.fills??challenger.baseline.fills??[]} names={names}/>
       <AccountColumn title="基线·日内执行" badge="ADAPTIVE VWAP" accountId={text(challenger.intraday_baseline?.account_id)} status={text(challenger.intraday_baseline?.status)} equity={Number(intradayLive?.portfolio.equity??challenger.intraday_baseline?.portfolio?.equity??0)} portfolio={intradayLive?.portfolio??challenger.intraday_baseline?.portfolio} orders={intradayLive?.orders??challenger.intraday_baseline?.orders??[]} fills={intradayLive?.fills??challenger.intraday_baseline?.fills??[]} names={names}/>
       <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challengerPortfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challengerLive?.orders??challenger.orders} fills={challengerLive?.fills??challenger.fills} names={names}/>
-      <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={text(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={candidateLive?.orders??selectedCandidate?.orders??observation?.orders??[]} fills={candidateLive?.fills??selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
+      <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={reviewStatusName(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={candidateLive?.orders??selectedCandidate?.orders??observation?.orders??[]} fills={candidateLive?.fills??selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
     </div>
     <PerformanceComparisonCharts comparison={globalView}/>
     <CandidateObservation challenger={challenger} selectedTag={text(selectedCandidate?.candidate_tag)}/>
@@ -341,7 +380,7 @@ function AccountColumn({ title, badge, accountId, status, equity, portfolio, tar
 
 function CandidateSwitcher({ observation, selectedTag, onSelect }: { observation:Challenger["candidate_observation"]; selectedTag:string; onSelect:(tag:string)=>void }) {
   if (!observation) return null;
-  return <div className="candidate-switcher"><b>第三列候选策略</b><select value={selectedTag} onChange={(event)=>onSelect(event.target.value)}>{(observation.candidates??[]).map((row)=><option key={row.candidate_tag} value={row.candidate_tag}>{row.candidate_tag} · {row.latest_trade_date?`${text(row.review_stage)} · ${text(row.common_observation_days)}日`:"等待首次收盘观察"}</option>)}</select><span>默认展示最近已有真实委托的候选；新模型在训练完成后的首个收盘流水线开始观察</span></div>;
+  return <div className="candidate-switcher"><b>第三列候选策略</b><select value={selectedTag} onChange={(event)=>onSelect(event.target.value)}>{(observation.candidates??[]).map((row)=><option key={row.candidate_tag} value={row.candidate_tag}>{row.candidate_tag} · {row.latest_trade_date?`${reviewStatusName(row.review_stage)} · ${text(row.common_observation_days)}日`:"等待首次收盘观察"}</option>)}</select><span>默认展示最近已有真实委托的候选；新模型在训练完成后的首个收盘流水线开始观察</span></div>;
 }
 
 function CandidateObservation({ challenger, selectedTag }: { challenger: Challenger; selectedTag:string }) {
@@ -351,7 +390,7 @@ function CandidateObservation({ challenger, selectedTag }: { challenger: Challen
   const commonDays = Number(selected?.common_observation_days??observation.comparison?.common_observation_days??0);
   return <>
     <section className="kpis"><Kpi label="候选队列" value={String(observation.candidates?.length??0)} note="各版本独立账户持续运行"/><Kpi label="初评门槛" value="20共同日" note="候选与两个对照均有快照"/><Kpi label="正式评审" value="60共同日" note="达到后冻结证据等待人工评审"/><Kpi label="当前选择" value={selectedTag} note={`${commonDays} 个共同日`}/></section>
-    <Panel title="每周候选模型排行榜" subtitle="离线测试按训练版本永久留档；BLOCKED 候选仍可进入隔离观察，但绝不会自动替换当前模型"><Table rows={observation.leaderboard} columns={[["candidate_tag","候选版本"],["data_cutoff","数据截止"],["rank_ic","Rank IC"],["rank_ic_ir","ICIR"],["cost_adjusted_top_k_excess_return","成本后Top-K超额"],["positive_seed_ratio","正种子率"],["average_turnover","换手率"],["research_gate_passed","研究门禁"],["observation_days","观察日"],["latest_status","观察状态"]]} format={{rank_ic:num,rank_ic_ir:num,cost_adjusted_top_k_excess_return:pct,positive_seed_ratio:pct,average_turnover:pct,research_gate_passed:(v)=>v?"PASS":"BLOCKED"}}/></Panel>
+    <Panel title="每周候选模型排行榜" subtitle="离线测试按训练版本永久留档；未通过研究门禁的候选仍可隔离观察，但绝不会自动替换当前模型"><Table rows={observation.leaderboard} columns={[["candidate_tag","候选版本"],["data_cutoff","数据截止"],["rank_ic","Rank IC"],["rank_ic_ir","ICIR"],["cost_adjusted_top_k_excess_return","成本后Top-K超额"],["positive_seed_ratio","正种子率"],["average_turnover","换手率"],["research_gate_passed","研究门禁"],["observation_days","观察日"],["review_stage","评审阶段"],["latest_status","运行状态"]]} format={{rank_ic:num,rank_ic_ir:num,cost_adjusted_top_k_excess_return:pct,positive_seed_ratio:pct,average_turnover:pct,research_gate_passed:(v)=>v?"通过":"未通过",review_stage:reviewStatusName,latest_status:reviewStatusName}}/></Panel>
   </>;
 }
 
@@ -403,7 +442,7 @@ function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["c
   return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略（可多选）</span><button className={showAll?"active":""} onClick={()=>setSelectedAccountIds(new Set())}>全部</button>{series.map((item)=><button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={!showAll&&selectedAccountIds.has(item.accountId)?"active":""} onClick={()=>toggleAccount(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/></div></>;
 }
 
-function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, selectedAccountIds, onToggle }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; selectedAccountIds:Set<string>; onToggle:(accountId:string)=>void }) {
+function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, yMin, yMax, selectedAccountIds, onToggle }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; yMin?:number; yMax?:number; selectedAccountIds:Set<string>; onToggle:(accountId:string)=>void }) {
   const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
   const dates = [...new Set(series.flatMap((item)=>item.rows.map((row)=>text(row.trade_date))))].sort();
   const dateIndex = new Map(dates.map((date,index)=>[date,index]));
@@ -413,7 +452,7 @@ function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, z
   const rawMin = Math.min(...points.map((point)=>point.value), zeroLine ? 0 : Infinity);
   const rawMax = Math.max(...points.map((point)=>point.value), zeroLine ? 0 : -Infinity);
   const padding = Math.max((rawMax - rawMin) * 0.12, zeroLine ? 0.001 : 0.005);
-  const min = rawMin - padding, max = rawMax + padding, span = Math.max(max - min, 0.000001);
+  const min = yMin??rawMin-padding, max = yMax??rawMax+padding, span = Math.max(max - min, 0.000001);
   const x = (date: string) => left + (count <= 1 ? 0 : Number(dateIndex.get(date)??0) / (count - 1)) * (width - left - right);
   const y = (value: number) => top + (max - value) / span * (height - top - bottom);
   const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(text(row.trade_date)).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");

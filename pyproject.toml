@@ -27,6 +27,12 @@ ai = [
   "lightgbm>=4.6,<5",
   "scikit-learn>=1.7,<2",
 ]
+risk = [
+  "skfolio>=0.15,<1",
+  "gymnasium>=1.0,<2",
+  "stable-baselines3>=2.6,<3",
+  "torch>=2.7",
+]
 
 [project.scripts]
 moneymore = "moneymore.cli:main"

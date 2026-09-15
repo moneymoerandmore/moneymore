@@ -34,6 +34,9 @@ class WeeklyTrainingService:
         poll_seconds: int = 60,
         retry_interval: timedelta = timedelta(hours=6),
         maximum_attempts: int = 3,
+        runner_script: str = "run_weekly_training.py",
+        schedule_label: str = "每周六 09:00",
+        log_subdirectory: str = "training",
     ) -> None:
         self.root = root
         self.database = database or root / "state" / "qlib-training.sqlite3"
@@ -42,7 +45,9 @@ class WeeklyTrainingService:
         self.poll_seconds = poll_seconds
         self.retry_interval = retry_interval
         self.maximum_attempts = maximum_attempts
-        self.log_dir = root / "logs" / "training"
+        self.runner_script = runner_script
+        self.schedule_label = schedule_label
+        self.log_dir = root / "logs" / log_subdirectory
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._stop = threading.Event()
@@ -182,7 +187,7 @@ class WeeklyTrainingService:
 
         command = [
             sys.executable,
-            str(self.root / "scripts" / "run_weekly_training.py"),
+            str(self.root / "scripts" / self.runner_script),
             "--run-id",
             str(run_id),
             "--database",
@@ -208,8 +213,8 @@ class WeeklyTrainingService:
             )
         return run_id
 
-    def status(self, limit: int = 10) -> dict[str, Any]:
-        now = datetime.now(SHANGHAI)
+    def status(self, limit: int = 10, now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(SHANGHAI)
         due = latest_due_slot(now, self.weekday, self.hour)
         with sqlite3.connect(self.database) as connection:
             connection.row_factory = sqlite3.Row
@@ -222,7 +227,7 @@ class WeeklyTrainingService:
             ]
         return {
             "enabled": True,
-            "schedule": "每周六 09:00",
+            "schedule": self.schedule_label,
             "timezone": "Asia/Shanghai",
             "latest_due_key": due.strftime("%Y-%m-%d"),
             "catch_up": True,

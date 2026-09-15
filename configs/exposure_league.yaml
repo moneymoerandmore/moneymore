@@ -1,0 +1,98 @@
+league_id: total_equity_exposure_v1
+mode: research_only
+production_enabled: false
+output_contract:
+  field: target_exposure
+  minimum: 0.0
+  maximum: 1.0
+  forbidden_outputs:
+    - symbol
+    - industry
+    - stock_weights
+input_contract:
+  risky_asset: abstract_stock_portfolio_return
+  defensive_asset: cash_return
+  stock_selection_fields_allowed: false
+contestants:
+  - method_id: pysystemtrade_vol_target
+    framework: pysystemtrade
+    stage: ready
+    upstream_defaults:
+      percentage_vol_target: 16.0
+      volatility_function: mixed_vol_calc
+      fast_ewma_span: 35
+      minimum_periods: 10
+      slow_vol_years: 10
+      slow_vol_proportion: 0.30
+      buffer_size: 0.10
+      buffer_trade_to_edge: true
+    local_constraint:
+      maximum_exposure: 1.0
+      reason: A-share long-only cash account does not use leverage
+  - method_id: skfolio_cash_allocator
+    framework: skfolio
+    stage: ready
+    native_model:
+      optimizer: MeanRisk
+      objective: MAXIMIZE_UTILITY
+      risk_measure: VARIANCE
+      budget: range_0_to_1
+      residual_budget: cash
+    model_selection:
+      walk_forward_train_days: 120
+      walk_forward_test_days: 20
+      purge_days: 1
+      risk_aversion_grid: [2, 5, 10, 20, 50]
+      evaluation_risk_aversion: 10
+      cpcv_folds: 6
+      cpcv_test_folds: 2
+      cpcv_embargo_days: 1
+    one_way_turnover_cost: 0.00061
+  - method_id: finrl_exposure_agent
+    framework: FinRL
+    stage: degenerate_excluded
+    exclusion_reason: held-out full-exposure ratio 98.33% and underperformed fixed 100% benchmark
+    gpu_control:
+      device: NVIDIA GeForce RTX 5090 Laptop GPU
+      timesteps_per_seed: 20000
+      held_out_full_exposure_ratio: 0.9917
+      conclusion: reproduced degeneration; compute device is not the cause
+    training_policy:
+      frequency: weekly
+      schedule: Saturday 09:00 Asia/Shanghai
+      startup_catch_up: true
+      automatic_promotion: false
+      maximum_attempts: 3
+      retry_interval_hours: 6
+    pipeline: train_validate_trade
+    agent_library: stable_baselines3
+    algorithm: PPO
+    training_timesteps_per_seed: 20000
+    seeds: [17, 42, 101]
+    action_space: scalar_0_to_1
+    residual_budget: cash
+  - method_id: deepdow_exposure_network
+    framework: DeepDow
+    stage: eliminated
+    elimination_reason: Sharpe scale invariance caused full-exposure saturation across all seeds
+    compatibility: deepdow_0.2.3_pure_pytorch_source_compatible
+    input_shape: [batch, 3, 60, 2]
+    assets: [stock_proxy, cash]
+    allocator: analytical_softmax
+    loss: sharpe_ratio
+    known_diagnostic: Sharpe is scale-invariant and may saturate total exposure
+    horizon_days: 20
+    epochs: 100
+    seeds: [17, 42, 101]
+    training_policy:
+      frequency: disabled
+      schedule: Saturday 09:00 Asia/Shanghai
+      startup_catch_up: true
+      automatic_promotion: false
+fairness:
+  common_input_returns: true
+  common_cash_returns: true
+  common_decision_dates: true
+  common_transaction_costs: true
+  point_in_time_only: true
+  no_existing_strategy_integration: true

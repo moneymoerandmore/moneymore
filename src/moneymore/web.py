@@ -43,6 +43,7 @@ from .intraday_execution import (
 from .long_term_review import evaluate_long_term_review
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle
+from .market_risk import build_market_risk_snapshot
 from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
@@ -239,6 +240,9 @@ def _runtime_health_bus() -> dict[str, object]:
     training_alive = bool(
         weekly_training_service._thread and weekly_training_service._thread.is_alive()
     )
+    finrl_training_alive = bool(
+        finrl_training_service._thread and finrl_training_service._thread.is_alive()
+    )
     add(
         "DAILY_SCHEDULER",
         "PASS" if scheduler_alive else "BLOCK",
@@ -246,8 +250,9 @@ def _runtime_health_bus() -> dict[str, object]:
     )
     add(
         "TRAINING_SCHEDULER",
-        "PASS" if training_alive else "WARN",
-        "每周训练调度线程正常" if training_alive else "每周训练调度线程已停止",
+        "PASS" if training_alive and finrl_training_alive else "WARN",
+        "Qlib/FinRL每周训练调度线程正常"
+        if training_alive and finrl_training_alive else "至少一个每周训练调度线程已停止",
     )
 
     try:
@@ -1460,13 +1465,29 @@ class TaskService:
 
 task_service = TaskService()
 weekly_training_service = WeeklyTrainingService(ROOT)
+finrl_training_service = WeeklyTrainingService(
+    ROOT,
+    ROOT / "state" / "finrl-training.sqlite3",
+    runner_script="run_weekly_finrl_training.py",
+    schedule_label="每周六 09:00（FinRL总仓位）",
+    log_subdirectory="training/finrl",
+)
+deepdow_training_service = WeeklyTrainingService(
+    ROOT,
+    ROOT / "state" / "deepdow-training.sqlite3",
+    runner_script="run_weekly_deepdow_training.py",
+    schedule_label="每周六 09:00（DeepDow总仓位）",
+    log_subdirectory="training/deepdow",
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     task_service.start()
     weekly_training_service.start()
+    finrl_training_service.start()
     yield
+    finrl_training_service.stop()
     weekly_training_service.stop()
     task_service.stop()
 
@@ -1490,6 +1511,10 @@ def health() -> dict[str, object]:
         "weekly_training_scheduler": bool(
             weekly_training_service._thread and weekly_training_service._thread.is_alive()
         ),
+        "finrl_training_scheduler": bool(
+            finrl_training_service._thread and finrl_training_service._thread.is_alive()
+        ),
+        "deepdow_training_scheduler": False,
         "server_time": datetime.now(SHANGHAI).isoformat(),
     }
 
@@ -1502,6 +1527,12 @@ def live_accounts() -> dict[str, object]:
 @app.get("/api/system-health")
 def system_health() -> dict[str, object]:
     return _runtime_health_bus()
+
+
+@app.get("/api/market-risk")
+def market_risk() -> dict[str, object]:
+    daily_path = DATA / "processed" / "daily.parquet"
+    return build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
 
 
 @app.get("/api/security-history")
@@ -1708,7 +1739,12 @@ def open_execution_status() -> dict[str, object]:
 
 @app.get("/api/weekly-training")
 def weekly_training() -> dict[str, object]:
-    return weekly_training_service.status()
+    status = weekly_training_service.status()
+    status["finrl"] = finrl_training_service.status()
+    deepdow_status = deepdow_training_service.status()
+    deepdow_status.update({"enabled": False, "retired": True})
+    status["deepdow"] = deepdow_status
+    return status
 
 
 @app.get("/api/factors")
