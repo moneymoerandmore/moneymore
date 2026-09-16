@@ -992,8 +992,8 @@ class TaskService:
                 try:
                     load_dotenv(ROOT / ".env")
                     _require_trading_gate()
-                    run_baseline_intraday_once(root=ROOT, now=now)
-                    run_baseline_intraday_once(
+                    intraday_results = [run_baseline_intraday_once(root=ROOT, now=now)]
+                    intraday_results.append(run_baseline_intraday_once(
                         root=ROOT,
                         now=now,
                         source_account=BASELINE_EXPOSURE_ACCOUNT,
@@ -1002,7 +1002,18 @@ class TaskService:
                         tick_table="baseline_pysystemtrade_intraday_account_ticks",
                         daily_table="baseline_pysystemtrade_intraday_account_daily",
                         audit_subdirectory="baseline-pysystemtrade-intraday-execution",
-                    )
+                    ))
+                    for result in intraday_results:
+                        if result.get("status") in {"QMT_QUOTES_EMPTY", "PARTIAL_COMPENSATION"}:
+                            self._notify(
+                                "ERROR" if result["status"] == "QMT_QUOTES_EMPTY" else "WARN",
+                                "INTRADAY_TARGET_GAP",
+                                "日内目标仓位未补齐",
+                                f"{result['account_id']}: {result['status']}; "
+                                f"blocked={result.get('blocked_target_gaps', [])}",
+                                trade_date=trade_date,
+                                dedupe_key=f"{trade_date}:{result['account_id']}:{result['status']}",
+                            )
                 except Exception as intraday_error:  # noqa: BLE001
                     self._notify(
                         "ERROR",

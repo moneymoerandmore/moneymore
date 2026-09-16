@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,9 @@ class ReconciliationResult:
 
 class PaperBroker:
     """Audit-only order intake. It never connects to a real broker."""
+
+    _schema_lock = threading.Lock()
+    _initialized_databases: set[Path] = set()
 
     def __init__(self, database: str | Path) -> None:
         self.database = Path(database)
@@ -117,7 +121,11 @@ class PaperBroker:
     ) -> str:
         if initial_cash <= 0:
             raise ValueError("initial_cash must be positive")
-        with sqlite3.connect(self.database) as connection:
+        with sqlite3.connect(self.database, timeout=30) as connection:
+            if connection.execute(
+                "SELECT 1 FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone():
+                return "EXISTS"
             try:
                 connection.execute(
                     """
@@ -804,7 +812,17 @@ class PaperBroker:
             ]
 
     def _initialize(self) -> None:
-        with sqlite3.connect(self.database) as connection:
+        database = self.database.resolve()
+        with self._schema_lock:
+            if database in self._initialized_databases:
+                return
+            with sqlite3.connect(self.database, timeout=30) as connection:
+                connection.execute("PRAGMA busy_timeout = 30000")
+                connection.execute("PRAGMA journal_mode = WAL")
+                self._initialize_schema(connection)
+            self._initialized_databases.add(database)
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS orders (

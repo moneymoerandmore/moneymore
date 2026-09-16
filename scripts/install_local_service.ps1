@@ -37,8 +37,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $DashboardDir "node_modules"))) {
 }
 
 & (Join-Path $ProjectRoot "scripts\local_service.ps1") -Action Stop
-Stop-LegacyMoneyMoreListener 8788
-Stop-LegacyMoneyMoreListener 3000
+try {
+    Invoke-WebRequest -Uri "http://127.0.0.1:8788/api/health" -UseBasicParsing -TimeoutSec 3 | Out-Null
+} catch { Stop-LegacyMoneyMoreListener 8788 }
+try {
+    Invoke-WebRequest -Uri "http://127.0.0.1:3000" -UseBasicParsing -TimeoutSec 3 | Out-Null
+} catch { Stop-LegacyMoneyMoreListener 3000 }
 
 $PowerShell = (Get-Command powershell.exe).Source
 $Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ServiceScript`" -Action Run"

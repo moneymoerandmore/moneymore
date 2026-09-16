@@ -32,6 +32,17 @@ function Test-Endpoint([string]$Uri) {
     } catch { return $false }
 }
 
+function Test-PortListening([int]$Port) {
+    $Client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $Result = $Client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (-not $Result.AsyncWaitHandle.WaitOne(1000)) { return $false }
+        $Client.EndConnect($Result)
+        return $true
+    } catch { return $false }
+    finally { $Client.Close() }
+}
+
 function Stop-RecordedProcess([string]$PidFile) {
     $Process = Get-RecordedProcess $PidFile
     if ($Process) { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue }
@@ -66,13 +77,15 @@ function Start-ChildProcess(
 }
 
 function Write-SupervisorHeartbeat($Api, $Web) {
+    $ApiHealthy = Test-Endpoint "http://127.0.0.1:$ApiPort/api/health"
+    $WebHealthy = Test-Endpoint "http://127.0.0.1:$WebPort"
     $Payload = [pscustomobject]@{
         observed_at = [DateTimeOffset]::Now.ToString("o")
         supervisor_pid = $PID
         api_pid = if ($Api -and -not $Api.HasExited) { $Api.Id } else { $null }
         web_pid = if ($Web -and -not $Web.HasExited) { $Web.Id } else { $null }
-        api_running = [bool]($Api -and -not $Api.HasExited)
-        web_running = [bool]($Web -and -not $Web.HasExited)
+        api_running = $ApiHealthy
+        web_running = $WebHealthy
     }
     $Temporary = "$HeartbeatFile.tmp"
     $Payload | ConvertTo-Json -Compress | Set-Content -LiteralPath $Temporary
@@ -125,22 +138,44 @@ switch ($Action) {
     "Run" {
         Assert-Runtime
         Repair-VinextWindowsStaticPaths
+        $ExistingSupervisor = Get-RecordedProcess $SupervisorPidFile
+        if ($ExistingSupervisor -and $ExistingSupervisor.Id -ne $PID) {
+            [pscustomobject]@{
+                observed_at = [DateTimeOffset]::Now.ToString("o")
+                event = "DUPLICATE_SUPERVISOR_SKIPPED"
+                component = "supervisor"
+                pid = $PID
+                existing_pid = $ExistingSupervisor.Id
+            } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
+            exit 0
+        }
         Set-Content -LiteralPath $SupervisorPidFile -Value $PID
         Remove-Item -LiteralPath $StopFile -Force -ErrorAction SilentlyContinue
         $Api = $null
         $Web = $null
+        $NextApiLaunch = [DateTimeOffset]::MinValue
+        $NextWebLaunch = [DateTimeOffset]::MinValue
         try {
             while (-not (Test-Path -LiteralPath $StopFile)) {
-                if (-not $Api -or $Api.HasExited) {
-                    $Api = Start-ChildProcess "api" $Python @(
-                        "-m", "uvicorn", "moneymore.web:app", "--host", "127.0.0.1",
-                        "--port", "$ApiPort", "--workers", "1"
-                    ) $ProjectRoot
+                $Now = [DateTimeOffset]::Now
+                if ((-not $Api -or $Api.HasExited) -and $Now -ge $NextApiLaunch) {
+                    $NextApiLaunch = $Now.AddSeconds(45)
+                    if (-not (Test-Endpoint "http://127.0.0.1:$ApiPort/api/health") -and
+                        -not (Test-PortListening $ApiPort)) {
+                        $Api = Start-ChildProcess "api" $Python @(
+                            "-m", "uvicorn", "moneymore.web:app", "--host", "127.0.0.1",
+                            "--port", "$ApiPort", "--workers", "1"
+                        ) $ProjectRoot
+                    } else { $Api = $null }
                 }
-                if (-not $Web -or $Web.HasExited) {
-                    $Web = Start-ChildProcess "web" $Node @(
-                        $Vinext, "start", "--hostname", "127.0.0.1", "--port", "$WebPort"
-                    ) (Join-Path $ProjectRoot "apps\dashboard")
+                if ((-not $Web -or $Web.HasExited) -and $Now -ge $NextWebLaunch) {
+                    $NextWebLaunch = $Now.AddSeconds(45)
+                    if (-not (Test-Endpoint "http://127.0.0.1:$WebPort") -and
+                        -not (Test-PortListening $WebPort)) {
+                        $Web = Start-ChildProcess "web" $Node @(
+                            $Vinext, "start", "--hostname", "127.0.0.1", "--port", "$WebPort"
+                        ) (Join-Path $ProjectRoot "apps\dashboard")
+                    } else { $Web = $null }
                 }
                 Write-SupervisorHeartbeat $Api $Web
                 Start-Sleep -Seconds 10
