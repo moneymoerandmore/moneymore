@@ -204,9 +204,30 @@ def _intraday(xtdata, symbols: list[str]) -> list[dict[str, object]]:
     return rows
 
 
+def _minute_history(xtdata, symbols: list[str], start: str, end: str) -> list[dict[str, object]]:
+    """Read actual QMT one-minute bars for an explicitly dated paper replay."""
+    rows: list[dict[str, object]] = []
+    for offset in range(0, len(symbols), 50):
+        chunk = symbols[offset : offset + 50]
+        xtdata.download_history_data2(chunk, "1m", start, end)
+        frames = xtdata.get_market_data_ex(
+            ["open", "high", "low", "close", "volume", "amount"],
+            chunk, period="1m", start_time=start, end_time=end,
+            count=-1, fill_data=False,
+        )
+        for symbol, frame in frames.items():
+            for timestamp, bar in frame.iterrows():
+                rows.append({
+                    "symbol": symbol, "timestamp": str(timestamp),
+                    **{field: float(bar[field]) for field in
+                       ("open", "high", "low", "close", "volume", "amount")},
+                })
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["probe", "calendar", "daily", "intraday"])
+    parser.add_argument("action", choices=["probe", "calendar", "daily", "intraday", "minute-history"])
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--trade-date")
@@ -229,6 +250,11 @@ def main() -> None:
         if not args.trade_date:
             parser.error("daily requires --trade-date")
         result = _daily(xtdata, args.trade_date)
+    elif args.action == "minute-history":
+        symbols = sorted(set(filter(None, (args.symbols or "").split(","))))
+        if not symbols or not args.start or not args.end:
+            parser.error("minute-history requires --symbols, --start and --end")
+        result = _minute_history(xtdata, symbols, args.start, args.end)
     else:
         symbols = sorted(set(filter(None, (args.symbols or "").split(","))))
         if not symbols:

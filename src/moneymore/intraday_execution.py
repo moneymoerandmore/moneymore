@@ -155,10 +155,18 @@ def _ensure_comparison_account_and_orders(
             key = f"{target_account}:target:{plan_date}:{symbol}:{side}:{quantity}"
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO orders(
+                INSERT INTO orders(
                     idempotency_key, created_at, status, strategy_id, symbol,
                     side, quantity, signal_date, reason_code, account_id
                 ) VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    status = 'PENDING', created_at = excluded.created_at,
+                    reason_code = excluded.reason_code
+                WHERE orders.status = 'CANCELLED' AND EXISTS (
+                    SELECT 1 FROM execution_attempts a
+                    WHERE a.idempotency_key = orders.idempotency_key
+                      AND a.reason_code = 'HISTORICAL_REPLAY_SUPERSEDED'
+                )
                 """,
                 (
                     key,
