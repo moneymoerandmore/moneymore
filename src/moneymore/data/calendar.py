@@ -23,7 +23,13 @@ def sync_trading_calendar(
     end_date = (current + timedelta(days=future_days)).strftime("%Y%m%d")
     calendar = provider.trading_calendar(start_date, end_date)
     validate_calendar(calendar)
-    available = set(calendar["cal_date"].astype(str))
+    # QMT serializes this flag as "0"/"1" while Tushare commonly returns an
+    # integer.  Persist one canonical schema so switching providers cannot
+    # turn the column into an Arrow-incompatible mixed object dtype.
+    calendar = calendar.copy()
+    calendar["cal_date"] = calendar["cal_date"].astype(str)
+    calendar["is_open"] = pd.to_numeric(calendar["is_open"], errors="raise").astype("int64")
+    available = set(calendar["cal_date"])
     if trade_date not in available:
         raise ValueError(
             f"official trading calendar does not cover requested date: {trade_date}"

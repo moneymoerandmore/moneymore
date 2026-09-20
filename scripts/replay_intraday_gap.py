@@ -212,38 +212,47 @@ def replay_day(broker: PaperBroker, bars: pd.DataFrame, trade_date: str,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--commit", action="store_true")
-    parser.add_argument("--account", choices=["baseline", "controlled"],
+    parser.add_argument("--account", choices=["baseline", "controlled", "all"],
                         default="baseline")
+    parser.add_argument("--trade-date")
+    parser.add_argument("--plan-date")
     parser.add_argument("--database", type=Path,
                         default=ROOT / "state/paper_orders.sqlite3")
     args = parser.parse_args()
+    if bool(args.trade_date) != bool(args.plan_date):
+        parser.error("--trade-date and --plan-date must be supplied together")
+    dates = ([(args.trade_date, args.plan_date)] if args.trade_date else
+             [("20260916", "20260915"), ("20260917", "20260916")])
+    account_specs = {
+        "baseline": (INTRADAY_ACCOUNT, MULTI_SECTOR_ACCOUNT,
+                     "baseline_intraday_account_daily", "intraday-execution"),
+        "controlled": (EXPOSURE_INTRADAY_ACCOUNT, BASELINE_EXPOSURE_ACCOUNT,
+                       "baseline_pysystemtrade_intraday_account_daily",
+                       "baseline-pysystemtrade-intraday-execution"),
+    }
+    selected = list(account_specs) if args.account == "all" else [args.account]
     broker = PaperBroker(args.database)
-    if args.account == "controlled":
-        account_id = EXPOSURE_INTRADAY_ACCOUNT
-        source_account = BASELINE_EXPOSURE_ACCOUNT
-        daily_table = "baseline_pysystemtrade_intraday_account_daily"
-        audit_subdir = "baseline-pysystemtrade-intraday-execution"
-    else:
-        account_id = INTRADAY_ACCOUNT
-        source_account = MULTI_SECTOR_ACCOUNT
-        daily_table = "baseline_intraday_account_daily"
-        audit_subdir = "intraday-execution"
-    dates = [("20260916", "20260915"), ("20260917", "20260916")]
-    with sqlite3.connect(args.database) as connection:
-        held = {row[0] for row in connection.execute(
-            "SELECT symbol FROM positions WHERE account_id = ?", (account_id,),
-        )}
-    symbols = sorted(held | set().union(*(source_target(args.database, day, plan, source_account)
-                                          for day, plan in dates)))
-    bars = historical_bars(symbols, dates[0][0], dates[-1][0])
-    if args.commit and any(broker.fills(account_id, day) for day, _ in dates):
-        raise RuntimeError("replay already has fills; refusing a second commit")
-    for day, plan in dates:
-        print(json.dumps(replay_day(
-            broker, bars, day, plan, account_id=account_id,
-            source_account=source_account, daily_table=daily_table,
-            audit_subdir=audit_subdir, commit=args.commit),
-                         ensure_ascii=False, default=str))
+    for account_name in selected:
+        account_id, source_account, daily_table, audit_subdir = account_specs[account_name]
+        with sqlite3.connect(args.database) as connection:
+            held = {row[0] for row in connection.execute(
+                "SELECT symbol FROM positions WHERE account_id = ?", (account_id,),
+            )}
+        symbols = sorted(held | set().union(*(
+            source_target(args.database, day, plan, source_account)
+            for day, plan in dates
+        )))
+        bars = historical_bars(symbols, dates[0][0], dates[-1][0])
+        if args.commit and any(broker.fills(account_id, day) for day, _ in dates):
+            raise RuntimeError(
+                f"{account_id} already has replay-date fills; refusing a second commit"
+            )
+        for day, plan in dates:
+            print(json.dumps(replay_day(
+                broker, bars, day, plan, account_id=account_id,
+                source_account=source_account, daily_table=daily_table,
+                audit_subdir=audit_subdir, commit=args.commit),
+                             ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":

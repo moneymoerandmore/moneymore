@@ -100,6 +100,7 @@ SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 INTRADAY_BASELINE_ACTIVATION_DATE = "20260908"
+EXPOSURE_INTRADAY_ACTIVATION_DATE = "20260916"
 _LIVE_ACCOUNT_CACHE: dict[str, object] = {"expires_at": 0.0, "payload": {}}
 _LIVE_ACCOUNT_LOCK = threading.Lock()
 
@@ -339,19 +340,32 @@ def _runtime_health_bus() -> dict[str, object]:
     add("DISK_CAPACITY", disk_status, f"项目磁盘剩余 {free_gb:.1f} GB", free_gb=free_gb)
 
     try:
+        store = ParquetStore(DATA)
         latest_daily = str(
-            ParquetStore(DATA).read("daily", columns=["trade_date"])["trade_date"]
+            store.read("daily", columns=["trade_date"])["trade_date"]
             .astype(str)
             .max()
         )
-        age_days = (
-            now.date() - datetime.strptime(latest_daily, "%Y%m%d").date()
-        ).days
+        calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
+        calendar["cal_date"] = calendar["cal_date"].astype(str)
+        today = now.strftime("%Y%m%d")
+        expected_cutoff = today
+        config = task_service.config()
+        if (now.hour, now.minute) < (int(config["hour"]), int(config["minute"])):
+            expected_cutoff = (now - timedelta(days=1)).strftime("%Y%m%d")
+        eligible = calendar.loc[
+            (calendar["cal_date"] <= expected_cutoff)
+            & (calendar["is_open"].astype(int) == 1),
+            "cal_date",
+        ]
+        expected_daily = str(eligible.max()) if not eligible.empty else latest_daily
+        current = latest_daily >= expected_daily
         add(
             "OFFICIAL_DAILY_DATA",
-            "PASS" if age_days <= 1 else "WARN",
-            f"正式日线最新数据日 {latest_daily}",
+            "PASS" if current else "WARN",
+            f"正式日线最新数据日 {latest_daily}；应到 {expected_daily}",
             latest_trade_date=latest_daily,
+            expected_trade_date=expected_daily,
         )
     except (FileNotFoundError, ValueError):
         add("OFFICIAL_DAILY_DATA", "WARN", "尚未确认正式日线数据日期")
@@ -557,6 +571,22 @@ class TaskService:
             daemon=True,
         )
         self._thread.start()
+        # A machine can be powered off for one or more complete trading days.
+        # Recover those gaps as soon as the API starts instead of waiting for
+        # the next 18:30 scheduler tick.  _recovery_dates deliberately excludes
+        # today's still-open session before the configured EOD time.
+        try:
+            if self._recovery_dates(ParquetStore(DATA), today):
+                self.trigger_recovery(today, "STARTUP_RECOVERY")
+        except (FileNotFoundError, RuntimeError, ValueError) as error:
+            self._notify(
+                "WARNING",
+                "STARTUP_RECOVERY_DEFERRED",
+                "启动补偿扫描暂缓",
+                f"{type(error).__name__}: {error}",
+                trade_date=today,
+                dedupe_key=f"{today}:startup-recovery-deferred",
+            )
 
     def _recover_interrupted_runs(self) -> None:
         now = datetime.now(SHANGHAI).isoformat()
@@ -1127,6 +1157,33 @@ class TaskService:
             "cal_date",
         ].tolist()
         dates = sorted(set(dates) | set(workflow_gap))
+        # A completed daily pipeline is not sufficient evidence for the two
+        # intraday comparison branches: those normally run only while the
+        # market-session loop is alive.  Missing audit artifacts therefore
+        # remain a recovery gap even when official daily bars and parent
+        # strategy runs are already complete.
+        state_root = self.database.parent
+        recovery_sessions = [
+            str(item) for item in calendar.loc[
+                (calendar["cal_date"] >= INTRADAY_BASELINE_ACTIVATION_DATE)
+                & (calendar["cal_date"] <= latest_data_date)
+                & (calendar["is_open"].astype(int) == 1),
+                "cal_date",
+            ].tolist()
+        ]
+        intraday_gap = [
+            item for item in recovery_sessions
+            if not (state_root / "intraday-execution" / f"{item}.json").exists()
+            or (
+                item >= EXPOSURE_INTRADAY_ACTIVATION_DATE
+                and not (
+                state_root
+                / "baseline-pysystemtrade-intraday-execution"
+                / f"{item}.json"
+                ).exists()
+            )
+        ]
+        dates = sorted(set(dates) | set(intraday_gap))
         # Intraday vendors do not guarantee a complete daily bar.  A manual
         # recovery before the configured end-of-day schedule must leave the
         # current session pending instead of creating an empty-data failure.
@@ -1171,7 +1228,7 @@ class TaskService:
             completed: list[str] = []
             for trade_date in dates:
                 child_run_id = self._create_run("daily_pipeline", trade_date, "RECOVERY")
-                self._execute(child_run_id, trade_date)
+                self._execute(child_run_id, trade_date, historical_recovery=True)
                 child = next(row for row in self.runs(100) if row["id"] == child_run_id)
                 if child["status"] != "COMPLETED":
                     raise RuntimeError(
@@ -1216,7 +1273,9 @@ class TaskService:
                 (now, trade_date, f"%{marker}%"),
             )
 
-    def _execute(self, run_id: int, trade_date: str) -> None:
+    def _execute(
+        self, run_id: int, trade_date: str, historical_recovery: bool = False
+    ) -> None:
         if not self._run_lock.acquire(blocking=False):
             self._finish(run_id, "SKIPPED_BUSY", error="another pipeline is running")
             return
@@ -1458,6 +1517,15 @@ class TaskService:
                         run_id=run_id,
                         dedupe_key=f"{trade_date}:{step_name}:failed",
                     )
+            if historical_recovery:
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "intraday_historical_replay",
+                    lambda: self._recover_intraday_branches(
+                        store, broker, trade_date
+                    ),
+                )
             if strategy_failures:
                 raise RuntimeError(
                     "independent strategy failures: " + " | ".join(strategy_failures)
@@ -1492,6 +1560,72 @@ class TaskService:
             )
         finally:
             self._run_lock.release()
+
+    def _recover_intraday_branches(
+        self, store: ParquetStore, broker: PaperBroker, trade_date: str
+    ) -> dict[str, object]:
+        calendar = store.read("trade_calendar", columns=["cal_date", "is_open"])
+        calendar["cal_date"] = calendar["cal_date"].astype(str)
+        previous = calendar.loc[
+            (calendar["cal_date"] < trade_date)
+            & (calendar["is_open"].astype(int) == 1),
+            "cal_date",
+        ].sort_values()
+        future = calendar.loc[
+            (calendar["cal_date"] > trade_date)
+            & (calendar["is_open"].astype(int) == 1),
+            "cal_date",
+        ].sort_values()
+        if previous.empty:
+            raise RuntimeError(f"no prior open session for intraday replay {trade_date}")
+        plan_date = str(previous.iloc[-1])
+        state_root = self.database.parent
+        replayed: list[str] = []
+        for account_name, audit_subdir in (
+            ("baseline", "intraday-execution"),
+            ("controlled", "baseline-pysystemtrade-intraday-execution"),
+        ):
+            if (
+                account_name == "controlled"
+                and trade_date < EXPOSURE_INTRADAY_ACTIVATION_DATE
+            ):
+                continue
+            audit = state_root / audit_subdir / f"{trade_date}.json"
+            if audit.exists():
+                continue
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "replay_intraday_gap.py"),
+                    "--account",
+                    account_name,
+                    "--trade-date",
+                    trade_date,
+                    "--plan-date",
+                    plan_date,
+                    "--commit",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            replayed.append(account_name)
+        next_trade_date = str(future.iloc[0]) if not future.empty else trade_date
+        prepared = {
+            "baseline": prepare_intraday_branch_orders(broker, next_trade_date),
+            "controlled": prepare_exposure_intraday_branch_orders(
+                broker, next_trade_date
+            ),
+        }
+        return {
+            "trade_date": trade_date,
+            "plan_date": plan_date,
+            "replayed": replayed,
+            "next_trade_date": next_trade_date,
+            "prepared_orders": prepared,
+        }
 
     def _set_running(self, run_id: int) -> None:
         with sqlite3.connect(self.database) as connection:

@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Run", "Start", "Stop", "Status")]
+    [ValidateSet("Run", "Start", "Stop", "Status", "Ensure")]
     [string]$Action = "Status",
     [int]$ApiPort = 8788,
     [int]$WebPort = 3000
@@ -98,12 +98,40 @@ function Assert-Runtime {
     }
 }
 
+function Test-SupervisorHealthy {
+    $Supervisor = Get-RecordedProcess $SupervisorPidFile
+    if (-not $Supervisor -or -not (Test-Path -LiteralPath $HeartbeatFile)) { return $false }
+    try {
+        $Heartbeat = Get-Content -LiteralPath $HeartbeatFile -Raw | ConvertFrom-Json
+        $Age = ([DateTimeOffset]::Now - [DateTimeOffset]::Parse($Heartbeat.observed_at)).TotalSeconds
+        return [int]$Heartbeat.supervisor_pid -eq $Supervisor.Id -and $Age -le 45
+    } catch { return $false }
+}
+
 function Repair-VinextWindowsStaticPaths {
     & $Node (Join-Path $ProjectRoot "apps\dashboard\scripts\patch-vinext-windows.mjs")
     if ($LASTEXITCODE -ne 0) { throw "Could not prepare the dashboard production server." }
 }
 
 switch ($Action) {
+    "Ensure" {
+        if (Test-SupervisorHealthy) {
+            Write-Output "MoneyMore supervisor heartbeat is healthy."
+            break
+        }
+        $Stale = Get-RecordedProcess $SupervisorPidFile
+        if ($Stale) {
+            Stop-Process -Id $Stale.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $SupervisorPidFile -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            observed_at = [DateTimeOffset]::Now.ToString("o")
+            event = "SUPERVISOR_RECOVERY_REQUESTED"
+            component = "watchdog"
+            stale_pid = if ($Stale) { $Stale.Id } else { $null }
+        } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
+        & $PSCommandPath -Action Start -ApiPort $ApiPort -WebPort $WebPort
+    }
     "Start" {
         Assert-Runtime
         Repair-VinextWindowsStaticPaths
@@ -177,7 +205,16 @@ switch ($Action) {
                         ) (Join-Path $ProjectRoot "apps\dashboard")
                     } else { $Web = $null }
                 }
-                Write-SupervisorHeartbeat $Api $Web
+                try {
+                    Write-SupervisorHeartbeat $Api $Web
+                } catch {
+                    [pscustomobject]@{
+                        observed_at = [DateTimeOffset]::Now.ToString("o")
+                        event = "HEARTBEAT_WRITE_FAILED"
+                        component = "supervisor"
+                        error = $_.Exception.Message
+                    } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
+                }
                 Start-Sleep -Seconds 10
             }
         } catch {

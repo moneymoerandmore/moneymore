@@ -233,7 +233,7 @@ export default function Dashboard() {
   const openSecurity=useCallback(async(symbol:string,accountId?:string)=>{
     setSecurityDetailLoading(true); setSecurityDetailError("");
     setSecurityDetailAccount(accountId??"");
-    try { setSecurityDetail(await json<SecurityHistory>(`/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
+    try { setSecurityDetail(await json<SecurityHistory>(`http://127.0.0.1:8788/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
     catch(reason) { setSecurityDetailError(reason instanceof Error?reason.message:"证券历史加载失败"); }
     finally { setSecurityDetailLoading(false); }
   },[]);
@@ -241,7 +241,7 @@ export default function Dashboard() {
     const symbol=securityDetail?.symbol;
     if(!symbol)return;
     const id=window.setInterval(async()=>{
-      try { setSecurityDetail(await json<SecurityHistory>(`/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
+      try { setSecurityDetail(await json<SecurityHistory>(`http://127.0.0.1:8788/api/security-history?symbol=${encodeURIComponent(symbol)}`)); }
       catch { /* keep the last valid candle while QMT reconnects */ }
     },10_000);
     return ()=>clearInterval(id);
@@ -273,14 +273,21 @@ export default function Dashboard() {
 }
 
 function MarketRiskPage({ risk, live, names }: { risk:MarketRisk; live?:LiveAccounts; names:Record<string,string> }) {
+  const [highlighted,setHighlighted]=useState<Set<string>>(()=>new Set());
+  const toggleHighlighted=(accountId:string)=>setHighlighted((current)=>{
+    if(!current.size)return new Set([accountId]);
+    const next=new Set(current);
+    if(next.has(accountId))next.delete(accountId);else next.add(accountId);
+    return next;
+  });
   const selectedRow=risk.exposure_league.contestants[0];
   const leagueSeries=selectedRow?[{accountId:text(selectedRow.method_id),label:"pysystemtrade 总仓位",color:"#7657d5",rows:(risk.exposure_league.history??[]).filter((row)=>text(row.method_id)===text(selectedRow.method_id)&&Number.isFinite(Number(row.target_exposure)))}]:[];
   const comparison=(risk.exposure_league.strategy_comparison??[]) as Row[];
   const strategySeries=[
-    {accountId:"baseline",label:"原基线",color:"#102c24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline")},
-    {accountId:"baseline_intraday",label:"基线 + 日内实时",color:"#168a83",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_intraday")},
-    {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#d08a24",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
-    {accountId:"baseline_pysystemtrade_intraday",label:"基线 + 仓位控制 + 日内实时",color:"#c14974",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade_intraday")},
+    {accountId:"baseline",label:"原基线",color:"#2489e8",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline")},
+    {accountId:"baseline_intraday",label:"基线 + 日内实时",color:"#f5a623",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_intraday")},
+    {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#e84a5f",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
+    {accountId:"baseline_pysystemtrade_intraday",label:"基线 + 仓位控制 + 日内实时",color:"#19a36a",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade_intraday")},
   ];
   const paper=(risk.paper_accounts??{}) as Row;
   const baseline=(paper.baseline??{}) as Row;
@@ -300,7 +307,7 @@ function MarketRiskPage({ risk, live, names }: { risk:MarketRisk; live?:LiveAcco
   return <>
     <Intro tag="BASELINE × EXPOSURE" title="基线策略叠加市场总仓位">只保留 pysystemtrade 作为正交仓位层。原基线回答“买什么”，叠加策略再决定“总共买多少”；T日收盘信号从下一交易日生效。</Intro>
     <section className="exposure-methods">{selectedRow&&<button className="active"><small>pysystemtrade 当前建议总仓位</small><b>{pct(selectedRow.target_exposure)}</b><span>{text(selectedRow.explanation)}</span></button>}</section>
-    <LineComparisonChart title="四种基线执行组合对比" subtitle={`${text(risk.exposure_league.comparison_mode)}；日内分支仅改变成交时机`} series={strategySeries} valueKey="normalized_nav" formatValue={(value)=>value.toFixed(4)} selectedAccountIds={new Set()} onToggle={()=>{}}/>
+    <LineComparisonChart title="四种基线执行组合对比" subtitle={`${text(risk.exposure_league.comparison_mode)}；点击图例可单选或多选高亮`} series={strategySeries} valueKey="normalized_nav" formatValue={(value)=>value.toFixed(4)} selectedAccountIds={highlighted} onToggle={toggleHighlighted}/>
     <div className="four-col account-columns">
       <AccountColumn title="原基线" badge="FACTOR BASELINE" accountId={baselineId} status="正常模拟" equity={Number(baselinePortfolio?.equity??1_000_000)} portfolio={baselinePortfolio} orders={baselineLive?.orders??(baseline.orders as Row[]??[])} fills={baselineLive?.fills??(baseline.fills as Row[]??[])} names={names}/>
       <AccountColumn title="基线 + 日内实时" badge="ADAPTIVE VWAP" accountId={baselineIntradayId} status="日内择价模拟" equity={Number(baselineIntradayLive?.portfolio.equity??1_000_000)} portfolio={baselineIntradayLive?.portfolio} orders={baselineIntradayLive?.orders??(baselineIntraday.orders as Row[]??[])} fills={baselineIntradayLive?.fills??(baselineIntraday.fills as Row[]??[])} names={names}/>
@@ -385,7 +392,7 @@ function ChallengerPage({ challenger, names, live }: { challenger: Challenger; n
       <AccountColumn title="挑战者" badge="ACTIVE GRU" accountId={challenger.account_id} status={text(challenger.latest.status)} equity={challengerEquity} portfolio={challengerPortfolio} targetExposure={Number(challenger.latest.target_gross_exposure)} exposurePolicy={challenger.latest.exposure_policy as Row|undefined} orders={challengerLive?.orders??challenger.orders} fills={challengerLive?.fills??challenger.fills} names={names}/>
       <AccountColumn title="候选者" badge={text(selectedCandidate?.candidate_tag??observation?.candidate_tag)} accountId={text(selectedCandidate?.account_id??observation?.account_id)} status={reviewStatusName(selectedCandidate?.review_stage??observation?.status)} equity={candidateEquity} portfolio={candidatePortfolio} targetExposure={Number(selectedCandidate?.latest?.target_gross_exposure??observation?.latest?.target_gross_exposure)} exposurePolicy={(selectedCandidate?.latest?.exposure_policy??observation?.latest?.exposure_policy) as Row|undefined} orders={candidateLive?.orders??selectedCandidate?.orders??observation?.orders??[]} fills={candidateLive?.fills??selectedCandidate?.fills??observation?.fills??[]} names={names} accent={!Boolean(selectedCandidate?.research_gate_passed??observation?.research_gate_passed)}/>
     </div>
-    <PerformanceComparisonCharts comparison={globalView}/>
+    <PerformanceComparisonCharts comparison={globalView} observation={observation}/>
     <CandidateObservation challenger={challenger} selectedTag={text(selectedCandidate?.candidate_tag)}/>
     <TradeCycleComparison challenger={challenger} names={names} candidateAccountId={selectedCandidate?.account_id}/>
     <Panel title="统一样本外模型竞赛" subtitle="相同股票池、标签、训练切分和Top-K规则"><Table rows={metrics} columns={[["model_id","模型"],["segment","区间"],["samples","样本"],["rank_ic","Rank IC"],["rank_ic_ir","Rank ICIR"],["top_k_excess_return","Top-K超额"]]} format={{rank_ic:num,rank_ic_ir:num,top_k_excess_return:pct}}/></Panel>
@@ -440,15 +447,26 @@ function ChallengerEvidence({ challenger }: { challenger: Challenger }) {
 }
 
 const chartPalette: Record<string, { label: string; color: string }> = {
-  "multi_sector_shadow": { label: "因子基线", color: "#102c24" },
-  "multi_sector_intraday_shadow": { label: "因子基线·日内执行", color: "#168a83" },
-  "qlib_gru_shadow": { label: "Qlib GRU 挑战者", color: "#ef7655" },
+  "multi_sector_shadow": { label: "因子基线", color: "#2489e8" },
+  "multi_sector_intraday_shadow": { label: "因子基线·日内执行", color: "#f5a623" },
+  "qlib_gru_shadow": { label: "Qlib GRU 挑战者", color: "#e84a5f" },
 };
-const candidateChartColors=["#3568c0","#8b5fbf","#168a83","#c14974","#a56a00","#537188","#8b6f47"];
+const candidateChartColors=["#8b6fd1","#19a36a","#ef7b45","#d950a0","#00a6a6","#6c7a89","#b98932"];
 
-function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["comparison"] }) {
+function PerformanceComparisonCharts({ comparison, observation }: { comparison: Challenger["comparison"]; observation?:Challenger["candidate_observation"] }) {
   const histories = comparison.independent_histories??comparison.histories??{};
-  const series = Object.entries(histories).map(([accountId, rows],index) => ({
+  const permanentAccounts=new Set(Object.keys(chartPalette));
+  const excludedCandidateStates=new Set(["EARLY_REJECTED","REJECTED","ELIMINATED","RETIRED","OUTDATED"]);
+  const eligibleCandidateAccounts=(observation?.candidates??[]).filter((candidate)=>
+    Boolean(candidate.research_gate_passed)
+    && !excludedCandidateStates.has(text(candidate.review_stage).toUpperCase())
+    && !excludedCandidateStates.has(text(candidate.latest_status).toUpperCase())
+  ).map((candidate)=>candidate.account_id);
+  const visibleAccounts=new Set([
+    ...permanentAccounts,
+    ...eligibleCandidateAccounts,
+  ]);
+  const series = Object.entries(histories).filter(([accountId])=>visibleAccounts.has(accountId)).map(([accountId, rows],index) => ({
     accountId,
     label: chartPalette[accountId]?.label??(accountId.startsWith("qlib_candidate_")?`Qlib 候选者 ${accountId.replace("qlib_candidate_","")}`:accountId),
     color: chartPalette[accountId]?.color??candidateChartColors[index%candidateChartColors.length],
@@ -462,11 +480,12 @@ function PerformanceComparisonCharts({ comparison }: { comparison: Challenger["c
     return next;
   });
   const showAll=!selectedAccountIds.size;
-  return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略（可多选）</span><button className={showAll?"active":""} onClick={()=>setSelectedAccountIds(new Set())}>全部</button>{series.map((item)=><button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={!showAll&&selectedAccountIds.has(item.accountId)?"active":""} onClick={()=>toggleAccount(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="各策略从自身首个运行日归一为 100；未运行区间留空" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/><LineComparisonChart title="每日收益率波动" subtitle="按各账户实际运行日净权益逐日计算；未运行区间留空，虚线为 0%" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/></div></>;
+  return <><div className="strategy-focus" role="group" aria-label="选择需要高亮的策略"><span>高亮策略（可多选）</span><button className={showAll?"active":""} onClick={()=>setSelectedAccountIds(new Set())}>全部</button>{series.map((item)=><button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={!showAll&&selectedAccountIds.has(item.accountId)?"active":""} onClick={()=>toggleAccount(item.accountId)}><i style={{background:item.color}}/>{item.label}</button>)}</div><div className="two-col"><LineComparisonChart title="累计权益走势" subtitle="展示固定对照与全部门禁通过、仍在考核的候选；各策略从自身首个运行日归一为 100" series={series} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(1)}`} selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/><LineComparisonChart title="每日收益率波动" subtitle="已淘汰、已过时及门禁未通过策略不进入图表；未运行区间留空" series={series} valueKey="daily_return" formatValue={(value)=>pct(value)} zeroLine selectedAccountIds={selectedAccountIds} onToggle={toggleAccount}/></div></>;
 }
 
 function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, zeroLine=false, yMin, yMax, selectedAccountIds, onToggle }: { title: string; subtitle: string; series: { accountId: string; label: string; color: string; rows: Row[] }[]; valueKey: string; formatValue: (value: number)=>string; zeroLine?: boolean; yMin?:number; yMax?:number; selectedAccountIds:Set<string>; onToggle:(accountId:string)=>void }) {
-  const width = 720, height = 238, left = 48, right = 18, top = 16, bottom = 33;
+  const [hoverIndex,setHoverIndex]=useState<number|null>(null);
+  const width = 720, height = 300, left = 12, right = 62, top = 18, bottom = 34;
   const dates = [...new Set(series.flatMap((item)=>item.rows.map((row)=>text(row.trade_date))))].sort();
   const dateIndex = new Map(dates.map((date,index)=>[date,index]));
   const points = series.flatMap((item)=>item.rows.map((row)=>({ date:text(row.trade_date), value:Number(row[valueKey]) })).filter((point)=>Number.isFinite(point.value)));
@@ -480,10 +499,13 @@ function LineComparisonChart({ title, subtitle, series, valueKey, formatValue, z
   const y = (value: number) => top + (max - value) / span * (height - top - bottom);
   const path = (rows: Row[]) => rows.map((row, index)=>`${index ? "L" : "M"}${x(text(row.trade_date)).toFixed(1)},${y(Number(row[valueKey])).toFixed(1)}`).join(" ");
   const last = series.map((item)=>({ ...item, value: Number(item.rows.at(-1)?.[valueKey]??0) }));
-  const ticks = [0, 0.5, 1];
+  const ticks = [0,.25,.5,.75,1];
   const showAll=!selectedAccountIds.size;
   const ordered=[...series].sort((a,b)=>Number(selectedAccountIds.has(a.accountId))-Number(selectedAccountIds.has(b.accountId)));
-  return <Panel title={title} subtitle={subtitle}><div className="chart-legend">{last.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);return <button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={focused?"active":"muted"} onClick={()=>onToggle(item.accountId)}><i style={{background:item.color}}/>{item.label} <b>{formatValue(item.value)}</b></button>})}</div><svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{formatValue(max-tick*(max-min))}</text></g>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{ordered.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);const selected=selectedAccountIds.has(item.accountId);return <g key={item.accountId} opacity={focused?1:.12}><path d={path(item.rows)} fill="none" stroke={item.color} strokeWidth={selected?"4":"2.5"} strokeLinecap="round" strokeLinejoin="round"/>{selected&&item.rows.map((row)=><circle key={text(row.trade_date)} cx={x(text(row.trade_date))} cy={y(Number(row[valueKey]))} r="3.2" fill={item.color} stroke="#fff" strokeWidth="1.5"><title>{`${item.label} · ${text(row.trade_date)} · ${formatValue(Number(row[valueKey]))}`}</title></circle>)}</g>})}<text x={left} y={height-8}>{text(dates[0])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></Panel>;
+  const hoverDate=hoverIndex==null?null:dates[hoverIndex];
+  const hoverRows=hoverDate?ordered.map((item)=>({item,row:item.rows.find((row)=>text(row.trade_date)===hoverDate)})).filter((entry)=>entry.row):[];
+  const pointer=(event:React.MouseEvent<SVGRectElement>)=>{const rect=event.currentTarget.getBoundingClientRect();const px=(event.clientX-rect.left)/rect.width*width;const index=Math.round((px-left)/(width-left-right)*Math.max(count-1,0));setHoverIndex(Math.max(0,Math.min(count-1,index)))};
+  return <Panel title={title} subtitle={subtitle}><div className="xq-chart"><div className="chart-legend">{last.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);return <button key={item.accountId} aria-pressed={!showAll&&selectedAccountIds.has(item.accountId)} className={focused?"active":"muted"} onClick={()=>onToggle(item.accountId)}><i style={{background:item.color}}/>{item.label}<b>{formatValue(item.value)}</b></button>})}</div><div className="xq-chart-stage">{hoverDate&&<div className="xq-float" style={{left:`${Math.min(78,Math.max(4,x(hoverDate)/width*100))}%`}}><b>{hoverDate}</b>{hoverRows.map(({item,row})=><span key={item.accountId}><i style={{background:item.color}}/>{item.label}<strong>{formatValue(Number(row?.[valueKey]))}</strong></span>)}</div>}<svg className="comparison-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>{ticks.map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={width-right+8} y={top+tick*(height-top-bottom)+3}>{formatValue(max-tick*(max-min))}</text></g>)}{dates.filter((_,index)=>index===0||index===dates.length-1||index===Math.floor((dates.length-1)/2)).map((date)=><line key={date} x1={x(date)} x2={x(date)} y1={top} y2={height-bottom} className="chart-grid vertical"/>)}{zeroLine && min <= 0 && max >= 0 && <line x1={left} x2={width-right} y1={y(0)} y2={y(0)} className="chart-zero"/>}{ordered.map((item)=>{const focused=showAll||selectedAccountIds.has(item.accountId);const selected=selectedAccountIds.has(item.accountId);return <g key={item.accountId} opacity={focused?1:.1}><path d={path(item.rows)} fill="none" stroke={item.color} strokeWidth={selected?"3":"2"} strokeLinecap="round" strokeLinejoin="round"/></g>})}{hoverDate&&<g className="chart-crosshair"><line x1={x(hoverDate)} x2={x(hoverDate)} y1={top} y2={height-bottom}/>{hoverRows.map(({item,row})=><circle key={item.accountId} cx={x(hoverDate)} cy={y(Number(row?.[valueKey]))} r="3.5" fill="#fff" stroke={item.color} strokeWidth="2"/>)}</g>}<rect x={left} y={top} width={width-left-right} height={height-top-bottom} fill="transparent" onMouseMove={pointer} onMouseLeave={()=>setHoverIndex(null)}/><text x={left} y={height-8}>{text(dates[0])}</text><text x={(left+width-right)/2} y={height-8} textAnchor="middle">{text(dates[Math.floor((dates.length-1)/2)])}</text><text x={width-right} y={height-8} textAnchor="end">{text(dates.at(-1))}</text></svg></div></div></Panel>;
 }
 
 function PointInTimeEvidence({ challenger }: { challenger: Challenger }) {
@@ -562,7 +584,10 @@ function SecurityHistoryModal({detail,initialAccountId,loading,error,onClose}:{d
   const [range,setRange]=useState("3M");
   const [accountId,setAccountId]=useState(initialAccountId);
   const [hovered,setHovered]=useState<(Row&{left:number;top:number})|null>(null);
-  useEffect(()=>{setRange("3M");setAccountId(initialAccountId);setHovered(null)},[detail?.symbol,initialAccountId]);
+  const [hoveredBar,setHoveredBar]=useState<number|null>(null);
+  // A newly selected security is a new chart session, so reset transient UI.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(()=>{setRange("3M");setAccountId(initialAccountId);setHovered(null);setHoveredBar(null)},[detail?.symbol,initialAccountId]);
   if(loading)return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal loading-detail" onClick={(event)=>event.stopPropagation()}><b>正在载入K线与交易记录…</b></section></div>;
   if(error)return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal loading-detail" onClick={(event)=>event.stopPropagation()}><button className="modal-close" onClick={onClose}>×</button><b>{error}</b></section></div>;
   if(!detail)return null;
@@ -573,15 +598,22 @@ function SecurityHistoryModal({detail,initialAccountId,loading,error,onClose}:{d
   const bars=detail.bars.slice(-barCount);
   const visibleDates=new Set(bars.map((row)=>text(row.trade_date)));
   const fills=strategyFills.filter((row)=>visibleDates.has(text(row.trade_date)));
-  const width=1080,height=430,left=58,right=22,top=18,bottom=35;
+  const width=1080,height=520,left=12,right=66,top=22,priceBottom=365,volumeTop=395,volumeBottom=486;
   const values=[...bars.flatMap((row)=>[Number(row.high),Number(row.low)]),...fills.map((row)=>Number(row.price))].filter(Number.isFinite);
-  const min=Math.min(...values),max=Math.max(...values),span=Math.max(max-min,0.01);
+  const rawMin=Math.min(...values),rawMax=Math.max(...values),pricePad=Math.max((rawMax-rawMin)*.05,.01),min=rawMin-pricePad,max=rawMax+pricePad,span=Math.max(max-min,0.01);
   const step=(width-left-right)/Math.max(bars.length,1),body=Math.max(1,Math.min(6,step*.62));
   const x=(index:number)=>left+(index+.5)*step;
-  const y=(value:number)=>top+(max-value)/span*(height-top-bottom);
+  const y=(value:number)=>top+(max-value)/span*(priceBottom-top);
+  const maxVolume=Math.max(...bars.map((row)=>Number(row.vol??row.volume??0)),1);
+  const volumeY=(value:number)=>volumeBottom-value/maxVolume*(volumeBottom-volumeTop);
+  const movingAverage=(period:number)=>bars.map((_,index)=>index+1<period?null:bars.slice(index-period+1,index+1).reduce((sum,row)=>sum+Number(row.close),0)/period);
+  const averages=[{period:5,color:"#f5a623",values:movingAverage(5)},{period:10,color:"#2489e8",values:movingAverage(10)},{period:20,color:"#d950a0",values:movingAverage(20)},{period:60,color:"#19a36a",values:movingAverage(60)}];
+  const averagePath=(items:(number|null)[])=>items.map((value,index)=>value==null?null:`${items.slice(0,index).some((item)=>item!=null)?"L":"M"}${x(index).toFixed(1)},${y(value).toFixed(1)}`).filter(Boolean).join(" ");
   const dateIndex=new Map(bars.map((row,index)=>[text(row.trade_date),index]));
   const accountName=(value:unknown)=>chartPalette[text(value)]?.label??(text(value).startsWith("qlib_candidate_")?`Qlib候选 ${text(value).replace("qlib_candidate_","")}`:text(value));
-  return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal" onClick={(event)=>event.stopPropagation()}><header><div><small>SECURITY TRADE HISTORY</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap">{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}{hovered.inherited?" · 继承自因子基线":""}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(height-top-bottom)} y2={top+tick*(height-top-bottom)} className="chart-grid"/><text x={left-8} y={top+tick*(height-top-bottom)+3} textAnchor="end">{(max-tick*span).toFixed(2)}</text></g>)}{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open);const color=up?"#d55445":"#218c74";const topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close)));return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?color:"#fff"} stroke={color}><title>{`${text(row.trade_date)} 开${num(row.open)} 高${num(row.high)} 低${num(row.low)} 收${num(row.close)}`}</title></rect></g>})}{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY";const lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length;const badgeY=buy?Math.min(height-bottom-14,priceY+30+lane*23):Math.max(top+14,priceY-30-lane*23);const connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="5"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text><title>{`${buy?"BUY":"SELL"} · ${tradeDate} · ${Number(fill.price).toFixed(3)} · ${text(fill.quantity)}股${fill.inherited?" · 继承自因子基线":""}`}</title></g>})}<text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>BUY 买入</span><span><i className="sell"/>SELL 卖出</span>{selectedAccountId==="multi_sector_intraday_shadow"&&<span>含分支日前继承成交</span>}</div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle={selectedAccountId==="multi_sector_intraday_shadow"?"包含分支建立前从普通基线继承的成交，继承记录单独标明来源":"图表和明细始终使用同一个策略账户，不混合其他策略"}><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"],["inherited","来源"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money,inherited:(v)=>v?"继承自基线":"本策略"}}/></Panel></section></div>;
+  const activeBar=hoveredBar==null?bars.at(-1):bars[hoveredBar];
+  const chartPointer=(event:React.MouseEvent<SVGRectElement>)=>{const rect=event.currentTarget.getBoundingClientRect();const px=(event.clientX-rect.left)/rect.width*width;setHoveredBar(Math.max(0,Math.min(bars.length-1,Math.floor((px-left)/step))))};
+  return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal xq-security" onClick={(event)=>event.stopPropagation()}><header><div><small>行情 · 模拟成交复盘</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap"><div className="xq-quote-strip"><b>{text(activeBar?.trade_date)}</b><span>开 <i>{num(activeBar?.open)}</i></span><span>高 <i className="up">{num(activeBar?.high)}</i></span><span>低 <i className="down">{num(activeBar?.low)}</i></span><span>收 <i>{num(activeBar?.close)}</i></span>{averages.map((average)=><span key={average.period} style={{color:average.color}}>MA{average.period} {num(average.values[hoveredBar??bars.length-1])}</span>)}</div>{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}{hovered.inherited?" · 继承自因子基线":""}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(priceBottom-top)} y2={top+tick*(priceBottom-top)} className="chart-grid"/><text x={width-right+8} y={top+tick*(priceBottom-top)+3}>{(max-tick*span).toFixed(2)}</text></g>)}<line x1={left} x2={width-right} y1={volumeTop-12} y2={volumeTop-12} className="chart-divider"/><text x={left} y={volumeTop-16}>成交量</text>{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open),color=up?"#f0484d":"#19a36a",topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close))),volume=Number(row.vol??row.volume??0);return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?"#fff":color} stroke={color}/><rect x={x(index)-body/2} y={volumeY(volume)} width={body} height={volumeBottom-volumeY(volume)} fill={up?"#f0484d":"#19a36a"} opacity=".86"/></g>})}{averages.map((average)=><path key={average.period} d={averagePath(average.values)} fill="none" stroke={average.color} strokeWidth="1.35"/>)}{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY",lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length,badgeY=buy?Math.min(priceBottom-14,priceY+28+lane*22):Math.max(top+14,priceY-28-lane*22),connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="3"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text></g>})}{hoveredBar!=null&&<g className="chart-crosshair"><line x1={x(hoveredBar)} x2={x(hoveredBar)} y1={top} y2={volumeBottom}/><line x1={left} x2={width-right} y1={y(Number(activeBar?.close))} y2={y(Number(activeBar?.close))}/></g>}<rect x={left} y={top} width={width-left-right} height={volumeBottom-top} fill="transparent" onMouseMove={chartPointer} onMouseLeave={()=>setHoveredBar(null)}/><text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={(left+width-right)/2} y={height-8} textAnchor="middle">{text(bars[Math.floor(bars.length/2)]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>B 买入</span><span><i className="sell"/>S 卖出</span>{selectedAccountId==="multi_sector_intraday_shadow"&&<span>含分支日前继承成交</span>}</div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle={selectedAccountId==="multi_sector_intraday_shadow"?"包含分支建立前从普通基线继承的成交，继承记录单独标明来源":"图表和明细始终使用同一个策略账户，不混合其他策略"}><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"],["inherited","来源"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money,inherited:(v)=>v?"继承自基线":"本策略"}}/></Panel></section></div>;
 }
 
 function SystemHealthBar({health}:{health:SystemHealth}){

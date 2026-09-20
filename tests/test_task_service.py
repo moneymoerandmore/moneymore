@@ -131,6 +131,62 @@ def test_recovery_dates_fill_every_missing_open_session(tmp_path: Path):
     assert service._recovery_dates(store, "20260730") == ["20260729", "20260730"]
 
 
+def test_recovery_dates_include_completed_day_with_missing_intraday_audit(tmp_path: Path):
+    service = TaskService(tmp_path / "service.sqlite3")
+    store = ParquetStore(tmp_path / "data")
+    store.merge_curated(
+        "daily",
+        [pd.DataFrame({"ts_code": ["A"], "trade_date": ["20260918"]})],
+        ["ts_code", "trade_date"],
+    )
+    store.merge_curated(
+        "trade_calendar",
+        [pd.DataFrame({"cal_date": ["20260917", "20260918"], "is_open": [1, 1]})],
+        ["cal_date"],
+    )
+    for day in ("20260917", "20260918"):
+        completed = service._create_run("daily_pipeline", day, "RECOVERY")
+        service._finish(completed, "COMPLETED")
+    for directory in (
+        "intraday-execution",
+        "baseline-pysystemtrade-intraday-execution",
+    ):
+        target = tmp_path / directory
+        target.mkdir()
+        (target / "20260917.json").write_text("{}", encoding="utf-8")
+
+    assert service._recovery_dates(store, "20260918") == ["20260918"]
+
+    for directory in (
+        "intraday-execution",
+        "baseline-pysystemtrade-intraday-execution",
+    ):
+        (tmp_path / directory / "20260918.json").write_text("{}", encoding="utf-8")
+    assert service._recovery_dates(store, "20260918") == []
+
+
+def test_controlled_intraday_audit_is_not_required_before_activation(tmp_path: Path):
+    service = TaskService(tmp_path / "service.sqlite3")
+    store = ParquetStore(tmp_path / "data")
+    store.merge_curated(
+        "daily",
+        [pd.DataFrame({"ts_code": ["A"], "trade_date": ["20260908"]})],
+        ["ts_code", "trade_date"],
+    )
+    store.merge_curated(
+        "trade_calendar",
+        [pd.DataFrame({"cal_date": ["20260908"], "is_open": [1]})],
+        ["cal_date"],
+    )
+    completed = service._create_run("daily_pipeline", "20260908", "RECOVERY")
+    service._finish(completed, "COMPLETED")
+    audit = tmp_path / "intraday-execution"
+    audit.mkdir()
+    (audit / "20260908.json").write_text("{}", encoding="utf-8")
+
+    assert service._recovery_dates(store, "20260908") == []
+
+
 def test_scheduler_accepts_completed_recovery_and_throttles_waiting(tmp_path: Path):
     service = TaskService(tmp_path / "service.sqlite3")
     timezone = ZoneInfo("Asia/Shanghai")

@@ -4,6 +4,8 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import pandas as pd
+
 from .provider import MarketDataProvider
 from .quality import (
     validate_adjustment_factors,
@@ -39,6 +41,9 @@ def sync_reference_data(
 
     calendar = provider.trading_calendar(start_date, end_date)
     validate_calendar(calendar)
+    calendar = calendar.copy()
+    calendar["cal_date"] = calendar["cal_date"].astype(str)
+    calendar["is_open"] = pd.to_numeric(calendar["is_open"], errors="raise").astype("int64")
     calendar_key = f"{start_date}_{end_date}"
     try:
         calendar_snapshot = store.save_snapshot(
