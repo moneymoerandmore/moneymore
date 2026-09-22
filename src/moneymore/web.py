@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import re
 import shutil
 import sqlite3
@@ -1724,7 +1725,11 @@ def system_health() -> dict[str, object]:
 @app.get("/api/market-risk")
 def market_risk() -> dict[str, object]:
     daily_path = DATA / "processed" / "daily.parquet"
-    payload = build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
+    # build_market_risk_snapshot is cached.  This endpoint enriches the snapshot
+    # with live branch histories, so never mutate the cached object itself.
+    payload = copy.deepcopy(
+        build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
+    )
     broker = PaperBroker(PAPER_DATABASE)
     broker.initialize_account(1_000_000, BASELINE_EXPOSURE_ACCOUNT)
     try:
@@ -1773,7 +1778,17 @@ def market_risk() -> dict[str, object]:
                 for row in controlled_intraday.to_dict("records")
             ]
         )
-    payload["exposure_league"]["strategy_comparison"] = comparison
+    # Intraday history may contain several account observations for one session.
+    # Charts are daily, therefore the final observation for each strategy/date is
+    # the only meaningful point.  This also bounds the API response size.
+    daily_comparison = {
+        (str(row.get("strategy_id")), str(row.get("trade_date"))): row
+        for row in comparison
+    }
+    payload["exposure_league"]["strategy_comparison"] = sorted(
+        daily_comparison.values(),
+        key=lambda row: (str(row.get("trade_date")), str(row.get("strategy_id"))),
+    )
     payload["paper_accounts"] = {
         "baseline": {
             "account_id": MULTI_SECTOR_ACCOUNT,

@@ -283,11 +283,12 @@ function MarketRiskPage({ risk, live, names }: { risk:MarketRisk; live?:LiveAcco
   const selectedRow=risk.exposure_league.contestants[0];
   const leagueSeries=selectedRow?[{accountId:text(selectedRow.method_id),label:"pysystemtrade 总仓位",color:"#7657d5",rows:(risk.exposure_league.history??[]).filter((row)=>text(row.method_id)===text(selectedRow.method_id)&&Number.isFinite(Number(row.target_exposure)))}]:[];
   const comparison=(risk.exposure_league.strategy_comparison??[]) as Row[];
+  const dailyComparison=[...new Map(comparison.map((row)=>[`${text(row.strategy_id)}:${text(row.trade_date)}`,row])).values()];
   const strategySeries=[
-    {accountId:"baseline",label:"原基线",color:"#2489e8",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline")},
-    {accountId:"baseline_intraday",label:"基线 + 日内实时",color:"#f5a623",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_intraday")},
-    {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#e84a5f",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
-    {accountId:"baseline_pysystemtrade_intraday",label:"基线 + 仓位控制 + 日内实时",color:"#19a36a",rows:comparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade_intraday")},
+    {accountId:"baseline",label:"原基线",color:"#2489e8",rows:dailyComparison.filter((row)=>text(row.strategy_id)==="baseline")},
+    {accountId:"baseline_intraday",label:"基线 + 日内实时",color:"#f5a623",rows:dailyComparison.filter((row)=>text(row.strategy_id)==="baseline_intraday")},
+    {accountId:"baseline_pysystemtrade",label:"基线 + pysystemtrade",color:"#e84a5f",rows:dailyComparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade")},
+    {accountId:"baseline_pysystemtrade_intraday",label:"基线 + 仓位控制 + 日内实时",color:"#19a36a",rows:dailyComparison.filter((row)=>text(row.strategy_id)==="baseline_pysystemtrade_intraday")},
   ];
   const paper=(risk.paper_accounts??{}) as Row;
   const baseline=(paper.baseline??{}) as Row;
