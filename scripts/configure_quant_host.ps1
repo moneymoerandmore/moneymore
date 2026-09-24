@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Install", "Audit", "Rollback")]
+    [ValidateSet("Install", "RepairQmt", "Audit", "Rollback")]
     [string]$Action = "Audit"
 )
 
@@ -8,18 +8,32 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $ProjectRoot "state\runtime"
 $BackupFile = Join-Path $RuntimeDir "windows-availability-before.json"
 $ServiceScript = Join-Path $PSScriptRoot "local_service.ps1"
+$QmtGuardScript = Join-Path $PSScriptRoot "miniqmt_guard.ps1"
 $UpdatePolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
 $MoneyMoreTask = "MoneyMore Service"
 $QmtTask = "MoneyMore MiniQMT"
 $QmtProcess = Get-Process -Name "XtMiniQmt" -ErrorAction SilentlyContinue | Select-Object -First 1
 $ExistingQmtTask = Get-ScheduledTask -TaskName $QmtTask -ErrorAction SilentlyContinue
-$QmtExecutable = if ($QmtProcess) {
+$QmtTaskLauncher = if ($ExistingQmtTask -and [string]$ExistingQmtTask.Actions[0].Arguments -match '-Launcher\s+"([^"]+)"') {
+    $Matches[1]
+} else {
+    $null
+}
+$QmtInternalExecutable = if ($QmtProcess) {
     $QmtProcess.Path
 } elseif ($ExistingQmtTask) {
     [string]$ExistingQmtTask.Actions[0].Execute
 } else {
     $null
 }
+$QmtBinDirectory = if ($QmtTaskLauncher) {
+    Split-Path -Parent $QmtTaskLauncher
+} elseif ($QmtInternalExecutable -and (Split-Path -Leaf $QmtInternalExecutable) -ine "powershell.exe") {
+    Split-Path -Parent $QmtInternalExecutable
+} else {
+    $null
+}
+$QmtLauncher = if ($QmtBinDirectory) { Join-Path $QmtBinDirectory "XtItClient.exe" } else { $null }
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -52,17 +66,21 @@ function Write-Audit {
         update_policy = Read-Policy
         moneymore_task = Read-Task $MoneyMoreTask
         qmt_task = Read-Task $QmtTask
-        qmt_exists = Test-Path -LiteralPath $QmtExecutable
+        qmt_launcher = $QmtLauncher
+        qmt_exists = Test-Path -LiteralPath $QmtLauncher
         active_power_scheme = (powercfg /getactivescheme | Out-String).Trim()
     } | ConvertTo-Json -Depth 6
 }
 
-if ($Action -eq "Install") {
+if ($Action -in @("Install", "RepairQmt")) {
     if (-not (Test-Path -LiteralPath $ServiceScript)) {
         throw "MoneyMore service script not found: $ServiceScript"
     }
-    if (-not (Test-Path -LiteralPath $QmtExecutable)) {
-        throw "MiniQMT executable not found: $QmtExecutable"
+    if (-not (Test-Path -LiteralPath $QmtLauncher)) {
+        throw "MiniQMT official launcher not found: $QmtLauncher"
+    }
+    if (-not (Test-Path -LiteralPath $QmtGuardScript)) {
+        throw "MiniQMT guard script not found: $QmtGuardScript"
     }
     if (-not (Test-Path -LiteralPath $BackupFile)) {
         [pscustomobject]@{
@@ -71,21 +89,26 @@ if ($Action -eq "Install") {
         } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $BackupFile -Encoding UTF8
     }
 
-    New-Item -ItemType Directory -Force -Path $UpdatePolicy | Out-Null
-    New-ItemProperty -LiteralPath $UpdatePolicy -Name "AUOptions" -PropertyType DWord -Value 4 -Force | Out-Null
-    New-ItemProperty -LiteralPath $UpdatePolicy -Name "NoAutoRebootWithLoggedOnUsers" -PropertyType DWord -Value 1 -Force | Out-Null
+    if ($Action -eq "Install") {
+        New-Item -ItemType Directory -Force -Path $UpdatePolicy | Out-Null
+        New-ItemProperty -LiteralPath $UpdatePolicy -Name "AUOptions" -PropertyType DWord -Value 4 -Force | Out-Null
+        New-ItemProperty -LiteralPath $UpdatePolicy -Name "NoAutoRebootWithLoggedOnUsers" -PropertyType DWord -Value 1 -Force | Out-Null
+    }
 
     $PowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $ServiceArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Action Start' -f $ServiceScript
-    $ServiceAction = New-ScheduledTaskAction -Execute $PowerShell -Argument $ServiceArguments
-    $ServiceTrigger = New-ScheduledTaskTrigger -AtStartup
-    $ServiceTrigger.Delay = "PT30S"
-    $ServicePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $ServiceSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 6 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName $MoneyMoreTask -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Start and supervise the MoneyMore API and dashboard after Windows boots." -Force | Out-Null
+    if ($Action -eq "Install") {
+        $ServiceArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Action Start' -f $ServiceScript
+        $ServiceAction = New-ScheduledTaskAction -Execute $PowerShell -Argument $ServiceArguments
+        $ServiceTrigger = New-ScheduledTaskTrigger -AtStartup
+        $ServiceTrigger.Delay = "PT30S"
+        $ServicePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $ServiceSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 6 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName $MoneyMoreTask -Action $ServiceAction -Trigger $ServiceTrigger -Principal $ServicePrincipal -Settings $ServiceSettings -Description "Start and supervise the MoneyMore API and dashboard after Windows boots." -Force | Out-Null
+    }
 
     $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $QmtAction = New-ScheduledTaskAction -Execute $QmtExecutable
+    $QmtArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Launcher "{1}"' -f $QmtGuardScript, $QmtLauncher
+    $QmtAction = New-ScheduledTaskAction -Execute $PowerShell -Argument $QmtArguments
     $QmtTrigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
     $QmtPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
     $QmtSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 6 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
