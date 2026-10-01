@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import copy
+import json
 import re
 import shutil
 import sqlite3
@@ -48,10 +48,11 @@ from .intraday_execution import (
     prepare_intraday_branch_orders,
     run_baseline_intraday_once,
 )
+from .leveraged_etf import LeveragedEtfPaper
 from .long_term_review import evaluate_long_term_review
+from .market_risk import build_market_risk_snapshot
 from .model_registry import ModelRegistry
 from .monthly_acceptance import evaluate_monthly_cycle
-from .market_risk import build_market_risk_snapshot
 from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
@@ -97,6 +98,8 @@ STATE = ROOT / "state"
 DATA = ROOT / "data"
 PAPER_DATABASE = STATE / "paper_orders.sqlite3"
 SERVICE_DATABASE = STATE / "service.sqlite3"
+LEVERAGED_ETF_DATABASE = STATE / "tqqq_sqqq_paper.sqlite3"
+LEVERAGED_ETF_CACHE = DATA / "leveraged-etf"
 SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1473,6 +1476,12 @@ class TaskService:
                     )
             independent_steps = [
                 (
+                    "tqqq_sqqq_paper_execution",
+                    lambda: LeveragedEtfPaper(
+                        LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE
+                    ).run(),
+                ),
+                (
                     "qlib_challenger_execution",
                     lambda: run_qlib_challenger_daily(
                         root=ROOT,
@@ -1519,14 +1528,30 @@ class TaskService:
                         dedupe_key=f"{trade_date}:{step_name}:failed",
                     )
             if historical_recovery:
-                self._run_step(
-                    run_id,
-                    trade_date,
-                    "intraday_historical_replay",
-                    lambda: self._recover_intraday_branches(
-                        store, broker, trade_date
-                    ),
-                )
+                # Minute-history replay repairs comparison accounts; it is not
+                # a prerequisite for the daily factor baseline. QMT can be
+                # offline during weekends and holidays. A replay outage must
+                # not pin the recovery watermark and block newer daily NAVs.
+                try:
+                    self._run_step(
+                        run_id,
+                        trade_date,
+                        "intraday_historical_replay",
+                        lambda: self._recover_intraday_branches(
+                            store, broker, trade_date
+                        ),
+                    )
+                except Exception as replay_error:  # noqa: BLE001
+                    detail = f"{type(replay_error).__name__}: {replay_error}"
+                    self._notify(
+                        "WARN",
+                        "INTRADAY_REPLAY_DEFERRED",
+                        "日内历史补演暂缓",
+                        f"{detail}; 日线基线继续恢复，分钟数据可用后自动重试日内分支。",
+                        trade_date=trade_date,
+                        run_id=run_id,
+                        dedupe_key=f"{trade_date}:intraday-replay-deferred",
+                    )
             if strategy_failures:
                 raise RuntimeError(
                     "independent strategy failures: " + " | ".join(strategy_failures)
@@ -1712,6 +1737,19 @@ def health() -> dict[str, object]:
     }
 
 
+@app.get("/api/leveraged-etf-paper")
+def leveraged_etf_paper() -> dict[str, object]:
+    return LeveragedEtfPaper(LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE).snapshot()
+
+
+@app.post("/api/leveraged-etf-paper/run")
+def run_leveraged_etf_paper() -> dict[str, object]:
+    try:
+        return LeveragedEtfPaper(LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE).run()
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"US ETF paper run failed: {error}") from error
+
+
 @app.get("/api/live-accounts")
 def live_accounts() -> dict[str, object]:
     return _live_account_snapshot()
@@ -1725,10 +1763,17 @@ def system_health() -> dict[str, object]:
 @app.get("/api/market-risk")
 def market_risk() -> dict[str, object]:
     daily_path = DATA / "processed" / "daily.parquet"
+    baseline_path = DATA / "curated" / "multi_sector_account_daily.parquet"
+    if not baseline_path.exists():
+        baseline_path = DATA / "processed" / "multi_sector_account_daily.parquet"
     # build_market_risk_snapshot is cached.  This endpoint enriches the snapshot
     # with live branch histories, so never mutate the cached object itself.
     payload = copy.deepcopy(
-        build_market_risk_snapshot(str(DATA), daily_path.stat().st_mtime_ns)
+        build_market_risk_snapshot(
+            str(DATA),
+            daily_path.stat().st_mtime_ns,
+            baseline_path.stat().st_mtime_ns if baseline_path.exists() else 0,
+        )
     )
     broker = PaperBroker(PAPER_DATABASE)
     broker.initialize_account(1_000_000, BASELINE_EXPOSURE_ACCOUNT)

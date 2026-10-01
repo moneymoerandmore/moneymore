@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Launcher,
     [int]$PollSeconds = 20,
-    [int]$StartupGraceSeconds = 25
+    [int]$StartupGraceSeconds = 25,
+    [int]$ProbeSeconds = 60,
+    [int]$FailureThreshold = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +12,8 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $ProjectRoot "state\runtime"
 $LogFile = Join-Path $RuntimeDir "miniqmt-guard.log"
 $WorkingDirectory = Join-Path (Split-Path -Parent (Split-Path -Parent $Launcher)) "config\tradingtime"
+$QmtPython = Join-Path $ProjectRoot ".runtime\qmt-py311\Scripts\python.exe"
+$QmtBridge = Join-Path $ProjectRoot "scripts\qmt_data_bridge.py"
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -33,6 +37,43 @@ function Remove-OrphanQuoteProcesses {
     }
 }
 
+function Test-QmtSession {
+    if (-not (Test-Path -LiteralPath $QmtPython) -or
+        -not (Test-Path -LiteralPath $QmtBridge)) { return $false }
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $QmtPython
+    $StartInfo.Arguments = ('"{0}" probe' -f $QmtBridge)
+    $StartInfo.WorkingDirectory = $ProjectRoot
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $Probe = [System.Diagnostics.Process]::new()
+    $Probe.StartInfo = $StartInfo
+    try {
+        [void]$Probe.Start()
+        if (-not $Probe.WaitForExit(15000)) {
+            $Probe.Kill()
+            Write-GuardLog "session probe timed out"
+            return $false
+        }
+        return $Probe.ExitCode -eq 0
+    } catch {
+        Write-GuardLog "session probe failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        $Probe.Dispose()
+    }
+}
+
+function Restart-QmtSession {
+    Write-GuardLog "session unhealthy; restarting official client processes"
+    Get-Process -Name "XtMiniQmt", "XtItClient", "miniquote" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Start-Process -FilePath $Launcher -WorkingDirectory $WorkingDirectory -WindowStyle Minimized
+}
+
 if (-not (Test-Path -LiteralPath $Launcher)) {
     throw "MiniQMT official launcher not found: $Launcher"
 }
@@ -41,6 +82,8 @@ if (-not (Test-Path -LiteralPath $WorkingDirectory)) {
 }
 
 Write-GuardLog "guard started launcher=$Launcher"
+$LastProbeAt = [DateTimeOffset]::MinValue
+$ConsecutiveProbeFailures = 0
 while ($true) {
     try {
         if (-not (Get-QmtMainProcess)) {
@@ -56,6 +99,22 @@ while ($true) {
                 Write-GuardLog "main process restored pid=$($Started.Id)"
             } else {
                 Write-GuardLog "official launcher returned but XtMiniQmt is still absent"
+            }
+        } elseif (([DateTimeOffset]::Now - $LastProbeAt).TotalSeconds -ge $ProbeSeconds) {
+            $LastProbeAt = [DateTimeOffset]::Now
+            if (Test-QmtSession) {
+                if ($ConsecutiveProbeFailures -gt 0) {
+                    Write-GuardLog "session probe recovered"
+                }
+                $ConsecutiveProbeFailures = 0
+            } else {
+                $ConsecutiveProbeFailures += 1
+                Write-GuardLog "session probe unhealthy count=$ConsecutiveProbeFailures threshold=$FailureThreshold"
+                if ($ConsecutiveProbeFailures -ge $FailureThreshold) {
+                    Restart-QmtSession
+                    $ConsecutiveProbeFailures = 0
+                    $LastProbeAt = [DateTimeOffset]::Now.AddSeconds($StartupGraceSeconds)
+                }
             }
         }
     } catch {

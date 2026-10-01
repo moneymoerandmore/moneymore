@@ -70,8 +70,19 @@ def historical_bars(symbols: list[str], start: str, end: str) -> pd.DataFrame:
         str(ROOT / "scripts/qmt_data_bridge.py"), "minute-history",
         "--symbols", ",".join(symbols), "--start", start, "--end", end,
     ]
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
-                            encoding="utf-8", timeout=300, check=True)
+    # XtQuant's Windows process may emit GBK/GB18030 diagnostics. Decode them
+    # explicitly so a disconnected client produces a useful CalledProcessError
+    # rather than a background UnicodeDecodeError that hides stderr.
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="gb18030",
+        errors="replace",
+        timeout=300,
+        check=True,
+    )
     frame = pd.DataFrame(json.loads(result.stdout))
     if frame.empty:
         raise RuntimeError("QMT returned no historical minute bars")

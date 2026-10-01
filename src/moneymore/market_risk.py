@@ -63,15 +63,23 @@ def build_baseline_overlay_comparison(
     return rows
 
 
-@lru_cache(maxsize=2)
-def build_market_risk_snapshot(data_root: str, daily_mtime_ns: int) -> dict[str, object]:
+@lru_cache(maxsize=4)
+def build_market_risk_snapshot(
+    data_root: str,
+    daily_mtime_ns: int,
+    baseline_mtime_ns: int = 0,
+) -> dict[str, object]:
     """Build a point-in-time market-risk overlay from the active A-share universe.
 
     The overlay is deliberately independent from stock-selection scores.  A signal
     observed after close on T is an exposure proposal for T+1; it does not mutate
     any paper account until it passes forward validation and is explicitly enabled.
+    ``daily_mtime_ns`` and ``baseline_mtime_ns`` are cache-version inputs.  The
+    latter matters because market data is persisted before the strategy account
+    snapshot; caching on daily bars alone can otherwise hide the newest baseline
+    NAV until the following trading day.
     """
-    del daily_mtime_ns  # cache invalidation key
+    del daily_mtime_ns, baseline_mtime_ns  # cache invalidation keys
     store = ParquetStore(Path(data_root))
     universe = store.read("strategy_universe")
     effective = str(universe["effective_date"].astype(str).max())

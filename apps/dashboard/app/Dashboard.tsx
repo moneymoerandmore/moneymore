@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 
 type Row = Record<string, unknown>;
-type Page = "overview" | "sectors" | "research" | "risk" | "challenger" | "data" | "operations";
+type Page = "overview" | "sectors" | "research" | "risk" | "leveraged" | "challenger" | "data" | "operations";
 type Bank = {
   latest_date: string; latest_scores: Row[]; latest_holdings: Row[];
   scheduler: { enabled: boolean; time: string; timezone: string; next_run?: string };
@@ -73,6 +73,12 @@ type MarketRisk = {
   universe_size:number; coverage:number;
   exposure_league:Row & { contestants:Row[]; audit_contestants:Row[]; history:Row[] };
 };
+type LeveragedEtfPaper = {
+  account_id:string; strategy_id:string; initial_cash:number; currency:string; status:string;
+  cash:number; market_value:number; equity:number; total_return:number; drawdown:number;
+  positions:Row[]; latest_signal:(Row & { indicators?:Row })|null;
+  orders:Row[]; fills:Row[]; history:Row[]; data_source:string; execution_policy:string;
+};
 type SecurityHistory = {
   symbol:string; name:string; bars:Row[]; fills:Row[];
   coverage: { start_date:string; end_date:string; trading_days:number; fill_count:number };
@@ -117,6 +123,7 @@ const nav: { id: Page; label: string; note: string }[] = [
   { id: "sectors", label: "行业与个股", note: "SLEEVES" },
   { id: "research", label: "策略研究", note: "MODELS" },
   { id: "risk", label: "市场与仓位", note: "RISK" },
+  { id: "leveraged", label: "TQQQ / SQQQ", note: "US ETF PAPER" },
   { id: "challenger", label: "Qlib挑战者", note: "AI LAB" },
   { id: "data", label: "数据健康", note: "QUALITY" },
   { id: "operations", label: "运行与对账", note: "PAPER" },
@@ -164,6 +171,7 @@ const security = (v: unknown, names: Record<string, string>) => {
   return names[code] ? `${names[code]} · ${code}` : code;
 };
 const money = (v: unknown) => `¥${Number(v ?? 0).toLocaleString("zh-CN", { maximumFractionDigits: 0 })}`;
+const usd = (v: unknown) => `$${Number(v ?? 0).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
 const duration = (v: unknown) => {
   const seconds = Math.max(0, Number(v ?? 0));
   return `${Math.floor(seconds / 3600)}小时${Math.floor((seconds % 3600) / 60)}分`;
@@ -188,6 +196,7 @@ export default function Dashboard() {
   const [live, setLive] = useState<LiveAccounts | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [marketRisk, setMarketRisk] = useState<MarketRisk | null>(null);
+  const [leveragedEtf,setLeveragedEtf]=useState<LeveragedEtfPaper|null>(null);
   const [securityDetail,setSecurityDetail]=useState<SecurityHistory|null>(null);
   const [securityDetailAccount,setSecurityDetailAccount]=useState("");
   const [securityDetailLoading,setSecurityDetailLoading]=useState(false);
@@ -196,12 +205,13 @@ export default function Dashboard() {
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
     try {
-      const [b, s, e, q, o, m, a, c, i, r] = await Promise.all([
+      const [b, s, e, q, o, m, a, c, i, r, l] = await Promise.all([
         json<Bank>("/api/bank-dashboard"), json<Sectors>("/api/sector-portfolio"), json<Execution>("/api/multi-sector-execution"), json<DataQuality>("/api/data-quality"), json<OperationsCenter>("/api/operations-center"), json<ModelRegistry>("/api/model-registry"), json<MonthlyAcceptance>("/api/monthly-acceptance"), json<Challenger>("/api/qlib-challenger"),
         json<IntradayExecution>("/api/intraday-execution"),
         json<MarketRisk>("/api/market-risk"),
+        json<LeveragedEtfPaper>("/api/leveraged-etf-paper"),
       ]);
-      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setMarketRisk(r); setError("");
+      setBank(b); setSectors(s); setExecution(e); setQuality(q); setOperations(o); setModels(m); setAcceptance(a); setChallenger(c); setIntraday(i); setMarketRisk(r); setLeveragedEtf(l); setError("");
     } catch (reason) { setError(reason instanceof Error ? reason.message : "服务暂不可用"); }
   }, []);
   const refreshLive = useCallback(async () => {
@@ -246,7 +256,7 @@ export default function Dashboard() {
     },10_000);
     return ()=>clearInterval(id);
   },[securityDetail?.symbol]);
-  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday || !marketRisk) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
+  if (!bank || !sectors || !execution || !quality || !operations || !models || !acceptance || !challenger || !intraday || !marketRisk || !leveragedEtf) return <main className="loading"><span>M</span><b>MoneyMore</b><p>{error || "正在装载综合组合…"}</p><button onClick={() => void refresh()}>重新连接</button></main>;
   const current = nav.find((item) => item.id === page)!;
   const liveBaseline=live?.accounts[execution.account_id];
   const displayedExecution=liveBaseline?{...execution,portfolio:liveBaseline.portfolio,positions:liveBaseline.positions,orders:liveBaseline.orders,fills:liveBaseline.fills}:execution;
@@ -265,11 +275,36 @@ export default function Dashboard() {
       {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
       {page === "research" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Research sectors={sectors} models={models}/></SecurityAccountContext.Provider>}
       {page === "risk" && <MarketRiskPage risk={marketRisk} live={live} names={sectors.symbol_names}/>}
+      {page === "leveraged" && <LeveragedEtfPage account={leveragedEtf} onRefresh={refresh}/>}
       {page === "challenger" && <SecurityAccountContext.Provider value="qlib_gru_shadow"><ChallengerPage challenger={challenger} names={sectors.symbol_names} live={live}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></SecurityAccountContext.Provider>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Operations bank={bank} execution={displayedExecution} operations={operations} acceptance={acceptance} intraday={intraday} live={live} names={sectors.symbol_names} onRefresh={refresh}/></SecurityAccountContext.Provider>}
     </main>
   </div>{(securityDetailLoading||securityDetailError||securityDetail)&&<SecurityHistoryModal detail={securityDetail} initialAccountId={securityDetailAccount} loading={securityDetailLoading} error={securityDetailError} onClose={()=>{setSecurityDetail(null);setSecurityDetailError("");}}/>}</SecurityNavigationContext.Provider>;
+}
+
+function LeveragedEtfPage({account,onRefresh}:{account:LeveragedEtfPaper;onRefresh:()=>Promise<void>}) {
+  const [running,setRunning]=useState(false);
+  const [runError,setRunError]=useState("");
+  const signal=account.latest_signal;
+  const indicators=signal?.indicators??{};
+  const run=async()=>{
+    setRunning(true);setRunError("");
+    try { await json<LeveragedEtfPaper>("/api/leveraged-etf-paper/run",{method:"POST"}); await onRefresh(); }
+    catch(reason) { setRunError(reason instanceof Error?reason.message:"美股 ETF 模拟盘运行失败"); }
+    finally { setRunning(false); }
+  };
+  const allocationRows=signal?[{asset:"TQQQ",weight:signal.tqqq},{asset:"SQQQ",weight:signal.sqqq},{asset:"美元现金",weight:signal.cash}]:[];
+  const history=account.history.map((row)=>({...row,normalized_nav:Number(row.equity)/account.initial_cash}));
+  return <>
+    <section className="portfolio-hero leveraged-hero"><div><small>ISOLATED US ETF PAPER ACCOUNT</small><h2>TQQQ / SQQQ / Cash</h2><p>V5A VIX Spike · QQQ 趋势、波动率、MACD 与 VIX 联合择时</p><button className="primary" disabled={running} onClick={()=>void run()}>{running?"正在同步并计算…":"立即运行独立模拟盘"}</button></div><div className="exposure"><span>账户净值</span><b>{usd(account.equity)}</b><small>初始资金 {usd(account.initial_cash)} · {account.status}</small></div></section>
+    {runError&&<div className="error">{runError}</div>}
+    <section className="kpis"><Kpi label="累计收益" value={pct(account.total_return)} note="仅此独立美元账户" accent/><Kpi label="当前回撤" value={pct(account.drawdown)} note="相对账户历史峰值"/><Kpi label="美元现金" value={usd(account.cash)} note={`市值 ${usd(account.market_value)}`}/><Kpi label="最新信号" value={text(signal?.regime??"等待首次运行")} note={text(signal?.signal_date)}/></section>
+    <div className="two-col"><Panel title="最新目标配置" subtitle="收盘生成目标；下一交易日开盘成交，不使用未来数据"><Table rows={allocationRows} columns={[["asset","资产"],["weight","目标权重"]]} format={{weight:pct}}/></Panel><Panel title="信号诊断" subtitle="参数独立冻结，不引用 MoneyMore 其他策略"><Table rows={signal?[{qqq_close:indicators.qqq_close,ma180:indicators.ma180,vix:indicators.vix,vix_sma20:indicators.vix_sma20,vol:indicators.annualized_volatility,macd:indicators.macd_histogram,slope:indicators.ma_slope,score:signal.score}]:[]} columns={[["qqq_close","QQQ"],["ma180","MA180"],["vix","VIX"],["vix_sma20","VIX MA20"],["vol","年化波动"],["macd","MACD柱"],["slope","MA斜率%"],["score","评分"]]} format={{qqq_close:num,ma180:num,vix:num,vix_sma20:num,vol:pct,macd:num,slope:num,score:num}}/></Panel></div>
+    <div className="two-col"><Panel title="独立持仓" subtitle="不会进入 A 股账户、风控或策略 PK"><Table rows={account.positions} columns={[["symbol","标的"],["quantity","股数"],["avg_cost","均价"],["mark_price","现价"],["market_value","市值"],["unrealized_pnl","浮盈亏"]]} format={{avg_cost:usd,mark_price:usd,market_value:usd,unrealized_pnl:usd}}/></Panel><Panel title="待执行与历史订单" subtitle={account.execution_policy}><Table rows={account.orders.slice(0,30)} columns={[["signal_date","信号日"],["execution_date","执行日"],["symbol","标的"],["side","方向"],["quantity","数量"],["target_weight","目标权重"],["status","状态"],["reason","原因"]]} format={{target_weight:pct}}/></Panel></div>
+    <Panel title="美元账户净值" subtitle={account.data_source}>{history.length?<LineComparisonChart title="独立模拟盘净值" subtitle="以 $100,000 为 100；不与人民币账户合并" series={[{accountId:account.account_id,label:"TQQQ/SQQQ V5A",color:"#ef7655",rows:history}]} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(2)}`} selectedAccountIds={new Set([account.account_id])} onToggle={()=>{}}/>:<p className="empty">首次运行后开始记录每日净值</p>}</Panel>
+    <Panel title="模拟成交" subtitle="5 bps 滑点 + 1 bp 手续费"><Table rows={account.fills} columns={[["trade_date","成交日"],["signal_date","信号日"],["symbol","标的"],["side","方向"],["quantity","数量"],["price","成交价"],["fee","费用"]]} format={{price:usd,fee:usd}}/></Panel>
+  </>;
 }
 
 function MarketRiskPage({ risk, live, names }: { risk:MarketRisk; live?:LiveAccounts; names:Record<string,string> }) {
@@ -613,8 +648,15 @@ function SecurityHistoryModal({detail,initialAccountId,loading,error,onClose}:{d
   const dateIndex=new Map(bars.map((row,index)=>[text(row.trade_date),index]));
   const accountName=(value:unknown)=>chartPalette[text(value)]?.label??(text(value).startsWith("qlib_candidate_")?`Qlib候选 ${text(value).replace("qlib_candidate_","")}`:text(value));
   const activeBar=hoveredBar==null?bars.at(-1):bars[hoveredBar];
-  const chartPointer=(event:React.MouseEvent<SVGRectElement>)=>{const rect=event.currentTarget.getBoundingClientRect();const px=(event.clientX-rect.left)/rect.width*width;setHoveredBar(Math.max(0,Math.min(bars.length-1,Math.floor((px-left)/step))))};
-  return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal xq-security" onClick={(event)=>event.stopPropagation()}><header><div><small>行情 · 模拟成交复盘</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap"><div className="xq-quote-strip"><b>{text(activeBar?.trade_date)}</b><span>开 <i>{num(activeBar?.open)}</i></span><span>高 <i className="up">{num(activeBar?.high)}</i></span><span>低 <i className="down">{num(activeBar?.low)}</i></span><span>收 <i>{num(activeBar?.close)}</i></span>{averages.map((average)=><span key={average.period} style={{color:average.color}}>MA{average.period} {num(average.values[hoveredBar??bars.length-1])}</span>)}</div>{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}{hovered.inherited?" · 继承自因子基线":""}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(priceBottom-top)} y2={top+tick*(priceBottom-top)} className="chart-grid"/><text x={width-right+8} y={top+tick*(priceBottom-top)+3}>{(max-tick*span).toFixed(2)}</text></g>)}<line x1={left} x2={width-right} y1={volumeTop-12} y2={volumeTop-12} className="chart-divider"/><text x={left} y={volumeTop-16}>成交量</text>{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open),color=up?"#f0484d":"#19a36a",topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close))),volume=Number(row.vol??row.volume??0);return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?"#fff":color} stroke={color}/><rect x={x(index)-body/2} y={volumeY(volume)} width={body} height={volumeBottom-volumeY(volume)} fill={up?"#f0484d":"#19a36a"} opacity=".86"/></g>})}{averages.map((average)=><path key={average.period} d={averagePath(average.values)} fill="none" stroke={average.color} strokeWidth="1.35"/>)}{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY",lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length,badgeY=buy?Math.min(priceBottom-14,priceY+28+lane*22):Math.max(top+14,priceY-28-lane*22),connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="3"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text></g>})}{hoveredBar!=null&&<g className="chart-crosshair"><line x1={x(hoveredBar)} x2={x(hoveredBar)} y1={top} y2={volumeBottom}/><line x1={left} x2={width-right} y1={y(Number(activeBar?.close))} y2={y(Number(activeBar?.close))}/></g>}<rect x={left} y={top} width={width-left-right} height={volumeBottom-top} fill="transparent" onMouseMove={chartPointer} onMouseLeave={()=>setHoveredBar(null)}/><text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={(left+width-right)/2} y={height-8} textAnchor="middle">{text(bars[Math.floor(bars.length/2)]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>B 买入</span><span><i className="sell"/>S 卖出</span>{selectedAccountId==="multi_sector_intraday_shadow"&&<span>含分支日前继承成交</span>}</div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle={selectedAccountId==="multi_sector_intraday_shadow"?"包含分支建立前从普通基线继承的成交，继承记录单独标明来源":"图表和明细始终使用同一个策略账户，不混合其他策略"}><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"],["inherited","来源"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money,inherited:(v)=>v?"继承自基线":"本策略"}}/></Panel></section></div>;
+  const chartPointer=(event:React.MouseEvent<SVGRectElement>)=>{
+    // The event target is the plot-area rect, not the complete SVG.  Mapping
+    // its CSS pixel offset through the full viewBox width introduced a growing
+    // rightward crosshair error.  Map directly to the number of visible bars.
+    const rect=event.currentTarget.getBoundingClientRect();
+    const ratio=Math.max(0,Math.min(1,(event.clientX-rect.left)/Math.max(rect.width,1)));
+    setHoveredBar(Math.max(0,Math.min(bars.length-1,Math.floor(ratio*bars.length))));
+  };
+  return <div className="security-modal-backdrop" onClick={onClose}><section className="security-modal xq-security" onClick={(event)=>event.stopPropagation()}><header><div><small>行情 · 模拟成交复盘</small><h2>{detail.name}<em>{detail.symbol}</em></h2><p>{detail.coverage.start_date} → {detail.coverage.end_date} · {detail.coverage.trading_days}个交易日 · 当前策略{strategyFills.length}笔模拟成交</p></div><button className="modal-close" onClick={onClose}>×</button></header><div className="security-filters"><label>策略<select value={selectedAccountId} onChange={(event)=>{setAccountId(event.target.value);setHovered(null)}}>{accountIds.map((id)=><option key={id} value={id}>{accountName(id)}</option>)}</select></label><div className="range-tabs">{["1M","3M","6M","1Y","3Y","ALL"].map((item)=><button key={item} className={range===item?"active":""} onClick={()=>setRange(item)}>{item}</button>)}</div></div><div className="candlestick-wrap"><div className="xq-quote-strip"><b>{text(activeBar?.trade_date)}</b><span>开 <i>{num(activeBar?.open)}</i></span><span>高 <i className="up">{num(activeBar?.high)}</i></span><span>低 <i className="down">{num(activeBar?.low)}</i></span><span>收 <i>{num(activeBar?.close)}</i></span>{averages.map((average)=><span key={average.period} style={{color:average.color}}>MA{average.period} {num(average.values[hoveredBar??bars.length-1])}</span>)}</div>{hovered&&<div className="trade-tooltip" style={{left:`${hovered.left}%`,top:`${hovered.top}%`}}><b className={text(hovered.side).toLowerCase()}>{text(hovered.side)==="BUY"?"买入 BUY":"卖出 SELL"}</b><span>{text(hovered.trade_date)} · {accountName(hovered.account_id)}{hovered.inherited?" · 继承自因子基线":""}</span><strong>成交价 {Number(hovered.price).toFixed(3)}</strong><span>数量 {Number(hovered.quantity).toLocaleString("zh-CN")}股 · 费用 {money(hovered.fee)}</span></div>}<svg className="candlestick-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${detail.name} K线与买卖记录`}>{[0,.25,.5,.75,1].map((tick)=><g key={tick}><line x1={left} x2={width-right} y1={top+tick*(priceBottom-top)} y2={top+tick*(priceBottom-top)} className="chart-grid"/><text x={width-right+8} y={top+tick*(priceBottom-top)+3}>{(max-tick*span).toFixed(2)}</text></g>)}<line x1={left} x2={width-right} y1={volumeTop-12} y2={volumeTop-12} className="chart-divider"/><text x={left} y={volumeTop-16}>成交量</text>{bars.map((row,index)=>{const up=Number(row.close)>=Number(row.open),color=up?"#f0484d":"#19a36a",topY=y(Math.max(Number(row.open),Number(row.close))),bottomY=y(Math.min(Number(row.open),Number(row.close))),volume=Number(row.vol??row.volume??0);return <g key={text(row.trade_date)}><line x1={x(index)} x2={x(index)} y1={y(Number(row.high))} y2={y(Number(row.low))} stroke={color}/><rect x={x(index)-body/2} y={topY} width={body} height={Math.max(bottomY-topY,1)} fill={up?"#fff":color} stroke={color}/><rect x={x(index)-body/2} y={volumeY(volume)} width={body} height={volumeBottom-volumeY(volume)} fill={up?"#f0484d":"#19a36a"} opacity=".86"/></g>})}{averages.map((average)=><path key={average.period} d={averagePath(average.values)} fill="none" stroke={average.color} strokeWidth="1.35"/>)}<rect className="chart-hit-area" x={left} y={top} width={width-left-right} height={volumeBottom-top} fill="transparent" onMouseMove={chartPointer} onMouseLeave={()=>setHoveredBar(null)}/>{fills.map((fill,index)=>{const tradeDate=text(fill.trade_date),pointIndex=dateIndex.get(tradeDate);if(pointIndex==null)return null;const px=x(pointIndex),priceY=y(Number(fill.price)),buy=text(fill.side)==="BUY",lane=fills.slice(0,index).filter((row)=>text(row.trade_date)===tradeDate&&(text(row.side)==="BUY")===buy).length,badgeY=buy?Math.min(priceBottom-14,priceY+28+lane*22):Math.max(top+14,priceY-28-lane*22),connectorEnd=badgeY+(buy?-11:11);return <g key={`${text(fill.id)}-${index}`} className={buy?"trade-badge buy":"trade-badge sell"} onMouseEnter={()=>setHovered({...fill,left:px/width*100,top:badgeY/height*100})} onMouseLeave={()=>setHovered(null)}><line x1={px} x2={px} y1={priceY} y2={connectorEnd} className="trade-connector"/><circle cx={px} cy={priceY} r="3" className="trade-price-dot"/><rect x={px-10} y={badgeY-10} width="20" height="20" rx="3"/><text x={px} y={badgeY+3.5} textAnchor="middle">{buy?"B":"S"}</text></g>})}{hoveredBar!=null&&<g className="chart-crosshair"><line x1={x(hoveredBar)} x2={x(hoveredBar)} y1={top} y2={volumeBottom}/><line x1={left} x2={width-right} y1={y(Number(activeBar?.close))} y2={y(Number(activeBar?.close))}/></g>}<text x={left} y={height-8}>{text(bars[0]?.trade_date)}</text><text x={(left+width-right)/2} y={height-8} textAnchor="middle">{text(bars[Math.floor(bars.length/2)]?.trade_date)}</text><text x={width-right} y={height-8} textAnchor="end">{text(bars.at(-1)?.trade_date)}</text></svg><div className="trade-legend"><span><i className="buy"/>B 买入</span><span><i className="sell"/>S 卖出</span>{selectedAccountId==="multi_sector_intraday_shadow"&&<span>含分支日前继承成交</span>}</div></div><Panel title={`${accountName(selectedAccountId)} · 历史成交`} subtitle={selectedAccountId==="multi_sector_intraday_shadow"?"包含分支建立前从普通基线继承的成交，继承记录单独标明来源":"图表和明细始终使用同一个策略账户，不混合其他策略"}><Table rows={[...strategyFills].reverse()} columns={[["trade_date","日期"],["side","操作"],["quantity","数量"],["price","成交价"],["fee","费用"],["inherited","来源"]]} format={{price:(v)=>Number(v).toFixed(3),fee:money,inherited:(v)=>v?"继承自基线":"本策略"}}/></Panel></section></div>;
 }
 
 function SystemHealthBar({health}:{health:SystemHealth}){
