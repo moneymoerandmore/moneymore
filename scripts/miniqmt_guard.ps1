@@ -4,7 +4,8 @@ param(
     [int]$PollSeconds = 20,
     [int]$StartupGraceSeconds = 25,
     [int]$ProbeSeconds = 60,
-    [int]$FailureThreshold = 3
+    [int]$FailureThreshold = 3,
+    [switch]$RestartOnProbeFailure
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,8 +13,9 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $ProjectRoot "state\runtime"
 $LogFile = Join-Path $RuntimeDir "miniqmt-guard.log"
 $WorkingDirectory = Join-Path (Split-Path -Parent (Split-Path -Parent $Launcher)) "config\tradingtime"
-$QmtPython = Join-Path $ProjectRoot ".runtime\qmt-py311\Scripts\python.exe"
+$QmtPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $QmtBridge = Join-Path $ProjectRoot "scripts\qmt_data_bridge.py"
+$QmtSdk = Join-Path $ProjectRoot ".runtime\xtquant_250807"
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -48,6 +50,10 @@ function Test-QmtSession {
     $StartInfo.CreateNoWindow = $true
     $StartInfo.RedirectStandardOutput = $true
     $StartInfo.RedirectStandardError = $true
+    # The broker's current client requires the matching SDK.  The legacy SDK
+    # reports every healthy session as disconnected and previously triggered
+    # destructive restart loops.
+    $StartInfo.Environment["MONEYMORE_XTQUANT_SDK"] = $QmtSdk
     $Probe = [System.Diagnostics.Process]::new()
     $Probe.StartInfo = $StartInfo
     try {
@@ -110,7 +116,12 @@ while ($true) {
             } else {
                 $ConsecutiveProbeFailures += 1
                 Write-GuardLog "session probe unhealthy count=$ConsecutiveProbeFailures threshold=$FailureThreshold"
-                if ($ConsecutiveProbeFailures -ge $FailureThreshold) {
+                # A history download can temporarily monopolize XtQuant's
+                # local RPC service.  Process liveness remains authoritative;
+                # probing is observational unless explicitly opted into the
+                # old destructive recovery behaviour.
+                if ($RestartOnProbeFailure -and
+                    $ConsecutiveProbeFailures -ge $FailureThreshold) {
                     Restart-QmtSession
                     $ConsecutiveProbeFailures = 0
                     $LastProbeAt = [DateTimeOffset]::Now.AddSeconds($StartupGraceSeconds)
