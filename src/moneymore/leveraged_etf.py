@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -16,6 +18,7 @@ STRATEGY_ID = "v5a_vix_spike"
 INITIAL_CASH = 100_000.0
 TRADE_SYMBOLS = ("TQQQ", "SQQQ")
 DATA_SYMBOLS = ("QQQ", "TQQQ", "SQQQ", "^VIX")
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -230,13 +233,73 @@ class LeveragedEtfPaper:
 
     def run(self, client: YahooDailyClient | None = None) -> dict[str, object]:
         data = self.refresh_data(client)
+        now = datetime.now(NEW_YORK)
+        today = now.date().isoformat()
         latest_date = str(data["QQQ"].iloc[-1]["trade_date"])
-        self._execute_pending(latest_date, {s: float(data[s].iloc[-1]["open"]) for s in TRADE_SYMBOLS})
-        allocation = self.allocation(data)
-        closes = {s: float(data[s].iloc[-1]["close"]) for s in TRADE_SYMBOLS}
-        self._record_equity(latest_date, closes)
-        self._queue(allocation, closes)
+        # Yahoo exposes today's still-forming daily candle during the session.
+        # Startup recovery must never turn that partial candle into a close signal.
+        if latest_date == today and (now.hour, now.minute) < (16, 15):
+            data = {
+                symbol: frame.loc[frame["trade_date"].astype(str) < today]
+                .reset_index(drop=True)
+                for symbol, frame in data.items()
+            }
+        return self._run_aligned(data)
+
+    def _run_aligned(self, data: dict[str, pd.DataFrame]) -> dict[str, object]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT MAX(signal_date) FROM signals").fetchone()
+            last_signal_date = None if row is None else row[0]
+        indices = [
+            index
+            for index, trade_date in enumerate(data["QQQ"]["trade_date"].astype(str))
+            if last_signal_date is None or trade_date > str(last_signal_date)
+        ]
+        # A new account starts from the latest completed session; an existing
+        # account replays every missing session so orders, holdings and NAV do
+        # not jump across an outage.
+        if last_signal_date is None and indices:
+            indices = indices[-1:]
+        for index in indices:
+            trade_date = str(data["QQQ"].iloc[index]["trade_date"])
+            opens = {symbol: float(data[symbol].iloc[index]["open"]) for symbol in TRADE_SYMBOLS}
+            closes = {symbol: float(data[symbol].iloc[index]["close"]) for symbol in TRADE_SYMBOLS}
+            self._execute_pending(trade_date, opens)
+            self._record_equity(trade_date, closes)
+            self._queue(self.allocation(data, index), closes)
+        closes = {symbol: float(data[symbol].iloc[-1]["close"]) for symbol in TRADE_SYMBOLS}
         return self.snapshot(closes)
+
+    def run_open(self, client: YahooDailyClient | None = None) -> dict[str, object]:
+        """Execute prior-close orders using today's official session open.
+
+        This deliberately does not calculate a new signal from the incomplete
+        intraday daily bar returned shortly after the US open.
+        """
+        data = self.refresh_data(client)
+        trade_date = str(data["QQQ"].iloc[-1]["trade_date"])
+        expected_date = datetime.now(NEW_YORK).date().isoformat()
+        if trade_date != expected_date:
+            raise RuntimeError(
+                f"US session open bar is not available yet: expected {expected_date}, got {trade_date}"
+            )
+        opens = {symbol: float(data[symbol].iloc[-1]["open"]) for symbol in TRADE_SYMBOLS}
+        closes = {symbol: float(data[symbol].iloc[-1]["close"]) for symbol in TRADE_SYMBOLS}
+        self._execute_pending(trade_date, opens)
+        self._record_equity(trade_date, closes)
+        return self.snapshot(closes)
+
+    def run_close(self, client: YahooDailyClient | None = None) -> dict[str, object]:
+        """Mark the account and create the next-session target after US close."""
+        payload = self.run(client)
+        expected_date = datetime.now(NEW_YORK).date().isoformat()
+        latest_signal = payload.get("latest_signal")
+        actual_date = None if latest_signal is None else latest_signal.get("signal_date")
+        if actual_date != expected_date:
+            raise RuntimeError(
+                f"US session close bar is not available yet: expected {expected_date}, got {actual_date}"
+            )
+        return payload
 
     def _execute_pending(self, trade_date: str, opens: dict[str, float]) -> None:
         with self._connect() as connection:
@@ -350,3 +413,71 @@ class LeveragedEtfPaper:
                 if not frame.empty:
                     result[symbol] = float(frame.iloc[-1]["close"])
         return result
+
+
+class LeveragedEtfScheduler:
+    """US-session scheduler, independent from MoneyMore's A-share timetable."""
+
+    def __init__(self, paper: LeveragedEtfPaper, poll_seconds: int = 30) -> None:
+        self.paper = paper
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.last_open_run: str | None = None
+        self.last_close_run: str | None = None
+        self.last_startup_run: str | None = None
+        self.last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="moneymore-us-etf-paper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def status(self) -> dict[str, object]:
+        now = datetime.now(NEW_YORK)
+        return {
+            "running": bool(self._thread and self._thread.is_alive()),
+            "timezone": "America/New_York",
+            "now": now.isoformat(),
+            "open_schedule": "09:35",
+            "close_schedule": "16:15",
+            "last_open_run": self.last_open_run,
+            "last_close_run": self.last_close_run,
+            "last_startup_run": self.last_startup_run,
+            "last_error": self.last_error,
+        }
+
+    def _loop(self) -> None:
+        # Every service start immediately repairs missed completed sessions.
+        # The normal open/close clocks below then take over for the live session.
+        try:
+            self.paper.run()
+            self.last_startup_run = datetime.now(NEW_YORK).isoformat()
+            self.last_error = None
+        except Exception as error:  # noqa: BLE001 - retry on the timed loop
+            self.last_error = f"{type(error).__name__}: {error}"
+        while not self._stop.is_set():
+            now = datetime.now(NEW_YORK)
+            session = now.date().isoformat()
+            weekday = now.weekday() < 5
+            try:
+                if weekday and (now.hour, now.minute) >= (9, 35) and self.last_open_run != session:
+                    self.paper.run_open()
+                    self.last_open_run = session
+                    self.last_error = None
+                if weekday and (now.hour, now.minute) >= (16, 15) and self.last_close_run != session:
+                    self.paper.run_close()
+                    self.last_close_run = session
+                    self.last_error = None
+            except Exception as error:  # noqa: BLE001 - retry transient quote/feed failures
+                self.last_error = f"{type(error).__name__}: {error}"
+            self._stop.wait(self.poll_seconds)

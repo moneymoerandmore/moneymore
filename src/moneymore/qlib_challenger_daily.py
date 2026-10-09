@@ -23,6 +23,8 @@ from .qlib_challenger import (
     QlibPanelDataset,
     build_challenger_dataset,
     challenger_universe,
+    rank_blend_predictions,
+    research_gate_diagnostics,
 )
 from .qlib_exposure import dynamic_target_exposure, previous_report_exposure
 from .qlib_governance import bootstrap_qlib_release
@@ -93,10 +95,10 @@ def run_qlib_challenger_daily(
     research_path: Path | None = None,
     account_history_table: str = "qlib_challenger_account_daily",
 ) -> ChallengerDailyResult:
-    challenger_config = yaml.safe_load(
+    default_challenger_config = yaml.safe_load(
         (root / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
     )
-    model_id = str(challenger_config["model_id"])
+    model_id = str(default_challenger_config["model_id"])
     strategy_id = execution_strategy_id(strategy_id or model_id, store)
     model_dir = model_dir or root / "state" / "qlib-challenger" / "models"
     model_path = model_dir / f"{model_id}.pkl"
@@ -120,23 +122,15 @@ def run_qlib_challenger_daily(
             account_id=account_id,
         )
     research = json.loads(research_path.read_text(encoding="utf-8"))
+    challenger_config = research.get("protocol") or default_challenger_config
+    model_id = str(challenger_config["model_id"])
     deployment = bootstrap_qlib_release(root)
     gru_metrics = next(
         (row for row in research["metrics"] if row["model_id"] == model_id),
         None,
     )
-    gate = challenger_config["research_gate"]
-    stability = research.get("stability", {})
-    research_gate_passed = (
-        gru_metrics is not None
-        and int(gru_metrics["samples"]) >= int(gate["minimum_samples"])
-        and float(gru_metrics["rank_ic"]) >= float(gate["minimum_rank_ic"])
-        and float(gru_metrics["rank_ic_ir"]) >= float(gate["minimum_rank_ic_ir"])
-        and float(gru_metrics.get("cost_adjusted_top_k_excess_return", -1))
-        > float(gate["minimum_cost_adjusted_excess_return"])
-        and int(stability.get("seed_count", 0)) >= int(gate["minimum_seed_count"])
-        and float(stability.get("positive_seed_ratio", 0))
-        >= float(gate["minimum_positive_seed_ratio"])
+    research_gate_passed, research_gate_failures = research_gate_diagnostics(
+        research, default_challenger_config
     )
     execution_policy = challenger_config.get("execution_policy", {})
     experimental_paper_enabled = bool(
@@ -164,12 +158,18 @@ def run_qlib_challenger_daily(
     if ensemble_path.exists():
         manifest = json.loads(ensemble_path.read_text(encoding="utf-8"))
         ensemble_predictions = []
-        for filename in manifest["models"]:
+        for item in manifest["models"]:
+            filename = item["filename"] if isinstance(item, dict) else item
+            weight = float(item.get("weight", 1.0)) if isinstance(item, dict) else 1.0
             with (ensemble_path.parent / filename).open("rb") as handle:
                 model = pickle.load(handle)
             _prepare_model_for_inference(model)
-            ensemble_predictions.append(model.predict(live_dataset, "live"))
-        predictions = sum(ensemble_predictions) / len(ensemble_predictions)
+            ensemble_predictions.append((model.predict(live_dataset, "live"), weight))
+        predictions = (
+            rank_blend_predictions(ensemble_predictions)
+            if manifest.get("method") == "daily_rank_blend"
+            else sum(series for series, _ in ensemble_predictions) / len(ensemble_predictions)
+        )
     else:
         with model_path.open("rb") as handle:
             model = pickle.load(handle)
@@ -235,8 +235,34 @@ def run_qlib_challenger_daily(
                 **selection_metadata,
                 "execution_strategy_id": strategy_id,
                 "research_gate_passed": research_gate_passed,
+                "research_gate_failures": research_gate_failures,
                 "deployment_mode": deployment.get("execution_mode"),
                 "observation_reason": "EXPERIMENTAL_PAPER_DISABLED",
+            },
+            account_id=account_id,
+        )
+
+    failed_gate_mode = str(execution_policy.get("failed_gate_mode", "observe_with_paper"))
+    if not research_gate_passed and failed_gate_mode == "scores_only":
+        executions = []
+        for symbol, bar in sorted(bars.items()):
+            executions.extend(broker.execute_pending(bar, config, account_id))
+        broker.cancel_pending(account_id, "RESEARCH_GATE_FAILED_SCORES_ONLY", side="BUY")
+        portfolio = broker.account_snapshot(marks, account_id)
+        _record_account_history(store, trade_date, portfolio, account_id, account_history_table)
+        return _finish(
+            trade_date, "RESEARCH_GATE_FAILED_SCORES_ONLY", model_id, selected,
+            score_frame.sort_values("score", ascending=False).to_dict("records"),
+            executions, [], portfolio, broker, report_dir,
+            {
+                **selection_metadata,
+                "execution_strategy_id": strategy_id,
+                "research_gate_passed": False,
+                "research_gate_failures": research_gate_failures,
+                "deployment_mode": deployment.get("execution_mode"),
+                "promotion_eligible": False,
+                "protocol_version": challenger_config.get("protocol_version", "legacy"),
+                "observation_reason": "RESEARCH_GATE_FAILED_SCORES_ONLY",
             },
             account_id=account_id,
         )
@@ -342,6 +368,7 @@ def run_qlib_challenger_daily(
             **selection_metadata,
             "execution_strategy_id": strategy_id,
             "research_gate_passed": research_gate_passed,
+            "research_gate_failures": research_gate_failures,
             "deployment_mode": deployment.get("execution_mode"),
             "promotion_eligible": research_gate_passed
             and deployment.get("execution_mode") == "PAPER_TRADING",
@@ -451,6 +478,9 @@ def _scheduled_portfolio(
         correlation_penalty=float(policy["correlation_penalty"]),
         cluster_correlation_threshold=float(policy["cluster_correlation_threshold"]),
         maximum_cluster_members=int(policy["maximum_cluster_members"]),
+        weighting_method=str(policy.get("weighting_method", "rank_linear")),
+        confidence_temperature=float(policy.get("confidence_temperature", 1.0)),
+        confidence_shrinkage=float(policy.get("confidence_shrinkage", 0.35)),
     )
     return selected, weights, {
         "selection_method": "global_rank_weighted_topk",

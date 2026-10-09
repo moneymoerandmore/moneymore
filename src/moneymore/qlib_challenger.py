@@ -201,6 +201,9 @@ def evaluate_predictions(
     cluster_correlation_threshold: float | None = None,
     maximum_cluster_members: int | None = None,
     correlations: dict[pd.Timestamp, pd.DataFrame] | None = None,
+    weighting_method: str = "rank_linear",
+    confidence_temperature: float = 1.0,
+    confidence_shrinkage: float = 0.35,
 ) -> ChallengerMetrics:
     aligned = pd.concat(
         [predictions.rename("score"), labels.rename("label")], axis=1
@@ -237,6 +240,9 @@ def evaluate_predictions(
                 correlation_penalty=correlation_penalty,
                 cluster_correlation_threshold=cluster_correlation_threshold,
                 maximum_cluster_members=maximum_cluster_members,
+                weighting_method=weighting_method,
+                confidence_temperature=confidence_temperature,
+                confidence_shrinkage=confidence_shrinkage,
             )
             selected = ranked.loc[ranked["instrument"].astype(str).isin(chosen)]
         held = set(selected["instrument"])
@@ -318,6 +324,53 @@ def save_challenger_artifact(
 
 def metrics_payload(metrics: ChallengerMetrics) -> dict[str, object]:
     return asdict(metrics)
+
+
+def rank_blend_predictions(
+    predictions: list[tuple[pd.Series, float]],
+) -> pd.Series:
+    """Blend heterogeneous models on comparable daily percentile ranks."""
+    if not predictions:
+        raise ValueError("at least one prediction series is required")
+    total_weight = sum(max(float(weight), 0.0) for _, weight in predictions)
+    if total_weight <= 0:
+        raise ValueError("prediction weights must contain a positive value")
+    blended = None
+    for series, weight in predictions:
+        ranked = series.groupby(level="datetime").rank(pct=True, method="average")
+        contribution = ranked * (max(float(weight), 0.0) / total_weight)
+        blended = contribution if blended is None else blended.add(contribution, fill_value=0.0)
+    assert blended is not None
+    return blended.sort_index()
+
+
+def research_gate_diagnostics(
+    research: dict[str, Any], fallback_config: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """Evaluate the immutable protocol stored with a candidate artifact."""
+    protocol = research.get("protocol") or fallback_config
+    model_id = str(protocol["model_id"])
+    gate = protocol["research_gate"]
+    metrics = {str(row.get("model_id")): row for row in research.get("metrics", [])}
+    metric = metrics.get(model_id, {})
+    stability = research.get("stability", {})
+    failures: list[str] = []
+    checks = (
+        (int(metric.get("samples", 0)) >= int(gate["minimum_samples"]), "MINIMUM_SAMPLES"),
+        (float(metric.get("rank_ic", -1)) >= float(gate["minimum_rank_ic"]), "RANK_IC"),
+        (float(metric.get("rank_ic_ir", -1)) >= float(gate["minimum_rank_ic_ir"]), "RANK_IC_IR"),
+        (float(metric.get("cost_adjusted_top_k_excess_return", -1)) > float(gate["minimum_cost_adjusted_excess_return"]), "COST_ADJUSTED_EXCESS_RETURN"),
+        (int(stability.get("seed_count", 0)) >= int(gate["minimum_seed_count"]), "SEED_COUNT"),
+        (float(stability.get("positive_seed_ratio", 0)) >= float(gate["minimum_positive_seed_ratio"]), "SEED_STABILITY"),
+    )
+    failures.extend(reason for passed, reason in checks if not passed)
+    if str(protocol.get("protocol_version", "legacy")) == "challenger_v2":
+        if int(research.get("universe_size", 0)) < int(gate.get("minimum_universe_size", 0)):
+            failures.append("UNIVERSE_SIZE")
+        lightgbm = metrics.get("qlib_lightgbm_alpha360_v1", {})
+        if gate.get("require_positive_lightgbm_rank_ic", False) and float(lightgbm.get("rank_ic", -1)) <= 0:
+            failures.append("CROSS_MODEL_LIGHTGBM_RANK_IC")
+    return not failures, failures
 
 
 def evaluate_forward_observations(

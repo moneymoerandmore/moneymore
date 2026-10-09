@@ -66,6 +66,21 @@ def test_same_session_is_idempotent(tmp_path: Path) -> None:
     assert second["fills"] == []
 
 
+def test_outage_replays_every_missing_us_session(tmp_path: Path) -> None:
+    paper = LeveragedEtfPaper(tmp_path / "us-etf.sqlite3", tmp_path / "cache")
+    full = _market()
+    partial = {symbol: frame.iloc[:-5].copy() for symbol, frame in full.items()}
+
+    first = paper.run(StaticClient(partial))
+    caught_up = paper.run(StaticClient(full))
+
+    assert first["latest_signal"]["signal_date"] == str(partial["QQQ"].iloc[-1]["trade_date"])
+    assert caught_up["latest_signal"]["signal_date"] == str(full["QQQ"].iloc[-1]["trade_date"])
+    assert len(caught_up["history"]) == 6
+    assert caught_up["fills"]
+    assert caught_up["positions"]
+
+
 def test_storage_is_not_the_moneymore_paper_broker_schema(tmp_path: Path) -> None:
     database = tmp_path / "us-etf.sqlite3"
     LeveragedEtfPaper(database, tmp_path / "cache")

@@ -48,7 +48,7 @@ from .intraday_execution import (
     prepare_intraday_branch_orders,
     run_baseline_intraday_once,
 )
-from .leveraged_etf import LeveragedEtfPaper
+from .leveraged_etf import LeveragedEtfPaper, LeveragedEtfScheduler
 from .long_term_review import evaluate_long_term_review
 from .market_risk import build_market_risk_snapshot
 from .model_registry import ModelRegistry
@@ -57,7 +57,7 @@ from .multi_sector_daily import (
     MULTI_SECTOR_ACCOUNT,
     run_multi_sector_daily,
 )
-from .open_execution import execute_accounts_at_qmt_open
+from .open_execution import execute_accounts_at_open, execute_accounts_at_qmt_open
 from .point_in_time import materialize_point_in_time_store
 from .portfolio_constructor import adjusted_close_panel, trailing_return_correlation
 from .qlib_candidate_observer import (
@@ -100,6 +100,10 @@ PAPER_DATABASE = STATE / "paper_orders.sqlite3"
 SERVICE_DATABASE = STATE / "service.sqlite3"
 LEVERAGED_ETF_DATABASE = STATE / "tqqq_sqqq_paper.sqlite3"
 LEVERAGED_ETF_CACHE = DATA / "leveraged-etf"
+leveraged_etf_paper_service = LeveragedEtfPaper(
+    LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE
+)
+leveraged_etf_scheduler = LeveragedEtfScheduler(leveraged_etf_paper_service)
 SYMBOL = "600036.SH"
 ACCOUNT = "default"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -223,6 +227,96 @@ def _live_account_snapshot() -> dict[str, object]:
             {"expires_at": clock.monotonic() + 4.0, "payload": payload}
         )
         return payload
+
+
+def _append_live_nav_points(
+    comparison: list[dict[str, object]],
+    live: dict[str, object],
+    store: ParquetStore,
+) -> list[dict[str, object]]:
+    """Overlay today's live account valuation on the close-based chart history.
+
+    The persisted account daily tables remain the official close ledger.  This
+    function only enriches the API response, scaling each live equity from its
+    own latest official account observation so a branch keeps its existing NAV
+    lineage.  The close pipeline naturally replaces the provisional point.
+    """
+    observed_at = str(live.get("observed_at") or "")
+    try:
+        trade_date = datetime.fromisoformat(observed_at).astimezone(SHANGHAI).strftime("%Y%m%d")
+    except ValueError:
+        return comparison
+    accounts = live.get("accounts")
+    if not isinstance(accounts, dict):
+        return comparison
+    specifications = {
+        "baseline": (MULTI_SECTOR_ACCOUNT, "multi_sector_account_daily", "原基线"),
+        "baseline_intraday": (INTRADAY_ACCOUNT, "baseline_intraday_account_daily", "基线 + 日内实时"),
+        "baseline_pysystemtrade": (
+            BASELINE_EXPOSURE_ACCOUNT,
+            "multi_sector_pysystemtrade_account_daily",
+            "基线 + pysystemtrade",
+        ),
+        "baseline_pysystemtrade_intraday": (
+            EXPOSURE_INTRADAY_ACCOUNT,
+            "baseline_pysystemtrade_intraday_account_daily",
+            "基线 + 仓位控制 + 日内实时",
+        ),
+    }
+    result = list(comparison)
+    for strategy_id, (account_id, table, label) in specifications.items():
+        account = accounts.get(account_id)
+        if not isinstance(account, dict):
+            continue
+        portfolio = account.get("portfolio")
+        if not isinstance(portfolio, dict) or portfolio.get("equity") is None:
+            continue
+        # Do not manufacture a new trading-day point from stale closing prices
+        # on weekends or during a QMT outage.  A real fill is sufficient evidence
+        # that the account changed even if the quote request itself degraded.
+        if live.get("quote_source") != "QMT_REALTIME" and not account.get("today_fills"):
+            continue
+        series = [row for row in result if row.get("strategy_id") == strategy_id]
+        if not series:
+            continue
+        try:
+            official = store.read(table).copy()
+        except FileNotFoundError:
+            continue
+        if official.empty or not {"trade_date", "equity"}.issubset(official.columns):
+            continue
+        official["trade_date"] = official["trade_date"].astype(str)
+        official["equity"] = pd.to_numeric(official["equity"], errors="coerce")
+        official = official.dropna(subset=["equity"]).sort_values("trade_date")
+        prior = official.loc[official["trade_date"] < trade_date]
+        if prior.empty:
+            # If the close job has already persisted today, use that row as the
+            # anchor and merely replace its chart value with the fresher mark.
+            prior = official.loc[official["trade_date"] <= trade_date]
+        if prior.empty:
+            continue
+        anchor = prior.iloc[-1]
+        anchor_date = str(anchor["trade_date"])
+        anchor_points = [row for row in series if str(row.get("trade_date")) == anchor_date]
+        if not anchor_points:
+            continue
+        anchor_nav = float(anchor_points[-1]["normalized_nav"])
+        anchor_equity = float(anchor["equity"])
+        live_equity = float(portfolio["equity"])
+        if anchor_equity <= 0:
+            continue
+        result.append(
+            {
+                "trade_date": trade_date,
+                "strategy_id": strategy_id,
+                "strategy": label,
+                "normalized_nav": anchor_nav * live_equity / anchor_equity,
+                "provisional": True,
+                "valuation_mode": str(live.get("quote_source") or "UNKNOWN"),
+                "observed_at": observed_at,
+            }
+        )
+    return result
 
 
 def _runtime_health_bus() -> dict[str, object]:
@@ -992,6 +1086,7 @@ class TaskService:
                         config=BacktestConfig.from_yaml(ROOT / "configs" / "default.yaml"),
                         trade_date=trade_date,
                         account_ids=[
+                            BANK_ACCOUNT,
                             MULTI_SECTOR_ACCOUNT,
                             BASELINE_EXPOSURE_ACCOUNT,
                             QLIB_CHALLENGER_ACCOUNT,
@@ -1309,6 +1404,39 @@ class TaskService:
                 return
             if result is not None and result.status != "COMPLETED":
                 raise RuntimeError(f"bank pipeline status: {result.status}")
+
+            if historical_recovery:
+                # The live scheduler normally executes every prior-session
+                # plan from QMT shortly after the open.  When the service or
+                # MiniQMT was offline, daily research alone is not enough:
+                # overlay accounts (notably the exposure-controlled baseline)
+                # otherwise retain old PENDING orders indefinitely.  Replay
+                # those orders at the immutable official daily open before
+                # generating this session's new targets.  PaperBroker keeps
+                # the operation idempotent, so already executed accounts are
+                # harmlessly skipped.
+                self._run_step(
+                    run_id,
+                    trade_date,
+                    "historical_open_execution_recovery",
+                    lambda: execute_accounts_at_open(
+                        store=store,
+                        broker=broker,
+                        config=config,
+                        trade_date=trade_date,
+                        account_ids=[
+                            BANK_ACCOUNT,
+                            MULTI_SECTOR_ACCOUNT,
+                            BASELINE_EXPOSURE_ACCOUNT,
+                            QLIB_CHALLENGER_ACCOUNT,
+                            *[
+                                candidate_account_id(str(row["candidate_tag"]))
+                                for row in candidate_catalog(ROOT)
+                            ],
+                        ],
+                        audit_dir=STATE / "open-execution-recovery",
+                    ),
+                )
 
             self._run_step(
                 run_id,
@@ -1704,7 +1832,9 @@ async def lifespan(_: FastAPI):
     task_service.start()
     weekly_training_service.start()
     finrl_training_service.start()
+    leveraged_etf_scheduler.start()
     yield
+    leveraged_etf_scheduler.stop()
     finrl_training_service.stop()
     weekly_training_service.stop()
     task_service.stop()
@@ -1739,13 +1869,17 @@ def health() -> dict[str, object]:
 
 @app.get("/api/leveraged-etf-paper")
 def leveraged_etf_paper() -> dict[str, object]:
-    return LeveragedEtfPaper(LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE).snapshot()
+    payload = leveraged_etf_paper_service.snapshot()
+    payload["scheduler"] = leveraged_etf_scheduler.status()
+    return payload
 
 
 @app.post("/api/leveraged-etf-paper/run")
 def run_leveraged_etf_paper() -> dict[str, object]:
     try:
-        return LeveragedEtfPaper(LEVERAGED_ETF_DATABASE, LEVERAGED_ETF_CACHE).run()
+        payload = leveraged_etf_paper_service.run()
+        payload["scheduler"] = leveraged_etf_scheduler.status()
+        return payload
     except Exception as error:
         raise HTTPException(status_code=503, detail=f"US ETF paper run failed: {error}") from error
 
@@ -1823,6 +1957,7 @@ def market_risk() -> dict[str, object]:
                 for row in controlled_intraday.to_dict("records")
             ]
         )
+    comparison = _append_live_nav_points(comparison, _live_account_snapshot(), store)
     # Intraday history may contain several account observations for one session.
     # Charts are daily, therefore the final observation for each strategy/date is
     # the only meaningful point.  This also bounds the API response size.

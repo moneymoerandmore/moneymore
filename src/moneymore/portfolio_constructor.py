@@ -21,6 +21,9 @@ def global_topk_portfolio(
     correlation_penalty: float = 0.0,
     cluster_correlation_threshold: float | None = None,
     maximum_cluster_members: int | None = None,
+    weighting_method: str = "rank_linear",
+    confidence_temperature: float = 1.0,
+    confidence_shrinkage: float = 0.35,
 ) -> tuple[list[str], dict[str, float], pd.DataFrame]:
     """Build one global rank portfolio; sector metadata is intentionally ignored."""
     if not 0 < top_k <= exit_rank:
@@ -61,7 +64,24 @@ def global_topk_portfolio(
     ][: max(0, top_k - len(held))]
     held.update(additions)
     selected = sorted(held, key=ranks.__getitem__)[:top_k]
-    raw = {symbol: float(top_k - index) for index, symbol in enumerate(selected)}
+    if weighting_method == "rank_linear":
+        raw = {symbol: float(top_k - index) for index, symbol in enumerate(selected)}
+    elif weighting_method == "confidence_softmax":
+        selected_scores = ranking.set_index(symbol_column).loc[selected, "score"].astype(float)
+        scale = float(selected_scores.std(ddof=0))
+        standardized = (
+            (selected_scores - float(selected_scores.mean())) / scale
+            if scale > 1e-12 else selected_scores * 0.0
+        )
+        temperature = max(float(confidence_temperature), 1e-6)
+        softmax = np.exp(np.clip(standardized.to_numpy() / temperature, -20, 20))
+        softmax = softmax / softmax.sum()
+        equal = np.full(len(selected), 1.0 / len(selected))
+        shrinkage = float(np.clip(confidence_shrinkage, 0.0, 1.0))
+        blended = shrinkage * equal + (1.0 - shrinkage) * softmax
+        raw = dict(zip(selected, blended, strict=True))
+    else:
+        raise ValueError(f"unsupported weighting_method: {weighting_method}")
     weights = _bounded_pro_rata(raw, gross_exposure, minimum_weight, maximum_weight)
     ranking["selected"] = ranking[symbol_column].astype(str).isin(selected)
     ranking["target_weight"] = ranking[symbol_column].astype(str).map(weights).fillna(0.0)

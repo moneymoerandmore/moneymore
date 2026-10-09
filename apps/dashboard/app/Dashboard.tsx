@@ -78,6 +78,7 @@ type LeveragedEtfPaper = {
   cash:number; market_value:number; equity:number; total_return:number; drawdown:number;
   positions:Row[]; latest_signal:(Row & { indicators?:Row })|null;
   orders:Row[]; fills:Row[]; history:Row[]; data_source:string; execution_policy:string;
+  scheduler?:Row;
 };
 type SecurityHistory = {
   symbol:string; name:string; bars:Row[]; fills:Row[];
@@ -275,7 +276,7 @@ export default function Dashboard() {
       {page === "sectors" && <SecurityAccountContext.Provider value="multi_sector_shadow"><SectorPage sectors={sectors}/></SecurityAccountContext.Provider>}
       {page === "research" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Research sectors={sectors} models={models}/></SecurityAccountContext.Provider>}
       {page === "risk" && <MarketRiskPage risk={marketRisk} live={live} names={sectors.symbol_names}/>}
-      {page === "leveraged" && <LeveragedEtfPage account={leveragedEtf} onRefresh={refresh}/>}
+      {page === "leveraged" && <LeveragedEtfPage account={leveragedEtf}/>}
       {page === "challenger" && <SecurityAccountContext.Provider value="qlib_gru_shadow"><ChallengerPage challenger={challenger} names={sectors.symbol_names} live={live}/><ChallengerEvidence challenger={challenger}/><PointInTimeEvidence challenger={challenger}/><GovernanceEvidence challenger={challenger}/><LongTermReview challenger={challenger}/></SecurityAccountContext.Provider>}
       {page === "data" && <DataHealth quality={quality}/>}
       {page === "operations" && <SecurityAccountContext.Provider value="multi_sector_shadow"><Operations bank={bank} execution={displayedExecution} operations={operations} acceptance={acceptance} intraday={intraday} live={live} names={sectors.symbol_names} onRefresh={refresh}/></SecurityAccountContext.Provider>}
@@ -283,23 +284,15 @@ export default function Dashboard() {
   </div>{(securityDetailLoading||securityDetailError||securityDetail)&&<SecurityHistoryModal detail={securityDetail} initialAccountId={securityDetailAccount} loading={securityDetailLoading} error={securityDetailError} onClose={()=>{setSecurityDetail(null);setSecurityDetailError("");}}/>}</SecurityNavigationContext.Provider>;
 }
 
-function LeveragedEtfPage({account,onRefresh}:{account:LeveragedEtfPaper;onRefresh:()=>Promise<void>}) {
-  const [running,setRunning]=useState(false);
-  const [runError,setRunError]=useState("");
+function LeveragedEtfPage({account}:{account:LeveragedEtfPaper}) {
   const signal=account.latest_signal;
   const indicators=signal?.indicators??{};
-  const run=async()=>{
-    setRunning(true);setRunError("");
-    try { await json<LeveragedEtfPaper>("/api/leveraged-etf-paper/run",{method:"POST"}); await onRefresh(); }
-    catch(reason) { setRunError(reason instanceof Error?reason.message:"美股 ETF 模拟盘运行失败"); }
-    finally { setRunning(false); }
-  };
   const allocationRows=signal?[{asset:"TQQQ",weight:signal.tqqq},{asset:"SQQQ",weight:signal.sqqq},{asset:"美元现金",weight:signal.cash}]:[];
   const history=account.history.map((row)=>({...row,normalized_nav:Number(row.equity)/account.initial_cash}));
   return <>
-    <section className="portfolio-hero leveraged-hero"><div><small>ISOLATED US ETF PAPER ACCOUNT</small><h2>TQQQ / SQQQ / Cash</h2><p>V5A VIX Spike · QQQ 趋势、波动率、MACD 与 VIX 联合择时</p><button className="primary" disabled={running} onClick={()=>void run()}>{running?"正在同步并计算…":"立即运行独立模拟盘"}</button></div><div className="exposure"><span>账户净值</span><b>{usd(account.equity)}</b><small>初始资金 {usd(account.initial_cash)} · {account.status}</small></div></section>
-    {runError&&<div className="error">{runError}</div>}
-    <section className="kpis"><Kpi label="累计收益" value={pct(account.total_return)} note="仅此独立美元账户" accent/><Kpi label="当前回撤" value={pct(account.drawdown)} note="相对账户历史峰值"/><Kpi label="美元现金" value={usd(account.cash)} note={`市值 ${usd(account.market_value)}`}/><Kpi label="最新信号" value={text(signal?.regime??"等待首次运行")} note={text(signal?.signal_date)}/></section>
+    <section className="portfolio-hero leveraged-hero"><div><small>ISOLATED US ETF PAPER ACCOUNT</small><h2>TQQQ / SQQQ / Cash</h2><p>V5A VIX Spike · QQQ 趋势、波动率、MACD 与 VIX 联合择时</p></div><div className="exposure"><span>账户净值</span><b>{usd(account.equity)}</b><small>初始资金 {usd(account.initial_cash)} · {account.status}</small></div></section>
+    <section className="kpis"><Kpi label="累计收益" value={pct(account.total_return)} note="仅此独立美元账户" accent/><Kpi label="当前回撤" value={pct(account.drawdown)} note="相对账户历史峰值"/><Kpi label="美元现金" value={usd(account.cash)} note={`市值 ${usd(account.market_value)}`}/><Kpi label="最新信号" value={text(signal?.regime??"等待首次运行")} note={`${text(signal?.signal_date)} · 调度${account.scheduler?.running?"正常":"停止"}`}/></section>
+    <Panel title="美股独立调度" subtitle="服务启动立即补齐缺失交易日；按 America/New_York 自动处理夏令时，不依赖 A 股流水线"><Table rows={account.scheduler?[account.scheduler]:[]} columns={[["running","运行中"],["last_startup_run","启动补跑"],["open_schedule","开盘执行"],["close_schedule","收盘计算"],["last_open_run","最近开盘任务"],["last_close_run","最近收盘任务"],["last_error","最近错误"]]} format={{running:(value)=>value?"是":"否"}}/></Panel>
     <div className="two-col"><Panel title="最新目标配置" subtitle="收盘生成目标；下一交易日开盘成交，不使用未来数据"><Table rows={allocationRows} columns={[["asset","资产"],["weight","目标权重"]]} format={{weight:pct}}/></Panel><Panel title="信号诊断" subtitle="参数独立冻结，不引用 MoneyMore 其他策略"><Table rows={signal?[{qqq_close:indicators.qqq_close,ma180:indicators.ma180,vix:indicators.vix,vix_sma20:indicators.vix_sma20,vol:indicators.annualized_volatility,macd:indicators.macd_histogram,slope:indicators.ma_slope,score:signal.score}]:[]} columns={[["qqq_close","QQQ"],["ma180","MA180"],["vix","VIX"],["vix_sma20","VIX MA20"],["vol","年化波动"],["macd","MACD柱"],["slope","MA斜率%"],["score","评分"]]} format={{qqq_close:num,ma180:num,vix:num,vix_sma20:num,vol:pct,macd:num,slope:num,score:num}}/></Panel></div>
     <div className="two-col"><Panel title="独立持仓" subtitle="不会进入 A 股账户、风控或策略 PK"><Table rows={account.positions} columns={[["symbol","标的"],["quantity","股数"],["avg_cost","均价"],["mark_price","现价"],["market_value","市值"],["unrealized_pnl","浮盈亏"]]} format={{avg_cost:usd,mark_price:usd,market_value:usd,unrealized_pnl:usd}}/></Panel><Panel title="待执行与历史订单" subtitle={account.execution_policy}><Table rows={account.orders.slice(0,30)} columns={[["signal_date","信号日"],["execution_date","执行日"],["symbol","标的"],["side","方向"],["quantity","数量"],["target_weight","目标权重"],["status","状态"],["reason","原因"]]} format={{target_weight:pct}}/></Panel></div>
     <Panel title="美元账户净值" subtitle={account.data_source}>{history.length?<LineComparisonChart title="独立模拟盘净值" subtitle="以 $100,000 为 100；不与人民币账户合并" series={[{accountId:account.account_id,label:"TQQQ/SQQQ V5A",color:"#ef7655",rows:history}]} valueKey="normalized_nav" formatValue={(value)=>`${(value*100).toFixed(2)}`} selectedAccountIds={new Set([account.account_id])} onToggle={()=>{}}/>:<p className="empty">首次运行后开始记录每日净值</p>}</Panel>

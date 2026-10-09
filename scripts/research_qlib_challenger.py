@@ -24,6 +24,7 @@ from moneymore.qlib_challenger import (
     challenger_universe,
     evaluate_predictions,
     metrics_payload,
+    rank_blend_predictions,
 )
 from moneymore.qlib_governance import register_qlib_candidate
 
@@ -135,6 +136,9 @@ def fit_and_evaluate(model_id: str, model: object) -> tuple[dict[str, object], o
             correlation_penalty=float(CONFIG["portfolio_policy"]["correlation_penalty"]),
             cluster_correlation_threshold=float(CONFIG["portfolio_policy"]["cluster_correlation_threshold"]),
             maximum_cluster_members=int(CONFIG["portfolio_policy"]["maximum_cluster_members"]),
+            weighting_method=str(CONFIG["portfolio_policy"].get("weighting_method", "rank_linear")),
+            confidence_temperature=float(CONFIG["portfolio_policy"].get("confidence_temperature", 1.0)),
+            confidence_shrinkage=float(CONFIG["portfolio_policy"].get("confidence_shrinkage", 0.35)),
             correlations=evaluation_correlations,
         )
         with (MODELS / f"{model_id}.pkl").open("wb") as handle:
@@ -153,7 +157,7 @@ lightgbm = LGBModel(
     reg_lambda=1.0,
     n_jobs=-1,
 )
-lightgbm_metrics, _ = fit_and_evaluate(
+lightgbm_metrics, lightgbm_predictions = fit_and_evaluate(
     "qlib_lightgbm_alpha360_v1",
     lightgbm,
 )
@@ -174,7 +178,14 @@ for seed in CONFIG["model"]["seeds"]:
     seed_predictions.append(predictions.rename(str(seed)))
     deployment_models.append(f"{seed_model_id}.pkl")
 
-ensemble_predictions = sum(seed_predictions) / len(seed_predictions)
+ensemble_config = CONFIG.get("ensemble", {})
+ensemble_predictions = rank_blend_predictions([
+    (lightgbm_predictions, float(ensemble_config.get("lightgbm_weight", 0.5))),
+    *[
+        (prediction, float(ensemble_config.get("gru_weight", 0.5)) / len(seed_predictions))
+        for prediction in seed_predictions
+    ],
+])
 labels = dataset.prepare("test", "label").iloc[:, 0]
 ensemble_metrics = metrics_payload(
     evaluate_predictions(
@@ -194,6 +205,9 @@ ensemble_metrics = metrics_payload(
         correlation_penalty=float(CONFIG["portfolio_policy"]["correlation_penalty"]),
         cluster_correlation_threshold=float(CONFIG["portfolio_policy"]["cluster_correlation_threshold"]),
         maximum_cluster_members=int(CONFIG["portfolio_policy"]["maximum_cluster_members"]),
+        weighting_method=str(CONFIG["portfolio_policy"].get("weighting_method", "rank_linear")),
+        confidence_temperature=float(CONFIG["portfolio_policy"].get("confidence_temperature", 1.0)),
+        confidence_shrinkage=float(CONFIG["portfolio_policy"].get("confidence_shrinkage", 0.35)),
         correlations=evaluation_correlations,
     )
 )
@@ -210,7 +224,16 @@ stability = {
 }
 ensemble_artifact = MODELS / f"{base_model_id}_ensemble.json"
 ensemble_artifact.write_text(
-    json.dumps({"models": deployment_models}, ensure_ascii=False, indent=2) + "\n",
+    json.dumps({
+        "method": "daily_rank_blend",
+        "models": [
+            {"filename": "qlib_lightgbm_alpha360_v1.pkl", "weight": float(ensemble_config.get("lightgbm_weight", 0.5))},
+            *[
+                {"filename": filename, "weight": float(ensemble_config.get("gru_weight", 0.5)) / len(deployment_models)}
+                for filename in deployment_models
+            ],
+        ],
+    }, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
 

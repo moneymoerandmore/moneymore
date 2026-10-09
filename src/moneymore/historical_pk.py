@@ -228,6 +228,10 @@ def build_qlib_targets(
     config = yaml.safe_load(
         (root / "configs" / "qlib_challenger.yaml").read_text(encoding="utf-8")
     )
+    research_path = root / "state" / "qlib-challenger" / "latest-research.json"
+    if research_path.exists():
+        saved = json.loads(research_path.read_text(encoding="utf-8"))
+        config = saved.get("protocol") or config
     frame = build_challenger_dataset(
         store,
         universe,
@@ -242,10 +246,18 @@ def build_qlib_targets(
         (model_dir / f"{config['model_id']}_ensemble.json").read_text(encoding="utf-8")
     )
     predictions = []
-    for filename in manifest["models"]:
+    for item in manifest["models"]:
+        filename = item["filename"] if isinstance(item, dict) else item
+        weight = float(item.get("weight", 1.0)) if isinstance(item, dict) else 1.0
         with (model_dir / filename).open("rb") as handle:
-            predictions.append(pickle.load(handle).predict(dataset, "test"))
-    scores = (sum(predictions) / len(predictions)).rename("score").reset_index()
+            predictions.append((pickle.load(handle).predict(dataset, "test"), weight))
+    from .qlib_challenger import rank_blend_predictions
+    blended = (
+        rank_blend_predictions(predictions)
+        if manifest.get("method") == "daily_rank_blend"
+        else sum(series for series, _ in predictions) / len(predictions)
+    )
+    scores = blended.rename("score").reset_index()
     scores["sector"] = scores["instrument"].map(universe)
     dates = sorted(pd.to_datetime(scores["datetime"].unique()))
     held: set[str] = set()
@@ -270,6 +282,9 @@ def build_qlib_targets(
                 correlation_penalty=float(policy["correlation_penalty"]),
                 cluster_correlation_threshold=float(policy["cluster_correlation_threshold"]),
                 maximum_cluster_members=int(policy["maximum_cluster_members"]),
+                weighting_method=str(policy.get("weighting_method", "rank_linear")),
+                confidence_temperature=float(policy.get("confidence_temperature", 1.0)),
+                confidence_shrinkage=float(policy.get("confidence_shrinkage", 0.35)),
             )
             held = set(selected)
         if (

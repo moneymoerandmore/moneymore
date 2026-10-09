@@ -10,6 +10,7 @@ from .config import BacktestConfig
 from .data.store import ParquetStore
 from .execution.paper import PaperBroker
 from .qlib_challenger_daily import ChallengerDailyResult, run_qlib_challenger_daily
+from .qlib_challenger import research_gate_diagnostics
 
 CANDIDATE_HISTORY_TABLE = "qlib_candidate_account_daily"
 
@@ -33,22 +34,14 @@ def candidate_catalog(root: Path) -> list[dict[str, Any]]:
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
         tag = str(payload.get("candidate_tag") or path.parent.name)
+        protocol = payload.get("protocol") or config
+        artifact_model_id = str(protocol.get("model_id", model_id))
         metric = next(
-            (row for row in payload.get("metrics", []) if row.get("model_id") == model_id),
+            (row for row in payload.get("metrics", []) if row.get("model_id") == artifact_model_id),
             {},
         )
         stability = payload.get("stability", {})
-        gate_passed = bool(
-            metric
-            and int(metric.get("samples", 0)) >= int(gate["minimum_samples"])
-            and float(metric.get("rank_ic", -1)) >= float(gate["minimum_rank_ic"])
-            and float(metric.get("rank_ic_ir", -1)) >= float(gate["minimum_rank_ic_ir"])
-            and float(metric.get("cost_adjusted_top_k_excess_return", -1))
-            > float(gate["minimum_cost_adjusted_excess_return"])
-            and int(stability.get("seed_count", 0)) >= int(gate["minimum_seed_count"])
-            and float(stability.get("positive_seed_ratio", 0))
-            >= float(gate["minimum_positive_seed_ratio"])
-        )
+        gate_passed, gate_failures = research_gate_diagnostics(payload, config)
         report_dir = root / "state" / "qlib-candidate-shadow" / tag
         reports = sorted(report_dir.glob("*.json")) if report_dir.exists() else []
         latest = (
@@ -81,6 +74,8 @@ def candidate_catalog(root: Path) -> list[dict[str, Any]]:
                 "average_turnover": metric.get("average_turnover"),
                 "positive_seed_ratio": stability.get("positive_seed_ratio"),
                 "research_gate_passed": gate_passed,
+                "research_gate_failures": gate_failures,
+                "protocol_version": protocol.get("protocol_version", "legacy"),
                 "observation_days": observation_days,
                 "latest_trade_date": latest.get("trade_date"),
                 "latest_status": latest.get("status", "AWAITING_OBSERVATION"),

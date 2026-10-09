@@ -18,6 +18,7 @@ from moneymore.qlib_challenger import (
     challenger_universe,
     evaluate_predictions,
     metrics_payload,
+    rank_blend_predictions,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +32,9 @@ ARTIFACTS = ROOT / "state" / "qlib-challenger"
 if ARGS.candidate_tag:
     ARTIFACTS = ARTIFACTS / "candidates" / str(ARGS.candidate_tag)
 MODELS = ARTIFACTS / "models"
+saved_research = ARTIFACTS / ("research.json" if ARGS.candidate_tag else "latest-research.json")
+if saved_research.exists():
+    CONFIG = json.loads(saved_research.read_text(encoding="utf-8")).get("protocol") or CONFIG
 
 store = ParquetStore(ROOT / "data")
 universe = challenger_universe(ROOT, store)
@@ -59,14 +63,16 @@ base_model_id = str(CONFIG["model_id"])
 manifest_path = MODELS / f"{base_model_id}_ensemble.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 seed_metrics = []
-seed_predictions = []
-for filename in manifest["models"]:
+model_metrics = []
+weighted_predictions = []
+for item in manifest["models"]:
+    filename = item["filename"] if isinstance(item, dict) else item
+    weight = float(item.get("weight", 1.0)) if isinstance(item, dict) else 1.0
     with (MODELS / filename).open("rb") as handle:
         model = pickle.load(handle)
     predictions = model.predict(dataset, "test")
-    seed_predictions.append(predictions)
-    seed_metrics.append(
-        metrics_payload(
+    weighted_predictions.append((predictions, weight))
+    metric_payload = metrics_payload(
             evaluate_predictions(
                 predictions,
                 dataset.prepare("test", "label").iloc[:, 0],
@@ -84,11 +90,20 @@ for filename in manifest["models"]:
                 correlation_penalty=float(CONFIG["portfolio_policy"]["correlation_penalty"]),
                 cluster_correlation_threshold=float(CONFIG["portfolio_policy"]["cluster_correlation_threshold"]),
                 maximum_cluster_members=int(CONFIG["portfolio_policy"]["maximum_cluster_members"]),
+                weighting_method=str(CONFIG["portfolio_policy"].get("weighting_method", "rank_linear")),
+                confidence_temperature=float(CONFIG["portfolio_policy"].get("confidence_temperature", 1.0)),
+                confidence_shrinkage=float(CONFIG["portfolio_policy"].get("confidence_shrinkage", 0.35)),
                 correlations=evaluation_correlations,
             )
         )
-    )
-ensemble_predictions = sum(seed_predictions) / len(seed_predictions)
+    if "_seed" in filename:
+        seed_metrics.append(metric_payload)
+    model_metrics.append(metric_payload)
+ensemble_predictions = (
+    rank_blend_predictions(weighted_predictions)
+    if manifest.get("method") == "daily_rank_blend"
+    else sum(series for series, _ in weighted_predictions) / len(weighted_predictions)
+)
 ensemble_metrics = metrics_payload(
     evaluate_predictions(
         ensemble_predictions,
@@ -107,6 +122,9 @@ ensemble_metrics = metrics_payload(
         correlation_penalty=float(CONFIG["portfolio_policy"]["correlation_penalty"]),
         cluster_correlation_threshold=float(CONFIG["portfolio_policy"]["cluster_correlation_threshold"]),
         maximum_cluster_members=int(CONFIG["portfolio_policy"]["maximum_cluster_members"]),
+        weighting_method=str(CONFIG["portfolio_policy"].get("weighting_method", "rank_linear")),
+        confidence_temperature=float(CONFIG["portfolio_policy"].get("confidence_temperature", 1.0)),
+        confidence_shrinkage=float(CONFIG["portfolio_policy"].get("confidence_shrinkage", 0.35)),
         correlations=evaluation_correlations,
     )
 )
@@ -119,7 +137,7 @@ payload = {
     "cuda_available": torch.cuda.is_available(),
     "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     "protocol": CONFIG,
-    "metrics": [*seed_metrics, ensemble_metrics],
+    "metrics": [*model_metrics, ensemble_metrics],
     "stability": {
         "seed_count": len(seed_metrics),
         "positive_seed_count": positive_seed_count,

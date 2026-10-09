@@ -44,3 +44,21 @@ def test_correlation_cluster_limits_duplicate_risk_without_sector_labels() -> No
         cluster_correlation_threshold=0.65, maximum_cluster_members=3,
     )
     assert len(set(selected) & set("ABCDEF")) == 3
+
+
+def test_confidence_weights_reflect_score_distance_with_bounds() -> None:
+    scores = pd.DataFrame({
+        "symbol": list("ABCDEFGHIJ"),
+        "score": [10.0, 4.0, 3.8, 3.6, 3.4, 3.2, 3.0, 2.8, 2.6, 2.4],
+    })
+    selected, weights, _ = global_topk_portfolio(
+        scores, set(), symbol_column="symbol", top_k=10, exit_rank=10,
+        max_replacements=10, minimum_weight=0.05, maximum_weight=0.15,
+        weighting_method="confidence_softmax", confidence_temperature=1.25,
+        confidence_shrinkage=0.45,
+    )
+    assert selected == list("ABCDEFGHIJ")
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["A"] == pytest.approx(0.15)
+    assert weights["A"] > weights["B"] > weights["J"]
+    assert min(weights.values()) >= 0.05 - 1e-12
