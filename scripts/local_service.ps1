@@ -87,7 +87,11 @@ function Write-SupervisorHeartbeat($Api, $Web) {
         api_running = $ApiHealthy
         web_running = $WebHealthy
     }
-    $Temporary = "$HeartbeatFile.tmp"
+    # A watchdog launch can briefly overlap an exiting supervisor.  A shared
+    # ``.tmp`` name lets those processes move/delete each other's file and was
+    # the cause of repeated empty/missing heartbeat alarms.  Each writer now
+    # owns its staging file; the final rename remains atomic for readers.
+    $Temporary = "$HeartbeatFile.$PID.tmp"
     $Payload | ConvertTo-Json -Compress | Set-Content -LiteralPath $Temporary
     Move-Item -LiteralPath $Temporary -Destination $HeartbeatFile -Force
 }
@@ -166,6 +170,27 @@ switch ($Action) {
     "Run" {
         Assert-Runtime
         Repair-VinextWindowsStaticPaths
+        $SupervisorMutex = [System.Threading.Mutex]::new(
+            $false,
+            "Local\MoneyMoreLocalServiceSupervisor"
+        )
+        $OwnsSupervisorMutex = $false
+        try {
+            try {
+                $OwnsSupervisorMutex = $SupervisorMutex.WaitOne(0)
+            } catch [System.Threading.AbandonedMutexException] {
+                $OwnsSupervisorMutex = $true
+            }
+            if (-not $OwnsSupervisorMutex) {
+                [pscustomobject]@{
+                    observed_at = [DateTimeOffset]::Now.ToString("o")
+                    event = "DUPLICATE_SUPERVISOR_SKIPPED"
+                    component = "supervisor"
+                    pid = $PID
+                    reason = "PROCESS_MUTEX_HELD"
+                } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
+                exit 0
+            }
         $ExistingSupervisor = Get-RecordedProcess $SupervisorPidFile
         if ($ExistingSupervisor -and $ExistingSupervisor.Id -ne $PID) {
             [pscustomobject]@{
@@ -226,9 +251,22 @@ switch ($Action) {
             } | ConvertTo-Json -Compress | Add-Content -LiteralPath $SupervisorEventLog
             throw
         } finally {
-            Stop-RecordedProcess (Join-Path $RuntimeDir "api.pid")
-            Stop-RecordedProcess (Join-Path $RuntimeDir "web.pid")
-            Remove-Item -LiteralPath $SupervisorPidFile, $StopFile, $HeartbeatFile -Force -ErrorAction SilentlyContinue
+            # Only the supervisor still registered as owner may clean shared
+            # runtime files.  An older, overlapping instance must never erase
+            # the replacement supervisor's heartbeat or child PID files.
+            $RecordedOwner = Get-RecordedProcess $SupervisorPidFile
+            if ($RecordedOwner -and $RecordedOwner.Id -eq $PID) {
+                Stop-RecordedProcess (Join-Path $RuntimeDir "api.pid")
+                Stop-RecordedProcess (Join-Path $RuntimeDir "web.pid")
+                Remove-Item -LiteralPath $SupervisorPidFile, $StopFile, $HeartbeatFile -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath "$HeartbeatFile.$PID.tmp" -Force -ErrorAction SilentlyContinue
+        }
+        } finally {
+            if ($OwnsSupervisorMutex) {
+                $SupervisorMutex.ReleaseMutex()
+            }
+            $SupervisorMutex.Dispose()
         }
     }
 }
