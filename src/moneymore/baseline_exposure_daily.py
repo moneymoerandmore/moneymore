@@ -15,6 +15,36 @@ from .signals import SignalDecision, write_signal_artifact
 BASELINE_EXPOSURE_ACCOUNT = "multi_sector_pysystemtrade_shadow"
 BASELINE_EXPOSURE_STRATEGY = "multi_sector_dynamic_v1_pysystemtrade"
 BASELINE_EXPOSURE_HISTORY = "multi_sector_pysystemtrade_account_daily"
+ASYMMETRIC_EXPOSURE_ACCOUNT = "multi_sector_pysystemtrade_asymmetric_shadow"
+ASYMMETRIC_EXPOSURE_STRATEGY = "multi_sector_dynamic_v1_pysystemtrade_asymmetric"
+ASYMMETRIC_EXPOSURE_HISTORY = "multi_sector_pysystemtrade_asymmetric_account_daily"
+TREND_CAP_EXPOSURE_ACCOUNT = "multi_sector_pysystemtrade_trend_cap_shadow"
+TREND_CAP_EXPOSURE_STRATEGY = "multi_sector_dynamic_v1_pysystemtrade_trend_cap"
+TREND_CAP_EXPOSURE_HISTORY = "multi_sector_pysystemtrade_trend_cap_account_daily"
+
+EXPOSURE_VARIANTS = {
+    "pysystemtrade_vol_target": {
+        "account_id": BASELINE_EXPOSURE_ACCOUNT,
+        "strategy_id": BASELINE_EXPOSURE_STRATEGY,
+        "history_table": BASELINE_EXPOSURE_HISTORY,
+        "slug": "baseline-pysystemtrade",
+        "label": "基线 + pysystemtrade",
+    },
+    "pysystemtrade_asymmetric": {
+        "account_id": ASYMMETRIC_EXPOSURE_ACCOUNT,
+        "strategy_id": ASYMMETRIC_EXPOSURE_STRATEGY,
+        "history_table": ASYMMETRIC_EXPOSURE_HISTORY,
+        "slug": "baseline-pysystemtrade-asymmetric",
+        "label": "基线 + 非对称调仓",
+    },
+    "pysystemtrade_trend_cap": {
+        "account_id": TREND_CAP_EXPOSURE_ACCOUNT,
+        "strategy_id": TREND_CAP_EXPOSURE_STRATEGY,
+        "history_table": TREND_CAP_EXPOSURE_HISTORY,
+        "slug": "baseline-pysystemtrade-trend-cap",
+        "label": "基线 + 趋势上限",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -33,16 +63,19 @@ def run_baseline_exposure_daily(
     *, store: ParquetStore, broker: PaperBroker, config: BacktestConfig,
     trade_date: str, baseline_report: dict[str, object], target_exposure: float,
     signal_dir: Path, report_dir: Path,
+    account_id: str = BASELINE_EXPOSURE_ACCOUNT,
+    strategy_id: str = BASELINE_EXPOSURE_STRATEGY,
+    history_table: str = BASELINE_EXPOSURE_HISTORY,
 ) -> BaselineExposureDailyResult:
     """Run an isolated paper account using baseline picks scaled by PST exposure."""
-    broker.initialize_account(config.initial_cash, BASELINE_EXPOSURE_ACCOUNT)
+    broker.initialize_account(config.initial_cash, account_id)
     base = {
         str(symbol): float(weight)
         for symbol, weight in dict(baseline_report.get("theoretical_target_weights") or baseline_report.get("target_weights") or {}).items()
     }
     exposure = min(1.0, max(0.0, float(target_exposure)))
     targets = {symbol: weight * exposure for symbol, weight in base.items()}
-    before = broker.account_snapshot({}, BASELINE_EXPOSURE_ACCOUNT)
+    before = broker.account_snapshot({}, account_id)
     held = {str(row["symbol"]) for row in before["positions"]}
     symbols = sorted(set(targets) | held)
     daily = store.read(
@@ -51,7 +84,7 @@ def run_baseline_exposure_daily(
     ) if symbols else pd.DataFrame()
     latest = daily.sort_values("trade_date").groupby("ts_code", as_index=False).tail(1) if not daily.empty else daily
     marks = {str(row["ts_code"]): float(row["close"]) for row in latest.to_dict("records")}
-    account = broker.account_snapshot(marks, BASELINE_EXPOSURE_ACCOUNT)
+    account = broker.account_snapshot(marks, account_id)
     positions = {str(row["symbol"]): row for row in account["positions"]}
     orders: list[dict[str, object]] = []
     for symbol in symbols:
@@ -61,7 +94,7 @@ def run_baseline_exposure_daily(
         target = float(targets.get(symbol, 0.0))
         position = positions.get(symbol, {})
         decision = SignalDecision(
-            strategy_id=BASELINE_EXPOSURE_STRATEGY, symbol=symbol,
+            strategy_id=strategy_id, symbol=symbol,
             as_of_date=trade_date, target_weight=target,
             action="HOLD" if target > 0 else "EXIT",
             reason_code="BASELINE_PYSYSTEMTRADE_TARGET" if target > 0 else "PORTFOLIO_EXIT",
@@ -77,13 +110,13 @@ def run_baseline_exposure_daily(
         )
         write_signal_artifact(decision, signal_dir)
         decision_status = broker.record_decision(decision)
-        submit_status = broker.submit(risk, BASELINE_EXPOSURE_ACCOUNT) if decision_status in {"RECORDED", "DUPLICATE"} else "DUPLICATE_DECISION"
+        submit_status = broker.submit(risk, account_id) if decision_status in {"RECORDED", "DUPLICATE"} else "DUPLICATE_DECISION"
         orders.append({"symbol": symbol, "target_weight": target, "decision_status": decision_status, "submit_status": submit_status, "rejection_code": risk.rejection_code})
-    portfolio = broker.account_snapshot(marks, BASELINE_EXPOSURE_ACCOUNT)
-    reconciliation = broker.reconcile(BASELINE_EXPOSURE_ACCOUNT).__dict__
+    portfolio = broker.account_snapshot(marks, account_id)
+    reconciliation = broker.reconcile(account_id).__dict__
     previous = None
     try:
-        history = store.read(BASELINE_EXPOSURE_HISTORY).sort_values("trade_date")
+        history = store.read(history_table).sort_values("trade_date")
         prior = history.loc[history["trade_date"].astype(str) < trade_date]
         if not prior.empty:
             previous = float(prior.iloc[-1]["equity"])
@@ -91,7 +124,7 @@ def run_baseline_exposure_daily(
         pass
     equity = float(portfolio["equity"])
     store.merge_curated(
-        BASELINE_EXPOSURE_HISTORY,
+        history_table,
         [pd.DataFrame([{
             "trade_date": trade_date, "status": "COMPLETED", "equity": equity,
             "cash": float(portfolio["cash"]), "market_value": float(portfolio["market_value"]),

@@ -26,8 +26,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .bank_daily import BANK_ACCOUNT, run_bank_daily_pipeline
 from .baseline_exposure_daily import (
+    ASYMMETRIC_EXPOSURE_ACCOUNT,
+    ASYMMETRIC_EXPOSURE_HISTORY,
     BASELINE_EXPOSURE_ACCOUNT,
     BASELINE_EXPOSURE_HISTORY,
+    EXPOSURE_VARIANTS,
+    TREND_CAP_EXPOSURE_ACCOUNT,
+    TREND_CAP_EXPOSURE_HISTORY,
     run_baseline_exposure_daily,
 )
 from .config import BacktestConfig
@@ -256,6 +261,16 @@ def _append_live_nav_points(
             BASELINE_EXPOSURE_ACCOUNT,
             "multi_sector_pysystemtrade_account_daily",
             "基线 + pysystemtrade",
+        ),
+        "baseline_pysystemtrade_asymmetric": (
+            ASYMMETRIC_EXPOSURE_ACCOUNT,
+            ASYMMETRIC_EXPOSURE_HISTORY,
+            "基线 + 非对称调仓",
+        ),
+        "baseline_pysystemtrade_trend_cap": (
+            TREND_CAP_EXPOSURE_ACCOUNT,
+            TREND_CAP_EXPOSURE_HISTORY,
+            "基线 + 趋势上限",
         ),
         "baseline_pysystemtrade_intraday": (
             EXPOSURE_INTRADAY_ACCOUNT,
@@ -1089,6 +1104,8 @@ class TaskService:
                             BANK_ACCOUNT,
                             MULTI_SECTOR_ACCOUNT,
                             BASELINE_EXPOSURE_ACCOUNT,
+                            ASYMMETRIC_EXPOSURE_ACCOUNT,
+                            TREND_CAP_EXPOSURE_ACCOUNT,
                             QLIB_CHALLENGER_ACCOUNT,
                             *[
                                 candidate_account_id(str(row["candidate_tag"]))
@@ -1428,6 +1445,8 @@ class TaskService:
                             BANK_ACCOUNT,
                             MULTI_SECTOR_ACCOUNT,
                             BASELINE_EXPOSURE_ACCOUNT,
+                            ASYMMETRIC_EXPOSURE_ACCOUNT,
+                            TREND_CAP_EXPOSURE_ACCOUNT,
                             QLIB_CHALLENGER_ACCOUNT,
                             *[
                                 candidate_account_id(str(row["candidate_tag"]))
@@ -1576,31 +1595,44 @@ class TaskService:
                 )
             if multi_result is not None:
                 try:
-                    def execute_baseline_exposure() -> Any:
+                    def execute_baseline_exposure_league() -> Any:
                         daily_path = DATA / "processed" / "daily.parquet"
                         snapshot = build_market_risk_snapshot(
                             str(DATA), daily_path.stat().st_mtime_ns
                         )
-                        contestant = snapshot["exposure_league"]["contestants"][0]
-                        return run_baseline_exposure_daily(
-                            store=store,
-                            broker=broker,
-                            config=config,
-                            trade_date=trade_date,
-                            baseline_report=asdict(multi_result),
-                            target_exposure=float(contestant["target_exposure"]),
-                            signal_dir=STATE / "baseline-pysystemtrade-signals",
-                            report_dir=STATE / "baseline-pysystemtrade-shadow",
-                        )
+                        contestants = {
+                            str(row["method_id"]): row
+                            for row in snapshot["exposure_league"]["contestants"]
+                        }
+                        results = {}
+                        for method_id, variant in EXPOSURE_VARIANTS.items():
+                            contestant = contestants.get(method_id)
+                            if contestant is None or contestant.get("target_exposure") is None:
+                                continue
+                            slug = str(variant["slug"])
+                            results[method_id] = run_baseline_exposure_daily(
+                                store=store,
+                                broker=broker,
+                                config=config,
+                                trade_date=trade_date,
+                                baseline_report=asdict(multi_result),
+                                target_exposure=float(contestant["target_exposure"]),
+                                signal_dir=STATE / f"{slug}-signals",
+                                report_dir=STATE / f"{slug}-shadow",
+                                account_id=str(variant["account_id"]),
+                                strategy_id=str(variant["strategy_id"]),
+                                history_table=str(variant["history_table"]),
+                            )
+                        return results
                     self._run_step(
                         run_id,
                         trade_date,
-                        "baseline_pysystemtrade_execution",
-                        execute_baseline_exposure,
+                        "baseline_exposure_league_execution",
+                        execute_baseline_exposure_league,
                     )
                 except Exception as overlay_error:  # noqa: BLE001
                     strategy_failures.append(
-                        f"baseline_pysystemtrade_execution: {type(overlay_error).__name__}: {overlay_error}"
+                        f"baseline_exposure_league_execution: {type(overlay_error).__name__}: {overlay_error}"
                     )
             independent_steps = [
                 (
@@ -1911,12 +1943,43 @@ def market_risk() -> dict[str, object]:
     )
     broker = PaperBroker(PAPER_DATABASE)
     broker.initialize_account(1_000_000, BASELINE_EXPOSURE_ACCOUNT)
+    broker.initialize_account(1_000_000, ASYMMETRIC_EXPOSURE_ACCOUNT)
+    broker.initialize_account(1_000_000, TREND_CAP_EXPOSURE_ACCOUNT)
     try:
         history = _records(ParquetStore(DATA).read(BASELINE_EXPOSURE_HISTORY).sort_values("trade_date"))
     except FileNotFoundError:
         history = []
     comparison = list(payload["exposure_league"].get("strategy_comparison", []))
     store = ParquetStore(DATA)
+    for method_id, variant in EXPOSURE_VARIANTS.items():
+        if method_id == "pysystemtrade_vol_target":
+            continue
+        strategy_id = f"baseline_{method_id}"
+        theoretical = [
+            row for row in comparison if row.get("strategy_id") == strategy_id
+        ]
+        try:
+            actual = store.read(str(variant["history_table"])).sort_values("trade_date")
+        except FileNotFoundError:
+            actual = pd.DataFrame()
+        if actual.empty or not theoretical:
+            continue
+        first = str(actual.iloc[0]["trade_date"])
+        lineage = [row for row in theoretical if str(row["trade_date"]) < first]
+        base_nav = float(lineage[-1]["normalized_nav"]) if lineage else 1.0
+        first_equity = float(actual.iloc[0]["equity"])
+        comparison.extend(
+            [
+                {
+                    "trade_date": str(row["trade_date"]),
+                    "strategy_id": strategy_id,
+                    "strategy": str(variant["label"]),
+                    "normalized_nav": base_nav * float(row["equity"]) / first_equity,
+                    "history_source": "INDEPENDENT_PAPER_ACCOUNT",
+                }
+                for row in actual.to_dict("records")
+            ]
+        )
     try:
         baseline_history = store.read("multi_sector_account_daily").sort_values("trade_date")
         intraday_history = store.read("baseline_intraday_account_daily").sort_values("trade_date")
@@ -1980,6 +2043,16 @@ def market_risk() -> dict[str, object]:
             "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == BASELINE_EXPOSURE_ACCOUNT][:100],
             "fills": broker.fills(BASELINE_EXPOSURE_ACCOUNT)[-100:],
             "history": history,
+        },
+        "baseline_pysystemtrade_asymmetric": {
+            "account_id": ASYMMETRIC_EXPOSURE_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == ASYMMETRIC_EXPOSURE_ACCOUNT][:100],
+            "fills": broker.fills(ASYMMETRIC_EXPOSURE_ACCOUNT)[-100:],
+        },
+        "baseline_pysystemtrade_trend_cap": {
+            "account_id": TREND_CAP_EXPOSURE_ACCOUNT,
+            "orders": [row for row in reversed(broker.orders()) if row.get("account_id") == TREND_CAP_EXPOSURE_ACCOUNT][:100],
+            "fills": broker.fills(TREND_CAP_EXPOSURE_ACCOUNT)[-100:],
         },
         "baseline_intraday": {
             "account_id": INTRADAY_ACCOUNT,
@@ -2172,6 +2245,8 @@ def _open_execution_status(trade_date: str) -> dict[str, object]:
     account_ids = [
         MULTI_SECTOR_ACCOUNT,
         BASELINE_EXPOSURE_ACCOUNT,
+        ASYMMETRIC_EXPOSURE_ACCOUNT,
+        TREND_CAP_EXPOSURE_ACCOUNT,
         EXPOSURE_INTRADAY_ACCOUNT,
         QLIB_CHALLENGER_ACCOUNT,
         *[candidate_account_id(str(row["candidate_tag"])) for row in candidate_catalog(ROOT)],

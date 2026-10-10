@@ -29,6 +29,25 @@ contestants:
     local_constraint:
       maximum_exposure: 1.0
       reason: A-share long-only cash account does not use leverage
+  - method_id: pysystemtrade_asymmetric
+    framework: pysystemtrade
+    stage: forward_challenger
+    parent: pysystemtrade_vol_target
+    execution_overlay:
+      risk_off: immediate
+      risk_on_step: 0.10
+      absolute_no_trade_band: 0.07
+    isolation: independent_paper_account
+  - method_id: pysystemtrade_trend_cap
+    framework: pysystemtrade
+    stage: forward_challenger
+    parent: pysystemtrade_vol_target
+    trend_model:
+      family: pysystemtrade_ewmac
+      horizons: [[16, 64], [32, 128]]
+      caps: [0.35, 0.70, 1.00]
+      combination: minimum_of_vol_target_and_trend_cap
+    isolation: independent_paper_account
   - method_id: skfolio_cash_allocator
     framework: skfolio
     stage: ready

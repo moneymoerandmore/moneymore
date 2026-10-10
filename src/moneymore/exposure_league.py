@@ -139,6 +139,87 @@ class PysystemtradeVolTargetPolicy:
         )
 
 
+class PysystemtradeAsymmetricPolicy:
+    """Managed-volatility challenger with fast cuts and gradual re-risking."""
+
+    method_id = "pysystemtrade_asymmetric"
+    framework = "pysystemtrade"
+
+    def __init__(self, no_trade_band: float = 0.07, risk_on_step: float = 0.10) -> None:
+        self.no_trade_band = no_trade_band
+        self.risk_on_step = risk_on_step
+        self.base = PysystemtradeVolTargetPolicy(buffer_size=0.0)
+
+    def decide(self, context: ExposureContext) -> ExposureDecision:
+        raw = self.base.decide(
+            ExposureContext(
+                context.as_of_date,
+                context.risky_asset_returns,
+                context.cash_returns,
+                None,
+            )
+        )
+        if raw.target_exposure is None:
+            return ExposureDecision(
+                self.method_id, self.framework, context.as_of_date, raw.status,
+                None, "pst-asymmetric-v1", raw.trained_until,
+                raw.explanation,
+            )
+        desired = float(raw.target_exposure)
+        previous = context.previous_exposure
+        if previous is None or desired < previous:
+            target = desired
+            action = "风险上升立即降仓"
+        else:
+            candidate = min(desired, previous + self.risk_on_step)
+            target = previous if candidate - previous < self.no_trade_band else candidate
+            action = "风险恢复分步加仓"
+        return ExposureDecision(
+            self.method_id, self.framework, context.as_of_date, "READY", float(target),
+            "pst-asymmetric-v1", context.as_of_date,
+            f"pysystemtrade波动目标{desired:.2%}；{action}；"
+            f"加仓步长{self.risk_on_step:.0%}；不交易带{self.no_trade_band:.0%}",
+        )
+
+
+class PysystemtradeTrendCapPolicy:
+    """Volatility target capped by a point-in-time EWMAC trend state."""
+
+    method_id = "pysystemtrade_trend_cap"
+    framework = "pysystemtrade"
+
+    def __init__(self) -> None:
+        self.base = PysystemtradeVolTargetPolicy()
+
+    def decide(self, context: ExposureContext) -> ExposureDecision:
+        raw = self.base.decide(context)
+        returns = pd.Series(context.risky_asset_returns, dtype=float).replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if raw.target_exposure is None or len(returns) < 128:
+            return ExposureDecision(
+                self.method_id, self.framework, context.as_of_date,
+                "INSUFFICIENT_HISTORY" if len(returns) < 128 else raw.status,
+                None, "pst-ewmac-trend-cap-v1", context.as_of_date,
+                "趋势上限至少需要128个风险资产收益观测",
+            )
+        synthetic_price = (1.0 + returns).cumprod()
+        fast16 = synthetic_price.ewm(span=16, adjust=False).mean().iloc[-1]
+        slow64 = synthetic_price.ewm(span=64, adjust=False).mean().iloc[-1]
+        fast32 = synthetic_price.ewm(span=32, adjust=False).mean().iloc[-1]
+        slow128 = synthetic_price.ewm(span=128, adjust=False).mean().iloc[-1]
+        positive = int(fast16 > slow64) + int(fast32 > slow128)
+        trend_cap = (0.35, 0.70, 1.00)[positive]
+        target = min(float(raw.target_exposure), trend_cap)
+        state = ("双周期下降", "趋势分歧", "双周期上升")[positive]
+        return ExposureDecision(
+            self.method_id, self.framework, context.as_of_date, "READY", target,
+            "pst-ewmac-trend-cap-v1", context.as_of_date,
+            f"pysystemtrade波动目标{float(raw.target_exposure):.2%}；"
+            f"EWMAC 16/64与32/128：{state}；趋势仓位上限{trend_cap:.0%}",
+        )
+
+
 class SkfolioCashAllocatorPolicy:
     """Native skfolio mean-risk allocator with time-aware model selection."""
 
@@ -378,6 +459,8 @@ def initial_exposure_league(
     """Declare the four adapters without fabricating untrained model outputs."""
     policies: list[ExposurePolicy] = [
         PysystemtradeVolTargetPolicy(),
+        PysystemtradeAsymmetricPolicy(),
+        PysystemtradeTrendCapPolicy(),
         SkfolioCashAllocatorPolicy(),
         FinRLExposurePolicy(root),
         DeepDowExposurePolicy(root),
@@ -385,7 +468,7 @@ def initial_exposure_league(
     previous_by_method = previous_exposures or {}
     records = []
     for policy in policies:
-        fallback = previous_exposure if policy.method_id == "pysystemtrade_vol_target" else None
+        fallback = previous_exposure if policy.method_id.startswith("pysystemtrade_") else None
         context = ExposureContext(
             as_of_date,
             risky_asset_returns,
@@ -415,6 +498,26 @@ def build_pysystemtrade_exposure_history(
                 cash_returns=(),
                 previous_exposure=previous,
             )
+        )
+        if decision.target_exposure is not None:
+            previous = decision.target_exposure
+        history.append(decision.to_record())
+    return history
+
+
+def build_exposure_policy_history(
+    dated_returns: list[tuple[str, float]], policy: ExposurePolicy,
+    initial_exposure: float | None = None,
+) -> list[dict[str, object]]:
+    """Run any scalar exposure policy point-in-time with its own carried state."""
+    observed: list[float] = []
+    previous = initial_exposure
+    history: list[dict[str, object]] = []
+    for trade_date, daily_return in dated_returns:
+        if np.isfinite(daily_return):
+            observed.append(float(daily_return))
+        decision = policy.decide(
+            ExposureContext(str(trade_date), tuple(observed), (), previous)
         )
         if decision.target_exposure is not None:
             previous = decision.target_exposure

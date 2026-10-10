@@ -7,14 +7,19 @@ import pandas as pd
 
 from .data.store import ParquetStore
 from .exposure_league import (
+    PysystemtradeAsymmetricPolicy,
+    PysystemtradeTrendCapPolicy,
+    build_exposure_policy_history,
     build_pysystemtrade_exposure_history,
-    initial_exposure_league,
 )
 
 
 def build_baseline_overlay_comparison(
     baseline: pd.DataFrame,
     exposure_history: list[dict[str, object]],
+    *,
+    strategy_id: str = "baseline_pysystemtrade",
+    strategy: str = "基线 + pysystemtrade",
 ) -> list[dict[str, object]]:
     """Build an auditable close-to-close counterfactual for the exposure overlay.
 
@@ -59,7 +64,7 @@ def build_baseline_overlay_comparison(
     for row in frame.to_dict("records"):
         common = {"trade_date": str(row["trade_date"])}
         rows.append({**common, "strategy_id": "baseline", "strategy": "原基线", "normalized_nav": float(row["baseline_nav"])})
-        rows.append({**common, "strategy_id": "baseline_pysystemtrade", "strategy": "基线 + pysystemtrade", "normalized_nav": float(row["overlay_nav"]), "target_exposure": float(row["overlay_exposure"]) if pd.notna(row["overlay_exposure"]) else None})
+        rows.append({**common, "strategy_id": strategy_id, "strategy": strategy, "normalized_nav": float(row["overlay_nav"]), "target_exposure": float(row["overlay_exposure"]) if pd.notna(row["overlay_exposure"]) else None})
     return rows
 
 
@@ -103,33 +108,45 @@ def build_market_risk_snapshot(
         coverage=("return", "count"),
     ).sort_index()
     latest = daily.dropna(subset=["proxy_return"]).iloc[-1]
-    pst_history = build_pysystemtrade_exposure_history(
-        [(str(date), float(value)) for date, value in daily["proxy_return"].dropna().items()]
+    dated_returns = [
+        (str(date), float(value))
+        for date, value in daily["proxy_return"].dropna().items()
+    ]
+    pst_history = build_pysystemtrade_exposure_history(dated_returns)
+    asymmetric_history = build_exposure_policy_history(
+        dated_returns, PysystemtradeAsymmetricPolicy()
     )
-    league_history = pst_history
-    contestants = initial_exposure_league(
-        str(latest.name),
-        tuple(daily["proxy_return"].dropna().astype(float).tolist()),
-        next(
-            (float(row["target_exposure"]) for row in reversed(pst_history[:-1])
-             if row["target_exposure"] is not None), None,
-        ),
-        Path(data_root).resolve().parent,
-        {
-            "pysystemtrade_vol_target": next(
-                (float(row["target_exposure"]) for row in reversed(pst_history[:-1])
-                 if row["target_exposure"] is not None), None,
-            ),
-        },
+    trend_history = build_exposure_policy_history(
+        dated_returns, PysystemtradeTrendCapPolicy()
     )
+    league_history = pst_history + asymmetric_history + trend_history
+    history_by_method = {
+        "pysystemtrade_vol_target": pst_history,
+        "pysystemtrade_asymmetric": asymmetric_history,
+        "pysystemtrade_trend_cap": trend_history,
+    }
     effective_contestants = [
-        row for row in contestants if row["framework"] == "pysystemtrade"
+        rows[-1] for rows in history_by_method.values() if rows
     ]
     try:
         baseline = store.read("multi_sector_account_daily")
     except FileNotFoundError:
         baseline = pd.DataFrame()
     comparison = build_baseline_overlay_comparison(baseline, pst_history)
+    comparison.extend(
+        row for row in build_baseline_overlay_comparison(
+            baseline, asymmetric_history,
+            strategy_id="baseline_pysystemtrade_asymmetric",
+            strategy="基线 + 非对称调仓",
+        ) if row["strategy_id"] != "baseline"
+    )
+    comparison.extend(
+        row for row in build_baseline_overlay_comparison(
+            baseline, trend_history,
+            strategy_id="baseline_pysystemtrade_trend_cap",
+            strategy="基线 + 趋势上限",
+        ) if row["strategy_id"] != "baseline"
+    )
     return {
         "status": "RESEARCH_ONLY",
         "as_of_date": str(latest.name),

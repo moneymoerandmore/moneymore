@@ -4,6 +4,8 @@ import pandas as pd
 from moneymore.exposure_league import (
     ExposureContext,
     ExposureDecision,
+    PysystemtradeAsymmetricPolicy,
+    PysystemtradeTrendCapPolicy,
     PysystemtradeVolTargetPolicy,
     SkfolioCashAllocatorPolicy,
     build_pysystemtrade_exposure_history,
@@ -67,6 +69,30 @@ def test_pysystemtrade_history_is_point_in_time_and_carries_exposure():
     ready = [row for row in rows if row["status"] == "READY"]
     assert ready
     assert all(0 <= float(row["target_exposure"]) <= 1 for row in ready)
+
+
+def test_asymmetric_policy_cuts_immediately_and_re_risks_by_step():
+    volatile = tuple([0.03, -0.03] * 80)
+    quiet = tuple([0.003, -0.003] * 80)
+    policy = PysystemtradeAsymmetricPolicy(no_trade_band=0.0, risk_on_step=0.10)
+    cut = policy.decide(ExposureContext("20260911", volatile, (), 0.90))
+    add = policy.decide(ExposureContext("20260912", quiet, (), 0.40))
+    assert float(cut.target_exposure) < 0.90
+    assert float(add.target_exposure) == pytest.approx(0.50)
+
+
+def test_trend_cap_never_exceeds_volatility_target():
+    up = tuple([0.002] * 150)
+    down = tuple([-0.002] * 150)
+    policy = PysystemtradeTrendCapPolicy()
+    up_decision = policy.decide(ExposureContext("20260911", up, (), None))
+    down_decision = policy.decide(ExposureContext("20260911", down, (), None))
+    raw = PysystemtradeVolTargetPolicy().decide(
+        ExposureContext("20260911", down, (), None)
+    )
+    assert 0 <= float(up_decision.target_exposure) <= 1
+    assert float(down_decision.target_exposure) <= float(raw.target_exposure)
+    assert "EWMAC" in down_decision.explanation
 
 
 def test_baseline_overlay_uses_prior_day_exposure_without_mutating_baseline():
