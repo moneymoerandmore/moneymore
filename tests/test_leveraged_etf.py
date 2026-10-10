@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from moneymore.leveraged_etf import ACCOUNT_ID, INITIAL_CASH, LeveragedEtfPaper
 
@@ -64,6 +65,23 @@ def test_same_session_is_idempotent(tmp_path: Path) -> None:
     assert len(second["orders"]) == len(first["orders"])
     assert second["cash"] == first["cash"]
     assert second["fills"] == []
+
+
+def test_managed_layer_reduces_risk_fast_and_rebuilds_slowly() -> None:
+    calm = _market()
+    rebuilding = LeveragedEtfPaper.allocation(calm, previous_tqqq=0.20)
+    inside_band = LeveragedEtfPaper.allocation(calm, previous_tqqq=0.95)
+
+    assert rebuilding.base_tqqq == 1.0
+    assert rebuilding.tqqq == 0.30
+    assert inside_band.tqqq == 0.95
+
+    reduced, position_volatility, scalar = LeveragedEtfPaper.manage_tqqq(
+        base_tqqq=1.0, qqq_volatility=0.40, previous_tqqq=1.0
+    )
+    assert position_volatility == pytest.approx(1.20)
+    assert scalar < 0.50
+    assert reduced < 0.50
 
 
 def test_outage_replays_every_missing_us_session(tmp_path: Path) -> None:

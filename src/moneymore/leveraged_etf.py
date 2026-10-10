@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 ACCOUNT_ID = "tqqq_sqqq_v5a_paper"
-STRATEGY_ID = "v5a_vix_spike"
+STRATEGY_ID = "v5a_managed_vol_v1"
 INITIAL_CASH = 100_000.0
 TRADE_SYMBOLS = ("TQQQ", "SQQQ")
 DATA_SYMBOLS = ("QQQ", "TQQQ", "SQQQ", "^VIX")
@@ -36,6 +36,11 @@ class Allocation:
     annualized_volatility: float
     macd_histogram: float
     ma_slope: float
+    base_tqqq: float
+    estimated_position_volatility: float
+    risk_scalar: float
+    no_trade_band: float
+    risk_on_step: float
 
 
 class YahooDailyClient:
@@ -166,7 +171,24 @@ class LeveragedEtfPaper:
         }
 
     @staticmethod
-    def allocation(data: dict[str, pd.DataFrame], index: int = -1) -> Allocation:
+    def manage_tqqq(base_tqqq: float, qqq_volatility: float, previous_tqqq: float | None) -> tuple[float, float, float]:
+        """Apply the frozen managed-volatility layer to a raw V5A target."""
+        estimated_position_volatility = 3.0 * qqq_volatility
+        risk_scalar = min(1.0, 0.50 / max(estimated_position_volatility, 1e-8))
+        desired_tqqq = base_tqqq * risk_scalar
+        no_trade_band = 0.07
+        risk_on_step = 0.10
+        if previous_tqqq is None or desired_tqqq < previous_tqqq:
+            managed = desired_tqqq
+        else:
+            candidate = min(desired_tqqq, previous_tqqq + risk_on_step)
+            managed = candidate if abs(candidate - previous_tqqq) >= no_trade_band else previous_tqqq
+        return managed, estimated_position_volatility, risk_scalar
+
+    @staticmethod
+    def allocation(
+        data: dict[str, pd.DataFrame], index: int = -1, previous_tqqq: float | None = None
+    ) -> Allocation:
         qqq = data["QQQ"].copy()
         close = qqq["close"].astype(float)
         returns = close.pct_change()
@@ -180,7 +202,10 @@ class LeveragedEtfPaper:
         vix = data["^VIX"]["close"].astype(float)
         vix_sma20 = vix.rolling(20).mean()
         position = index if index >= 0 else len(qqq) + index
-        values = [ma180.iloc[position], volatility.iloc[position], histogram.iloc[position], slope.iloc[position], vix_sma20.iloc[position]]
+        values = [
+            ma180.iloc[position], volatility.iloc[position],
+            histogram.iloc[position], slope.iloc[position], vix_sma20.iloc[position],
+        ]
         if any(pd.isna(value) for value in values):
             raise RuntimeError("strategy indicators are not ready")
         price = float(close.iloc[position])
@@ -223,12 +248,24 @@ class LeveragedEtfPaper:
             else:
                 tqqq = 0.0
             sqqq, regime = 0.0, "BULL" if tqqq else "CASH"
+        base_tqqq = tqqq
+        tqqq, estimated_position_volatility, risk_scalar = LeveragedEtfPaper.manage_tqqq(
+            base_tqqq, vol, previous_tqqq
+        )
+        no_trade_band = 0.07
+        risk_on_step = 0.10
+        if sqqq > 0:
+            tqqq = 0.0
+        cash = 1 - tqqq - sqqq
         return Allocation(
             signal_date=str(qqq.iloc[position]["trade_date"]), regime=regime,
-            tqqq=round(tqqq, 6), sqqq=round(sqqq, 6), cash=round(1 - tqqq - sqqq, 6),
+            tqqq=round(tqqq, 6), sqqq=round(sqqq, 6), cash=round(cash, 6),
             score=round(score, 4), qqq_close=price, ma180=long_ma, vix=vix_value,
             vix_sma20=vix_average, annualized_volatility=vol,
-            macd_histogram=hist, ma_slope=ma_slope,
+            macd_histogram=hist, ma_slope=ma_slope, base_tqqq=round(base_tqqq, 6),
+            estimated_position_volatility=round(estimated_position_volatility, 6),
+            risk_scalar=round(risk_scalar, 6), no_trade_band=no_trade_band,
+            risk_on_step=risk_on_step,
         )
 
     def run(self, client: YahooDailyClient | None = None) -> dict[str, object]:
@@ -248,8 +285,11 @@ class LeveragedEtfPaper:
 
     def _run_aligned(self, data: dict[str, pd.DataFrame]) -> dict[str, object]:
         with self._connect() as connection:
-            row = connection.execute("SELECT MAX(signal_date) FROM signals").fetchone()
-            last_signal_date = None if row is None else row[0]
+            recent = connection.execute(
+                "SELECT signal_date, tqqq FROM signals ORDER BY signal_date DESC LIMIT 2"
+            ).fetchall()
+            last_signal_date = None if not recent else str(recent[0]["signal_date"])
+            previous_tqqq = None if not recent else float(recent[0]["tqqq"])
         indices = [
             index
             for index, trade_date in enumerate(data["QQQ"]["trade_date"].astype(str))
@@ -266,8 +306,13 @@ class LeveragedEtfPaper:
             closes = {symbol: float(data[symbol].iloc[index]["close"]) for symbol in TRADE_SYMBOLS}
             self._execute_pending(trade_date, opens)
             self._record_equity(trade_date, closes)
-            self._queue(self.allocation(data, index), closes)
+            allocation = self.allocation(data, index, previous_tqqq=previous_tqqq)
+            self._queue(allocation, closes)
+            previous_tqqq = allocation.tqqq
         closes = {symbol: float(data[symbol].iloc[-1]["close"]) for symbol in TRADE_SYMBOLS}
+        if not indices and last_signal_date == str(data["QQQ"].iloc[-1]["trade_date"]):
+            prior_tqqq = float(recent[1]["tqqq"]) if len(recent) > 1 else None
+            self._queue(self.allocation(data, -1, previous_tqqq=prior_tqqq), closes)
         return self.snapshot(closes)
 
     def run_open(self, client: YahooDailyClient | None = None) -> dict[str, object]:
@@ -338,18 +383,37 @@ class LeveragedEtfPaper:
     def _queue(self, allocation: Allocation, closes: dict[str, float]) -> None:
         weights = {"TQQQ": allocation.tqqq, "SQQQ": allocation.sqqq}
         with self._connect() as connection:
-            if connection.execute("SELECT 1 FROM signals WHERE signal_date=?", (allocation.signal_date,)).fetchone():
-                return
+            now = datetime.now(UTC).isoformat()
+            indicators = asdict(allocation)
+            signal_exists = connection.execute(
+                "SELECT 1 FROM signals WHERE signal_date=?", (allocation.signal_date,)
+            ).fetchone()
+            if signal_exists:
+                connection.execute(
+                    """
+                    UPDATE signals
+                    SET regime=?, tqqq=?, sqqq=?, cash=?, score=?, indicators_json=?
+                    WHERE signal_date=?
+                    """,
+                    (
+                        allocation.regime, allocation.tqqq, allocation.sqqq,
+                        allocation.cash, allocation.score, json.dumps(indicators),
+                        allocation.signal_date,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM orders WHERE signal_date=? AND status='PENDING'",
+                    (allocation.signal_date,),
+                )
             account = connection.execute("SELECT cash FROM account WHERE account_id=?", (ACCOUNT_ID,)).fetchone()
             positions = {row["symbol"]: int(row["quantity"]) for row in connection.execute("SELECT * FROM positions")}
             equity = float(account["cash"]) + sum(positions.get(symbol, 0) * closes[symbol] for symbol in TRADE_SYMBOLS)
-            now = datetime.now(UTC).isoformat()
-            indicators = asdict(allocation)
-            connection.execute(
-                "INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (allocation.signal_date, allocation.regime, allocation.tqqq, allocation.sqqq,
-                 allocation.cash, allocation.score, json.dumps(indicators), now),
-            )
+            if not signal_exists:
+                connection.execute(
+                    "INSERT INTO signals VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (allocation.signal_date, allocation.regime, allocation.tqqq, allocation.sqqq,
+                     allocation.cash, allocation.score, json.dumps(indicators), now),
+                )
             for symbol in TRADE_SYMBOLS:
                 target = int(equity * weights[symbol] // closes[symbol])
                 current = positions.get(symbol, 0)
